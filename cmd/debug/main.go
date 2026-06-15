@@ -55,6 +55,12 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	case "debian-resolvconf":
+		if err := runDebianResolvconfDebug(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "debug debian-resolvconf: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	fmt.Println("mode not supported")
@@ -146,6 +152,44 @@ func runDirectDebug(ctx context.Context) error {
 	return nil
 }
 
+func runDebianResolvconfDebug(ctx context.Context) error {
+	const record = "sysnet-linux"
+	addr := netip.MustParseAddr("127.0.0.1")
+	provider, err := dns.NewDebianResolvconf(dns.Env{
+		Logf: func(format string, args ...any) {
+			fmt.Printf(format+"\n", args...)
+		},
+	}, record)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := provider.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "debian-resolvconf close: %v\n", err)
+		}
+	}()
+
+	pc, err := listenDNS(addr)
+	if err != nil {
+		return err
+	}
+	logger := newLoggingDNS(provider)
+	defer logger.Close()
+	server := gdns.NewServer(pc, logger)
+	defer server.Close()
+
+	if err := provider.SetDNS(addr); err != nil {
+		return err
+	}
+	fmt.Printf("proxying DNS on %s:53 until Ctrl+C\n", addr)
+	printResolvconfState(record)
+	printDirectDebugQueries(addr)
+
+	<-ctx.Done()
+	fmt.Println("shutting down")
+	return nil
+}
+
 func printDebugQueries(addr netip.Addr) {
 	uncachedName := fmt.Sprintf(
 		"sysnet-debug-%d.example.com",
@@ -174,6 +218,22 @@ func printDirectState() {
 	if err != nil {
 		fmt.Printf("read /etc/resolv.conf: %v\n", err)
 	}
+}
+
+func printResolvconfState(record string) {
+	for _, args := range [][]string{
+		{"-l"},
+		{"-u"},
+	} {
+		cmd := exec.Command("resolvconf", args...)
+		out, err := cmd.CombinedOutput()
+		fmt.Printf("resolvconf %s\n%s", strings.Join(args, " "), out)
+		if err != nil {
+			fmt.Printf("resolvconf %s: %v\n", strings.Join(args, " "), err)
+		}
+	}
+	fmt.Printf("owned resolvconf record: %s\n", record)
+	printDirectState()
 }
 
 func printResolvedState(ifname string) {

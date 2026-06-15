@@ -4,8 +4,10 @@ package dns
 
 import (
 	"context"
+	"io"
 	"net"
 	"os"
+	"os/exec"
 	"time"
 
 	"github.com/asciimoth/gonnect"
@@ -19,10 +21,15 @@ const (
 type Env struct {
 	Logf func(format string, args ...any)
 
-	ReadFile  func(path string) ([]byte, error)
-	WriteFile func(path string, data []byte, perm os.FileMode) error
-	Remove    func(path string) error
-	Dial      gonnect.Dial
+	ReadFile       func(path string) ([]byte, error)
+	WriteFile      func(path string, data []byte, perm os.FileMode) error
+	Remove         func(path string) error
+	Dial           gonnect.Dial
+	CommandContext func(
+		ctx context.Context,
+		name string,
+		args ...string,
+	) Cmd
 
 	DbusReadString func(ctx context.Context, name, objectPath, iface, member string) (string, error)
 	DbusPing       func(ctx context.Context, name, objectPath string) error
@@ -32,6 +39,25 @@ type Env struct {
 	ResolvconfStyle func() string
 
 	NmIsUsingResolved func() error
+}
+
+// Cmd is the subset of exec.Cmd used by DNS providers that configure the host
+// through external commands.
+type Cmd interface {
+	SetStdin(reader io.Reader)
+	Run() error
+}
+
+type execCmd struct {
+	cmd *exec.Cmd
+}
+
+func (c execCmd) SetStdin(r io.Reader) {
+	c.cmd.Stdin = r
+}
+
+func (c execCmd) Run() error {
+	return c.cmd.Run()
 }
 
 // DBusConn is the subset of a D-Bus connection used by resolved integration.
@@ -57,6 +83,15 @@ func (env Env) withDefaults() Env {
 	}
 	if env.Dial == nil {
 		env.Dial = (&net.Dialer{}).DialContext
+	}
+	if env.CommandContext == nil {
+		env.CommandContext = func(
+			ctx context.Context,
+			name string,
+			args ...string,
+		) Cmd {
+			return execCmd{cmd: exec.CommandContext(ctx, name, args...)}
+		}
 	}
 	if env.DbusReadString == nil {
 		env.DbusReadString = DbusReadString
