@@ -42,9 +42,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	if mode == "systemd-resolved" {
+	switch mode {
+	case "systemd-resolved":
 		if err := runResolvedDebug(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "debug resolved: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	case "direct":
+		if err := runDirectDebug(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "debug direct: %v\n", err)
 			os.Exit(1)
 		}
 		return
@@ -102,6 +109,43 @@ func runResolvedDebug(ctx context.Context) error {
 	return nil
 }
 
+func runDirectDebug(ctx context.Context) error {
+	addr := netip.MustParseAddr("127.0.0.1")
+	direct, err := dns.NewDirect(dns.Env{
+		Logf: func(format string, args ...any) {
+			fmt.Printf(format+"\n", args...)
+		},
+	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := direct.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "direct close: %v\n", err)
+		}
+	}()
+
+	pc, err := listenDNS(addr)
+	if err != nil {
+		return err
+	}
+	logger := newLoggingDNS(direct)
+	defer logger.Close()
+	server := gdns.NewServer(pc, logger)
+	defer server.Close()
+
+	if err := direct.SetDNS(addr); err != nil {
+		return err
+	}
+	fmt.Printf("proxying DNS on %s:53 until Ctrl+C\n", addr)
+	printDirectState()
+	printDirectDebugQueries(addr)
+
+	<-ctx.Done()
+	fmt.Println("shutting down")
+	return nil
+}
+
 func printDebugQueries(addr netip.Addr) {
 	uncachedName := fmt.Sprintf(
 		"sysnet-debug-%d.example.com",
@@ -113,6 +157,23 @@ func printDebugQueries(addr netip.Addr) {
 		"plain dig uses /etc/resolv.conf; it tests resolved only when " +
 			"resolv.conf points at the resolved stub",
 	)
+}
+
+func printDirectDebugQueries(addr netip.Addr) {
+	uncachedName := fmt.Sprintf(
+		"sysnet-debug-%d.example.com",
+		time.Now().UnixNano(),
+	)
+	fmt.Printf("direct proxy check: dig @%s %s\n", addr, uncachedName)
+	fmt.Printf("system resolver check: dig %s\n", uncachedName)
+}
+
+func printDirectState() {
+	out, err := os.ReadFile("/etc/resolv.conf")
+	fmt.Printf("/etc/resolv.conf\n%s", out)
+	if err != nil {
+		fmt.Printf("read /etc/resolv.conf: %v\n", err)
+	}
 }
 
 func printResolvedState(ifname string) {

@@ -144,7 +144,12 @@ func closeResolved(t *testing.T, r *Resolved) {
 	}
 }
 
-func assertAResponse(t *testing.T, r *Resolved, name string, want [4]byte) {
+func assertAResponse(
+	t *testing.T,
+	r gdns.Interface,
+	name string,
+	want [4]byte,
+) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

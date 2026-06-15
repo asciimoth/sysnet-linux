@@ -4,9 +4,11 @@ package dns
 
 import (
 	"context"
+	"net"
 	"os"
 	"time"
 
+	"github.com/asciimoth/gonnect"
 	"github.com/godbus/dbus/v5"
 )
 
@@ -17,7 +19,10 @@ const (
 type Env struct {
 	Logf func(format string, args ...any)
 
-	ReadFile func(path string) ([]byte, error)
+	ReadFile  func(path string) ([]byte, error)
+	WriteFile func(path string, data []byte, perm os.FileMode) error
+	Remove    func(path string) error
+	Dial      gonnect.Dial
 
 	DbusReadString func(ctx context.Context, name, objectPath, iface, member string) (string, error)
 	DbusPing       func(ctx context.Context, name, objectPath string) error
@@ -43,6 +48,15 @@ func (env Env) withDefaults() Env {
 	}
 	if env.ReadFile == nil {
 		env.ReadFile = os.ReadFile
+	}
+	if env.WriteFile == nil {
+		env.WriteFile = os.WriteFile
+	}
+	if env.Remove == nil {
+		env.Remove = os.Remove
+	}
+	if env.Dial == nil {
+		env.Dial = (&net.Dialer{}).DialContext
 	}
 	if env.DbusReadString == nil {
 		env.DbusReadString = DbusReadString
