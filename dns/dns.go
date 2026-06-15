@@ -28,12 +28,16 @@ var (
 // DNSProvider should NEVER use server set up via SetDNS to serve Requests
 // queue to avoid loops.
 //
-// If there multiple original upstreams (e.g. resolved split dns configuration)
+// After UnsetDNS, DNSProvider implementations that actively maintain the
+// server installed by SetDNS by watching system configuration changes and
+// rewriting it should stop doing so until SetDNS is called again.
+//
+// If there are multiple original upstreams (e.g. resolved split dns configuration)
 // DNSProvider implementation should handle it correctly under the hood routing
 // each request from Requests queue to matching upstream.
 //
-// It is common for DNSProvider imnplementations to accept fallback dns server
-// at cinstruction time to use in case there is no original upstream provided.
+// It is common for DNSProvider implementations to accept fallback dns server
+// at construction time to use in case there is no original upstream provided.
 type DNSProvider interface {
 	// Requests() chan <- Request
 	// Close() error
@@ -43,15 +47,21 @@ type DNSProvider interface {
 	// ALL DNS resolving mechanisms controlled by specific DNSProvider
 	// implementation should go use this server for all requests in system except
 	// ones done via DNSProvider.Requests queue.
-	// All changes done by SetDNS should have lofetime bounded to DNSProvider
+	// All changes done by SetDNS should have lifetime bounded to DNSProvider
 	// object and rolled back on close.
-	SetDNS(server netip.AddrPort)
+	SetDNS(server netip.Addr) error
+
+	// UnsetDNS should roll back changes done by SetDNS, if any. It should be
+	// valid to call SetDNS and UnsetDNS multiple times in any order.
+	UnsetDNS() error
 }
 
 // direct | systemd-resolved | debian-resolvconf | openresolv
 //
 // NOTE: Borrowed from github.com/tailscale/tailscale
 func DnsMode(ctx context.Context, env Env) (ret string, err error) {
+	env = env.withDefaults()
+
 	// In all cases that we detect systemd-resolved, try asking it what it
 	// thinks the current resolv.conf mode is so we can add it to our logs.
 	defer func() {

@@ -4,6 +4,7 @@ package dns
 
 import (
 	"context"
+	"os"
 	"time"
 
 	"github.com/godbus/dbus/v5"
@@ -20,10 +21,50 @@ type Env struct {
 
 	DbusReadString func(ctx context.Context, name, objectPath, iface, member string) (string, error)
 	DbusPing       func(ctx context.Context, name, objectPath string) error
+	SystemBus      func() (*dbus.Conn, error)
+	ResolvedBus    func() (DBusConn, error)
 
 	ResolvconfStyle func() string
 
 	NmIsUsingResolved func() error
+}
+
+// DBusConn is the subset of a D-Bus connection used by resolved integration.
+type DBusConn interface {
+	Object(dest string, path dbus.ObjectPath) dbus.BusObject
+	AddMatchSignal(options ...dbus.MatchOption) error
+	Signal(ch chan<- *dbus.Signal)
+	Close() error
+}
+
+func (env Env) withDefaults() Env {
+	if env.Logf == nil {
+		env.Logf = func(string, ...any) {}
+	}
+	if env.ReadFile == nil {
+		env.ReadFile = os.ReadFile
+	}
+	if env.DbusReadString == nil {
+		env.DbusReadString = DbusReadString
+	}
+	if env.DbusPing == nil {
+		env.DbusPing = DbusPing
+	}
+	if env.SystemBus == nil {
+		env.SystemBus = dbus.SystemBus
+	}
+	if env.ResolvedBus == nil {
+		env.ResolvedBus = func() (DBusConn, error) {
+			return env.SystemBus()
+		}
+	}
+	if env.ResolvconfStyle == nil {
+		env.ResolvconfStyle = ResolvconfStyle
+	}
+	if env.NmIsUsingResolved == nil {
+		env.NmIsUsingResolved = NmIsUsingResolved
+	}
+	return env
 }
 
 // DbusReadString reads a string property from the provided name and object

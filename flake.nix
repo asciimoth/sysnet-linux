@@ -64,6 +64,11 @@
 
           typos
           commitizen
+
+          just
+
+          # debug
+          dig
         ];
       };
     });
