@@ -1,4 +1,10 @@
+github.com/asciimoth/bufpool v0.3.0 h1:tQMop/kZ3eOLSorM9i0cqtOIpxWQUroGZ6oNk5DTnQc=
+github.com/asciimoth/bufpool v0.3.0/go.mod h1:JV6H4hpj2bCS5Svr0wNqR+XOZFOOkdXfNZxCjm/3QHw=
+github.com/asciimoth/gonnect v0.19.0 h1:j4huh4I3i8vG/UZCSDDPtrFea20lY7jc4Cz6JQ+yXY0=
+github.com/asciimoth/gonnect v0.19.0/go.mod h1:CohhruGEkUgKLF0ypR/RNFrdrqmJgUkKhvjMilED9Kk=
 github.com/godbus/dbus/v5 v5.2.2 h1:TUR3TgtSVDmjiXOgAAyaZbYmIeP3DPkld3jgKGV8mXQ=
 github.com/godbus/dbus/v5 v5.2.2/go.mod h1:3AAv2+hPq5rdnr5txxxRwiGjPXamgoIHgz9FPBfOp3c=
-golang.org/x/sys v0.27.0 h1:wBqf8DvsY9Y/2P8gAfPDEYNuS30J4lPHJxXSb/nJZ+s=
-golang.org/x/sys v0.27.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
+golang.org/x/net v0.54.0 h1:2zJIZAxAHV/OHCDTCOHAYehQzLfSXuf/5SoL/Dv6w/w=
+golang.org/x/net v0.54.0/go.mod h1:Sj4oj8jK6XmHpBZU/zWHw3BV3abl4Kvi+Ut7cQcY+cQ=
+golang.org/x/sys v0.44.0 h1:ildZl3J4uzeKP07r2F++Op7E9B29JRUy+a27EibtBTQ=
+golang.org/x/sys v0.44.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=

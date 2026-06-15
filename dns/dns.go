@@ -11,12 +11,42 @@ import (
 	"os"
 	"strings"
 
+	"github.com/asciimoth/gonnect/dns"
 	"github.com/asciimoth/sysnet-linux/dns/resolvconffile"
 )
 
 var (
 	SysdResolver = netip.MustParseAddr("127.0.0.53")
 )
+
+// DNSProvider implementation should track original upstream DNS resolver
+// (e.g. static configured one or DHCP sourced) and use it to serve
+// Requests queue regardless of SetDNS being called or not.
+// Note that upstream may be dynamic and change over time (e.g. when host
+// connects to new network and receive config via DHCP).
+//
+// DNSProvider should NEVER use server set up via SetDNS to serve Requests
+// queue to avoid loops.
+//
+// If there multiple original upstreams (e.g. resolved split dns configuration)
+// DNSProvider implementation should handle it correctly under the hood routing
+// each request from Requests queue to matching upstream.
+//
+// It is common for DNSProvider imnplementations to accept fallback dns server
+// at cinstruction time to use in case there is no original upstream provided.
+type DNSProvider interface {
+	// Requests() chan <- Request
+	// Close() error
+	dns.Interface
+
+	// SetDNS should set server as a default one for whole system.
+	// ALL DNS resolving mechanisms controlled by specific DNSProvider
+	// implementation should go use this server for all requests in system except
+	// ones done via DNSProvider.Requests queue.
+	// All changes done by SetDNS should have lofetime bounded to DNSProvider
+	// object and rolled back on close.
+	SetDNS(server netip.AddrPort)
+}
 
 // direct | systemd-resolved | debian-resolvconf | openresolv
 //
