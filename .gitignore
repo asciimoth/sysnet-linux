@@ -35,4 +35,4 @@ go.work.sum
 /.pre-commit-config.yaml
 /.direnv
 
-debug
+/debug

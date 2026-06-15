@@ -1,3 +1,3 @@
-debug:
+debug-dns:
 	go build -o ./debug ./cmd/debug
-	sudo ./debug
+	sudo ./debug dns
