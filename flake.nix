@@ -69,6 +69,9 @@
 
           # debug
           dig
+
+          # For e2e tests
+          python3
         ];
       };
     });

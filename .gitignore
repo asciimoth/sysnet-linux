@@ -36,3 +36,5 @@ go.work.sum
 /.direnv
 
 /debug
+
+__pycache__/
