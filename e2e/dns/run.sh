@@ -14,6 +14,7 @@ if [[ $# -eq 0 ]]; then
 		openresolv-no-upstream
 		systemd-resolved
 		systemd-resolved-no-upstream
+		systemd-resolved-split
 	)
 else
 	cases=("$@")
@@ -33,6 +34,9 @@ trap 'rm -rf "$tmpdir"; rm -f ./debug' EXIT
 
 for case_name in "${cases[@]}"; do
 	flavor="${case_name%-no-upstream}"
+	if [[ "$case_name" == systemd-resolved-* ]]; then
+		flavor="systemd-resolved"
+	fi
 	image="sysnet-linux-dns-e2e:${case_name}"
 	echo "building $image"
 	docker build \

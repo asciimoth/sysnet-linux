@@ -15,7 +15,8 @@ import os
 
 
 ADDR = (os.environ.get("SYSNET_DNS_E2E_UPSTREAM_ADDR", "127.0.0.54"), 53)
-ANSWER = socket.inet_aton("203.0.113.10")
+ANSWER_TEXT = os.environ.get("SYSNET_DNS_E2E_UPSTREAM_ANSWER", "203.0.113.10")
+ANSWER = socket.inet_aton(ANSWER_TEXT)
 
 
 def question_end(packet: bytes, offset: int) -> int:
@@ -26,6 +27,20 @@ def question_end(packet: bytes, offset: int) -> int:
 			return offset + 4
 		offset += length
 	raise ValueError("truncated DNS question")
+
+
+def question_name(packet: bytes, offset: int) -> str:
+	labels = []
+	while offset < len(packet):
+		length = packet[offset]
+		offset += 1
+		if length == 0:
+			return ".".join(labels) + "."
+		if offset + length > len(packet):
+			raise ValueError("truncated DNS question name")
+		labels.append(packet[offset:offset + length].decode("ascii", "replace"))
+		offset += length
+	raise ValueError("truncated DNS question name")
 
 
 def response(packet: bytes) -> bytes:
@@ -43,7 +58,10 @@ def main() -> int:
 	sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 	sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 	sock.bind(ADDR)
-	print(f"upstream DNS listening on {ADDR[0]}:{ADDR[1]}", flush=True)
+	print(
+		f"upstream DNS listening on {ADDR[0]}:{ADDR[1]} answer={ANSWER_TEXT}",
+		flush=True,
+	)
 
 	stop = False
 
@@ -61,6 +79,10 @@ def main() -> int:
 		except OSError:
 			break
 		try:
+			print(
+				f"upstream DNS query addr={ADDR[0]} name={question_name(packet, 12)}",
+				flush=True,
+			)
 			sock.sendto(response(packet), peer)
 		except Exception as exc:  # noqa: BLE001
 			print(f"upstream DNS error: {exc}", file=sys.stderr, flush=True)

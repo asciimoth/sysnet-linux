@@ -29,6 +29,9 @@ set -euo pipefail
 #   /etc/resolv.conf points at the resolved stub 127.0.0.53, and resolved has
 #   the mock upstream configured on eth0, so DnsMode is "systemd-resolved".
 #   Resolved routes system queries to the debug TUN DNS.
+# - systemd-resolved-split: resolved has two route-only domains on two links,
+#   each with a different upstream. Queries must return the answer for the
+#   matching route.
 #
 # Docker bind-mounts /etc/resolv.conf into containers. The resolvconf packages
 # normally maintain /etc/resolv.conf through a symlink to generated state, but
@@ -36,8 +39,11 @@ set -euo pipefail
 # real provider-owned resolvconf record, then copy the expected generated
 # nameserver into Docker's mounted file before running dig.
 
-case_name="${1:?usage: sysnet-dns-e2e <direct|direct-no-upstream|debian-resolvconf|debian-resolvconf-no-upstream|openresolv|openresolv-no-upstream|systemd-resolved|systemd-resolved-no-upstream>}"
+case_name="${1:?usage: sysnet-dns-e2e <direct|direct-no-upstream|debian-resolvconf|debian-resolvconf-no-upstream|openresolv|openresolv-no-upstream|systemd-resolved|systemd-resolved-no-upstream|systemd-resolved-split>}"
 expected_mode="${case_name%-no-upstream}"
+if [[ "$case_name" == systemd-resolved-* ]]; then
+	expected_mode="systemd-resolved"
+fi
 no_upstream=0
 if [[ "$case_name" == *-no-upstream ]]; then
 	no_upstream=1
@@ -52,7 +58,12 @@ fail() {
 	echo "--- debug log ---" >&2
 	if [[ -f "$debug_log" ]]; then cat "$debug_log" >&2; fi
 	echo "--- upstream log ---" >&2
-	if [[ -f "$upstream_log" ]]; then cat "$upstream_log" >&2; fi
+	for log in /tmp/sysnet-upstream*.log; do
+		if [[ -f "$log" ]]; then
+			echo "### $log" >&2
+			cat "$log" >&2
+		fi
+	done
 	echo "--- /etc/resolv.conf ---" >&2
 	cat /etc/resolv.conf >&2 || true
 	exit 1
@@ -85,10 +96,14 @@ cleanup() {
 trap cleanup EXIT
 
 start_upstream() {
-	SYSNET_DNS_E2E_UPSTREAM_ADDR="$upstream_addr" \
-		python3 /usr/local/lib/sysnet-dns-e2e/upstream_dns.py >"$upstream_log" 2>&1 &
+	local addr="${1:-$upstream_addr}"
+	local answer="${2:-203.0.113.10}"
+	local log="${3:-$upstream_log}"
+	SYSNET_DNS_E2E_UPSTREAM_ADDR="$addr" \
+		SYSNET_DNS_E2E_UPSTREAM_ANSWER="$answer" \
+		python3 /usr/local/lib/sysnet-dns-e2e/upstream_dns.py >"$log" 2>&1 &
 	cleanup_pids+=("$!")
-	wait_for_log "upstream DNS listening" "$upstream_log" || fail "upstream DNS did not start"
+	wait_for_log "upstream DNS listening" "$log" || fail "upstream DNS did not start on $addr"
 }
 
 write_direct_resolvconf() {
@@ -155,6 +170,20 @@ nameserver 127.0.0.53
 EOF
 }
 
+configure_resolved_link_dns() {
+	local ifname="$1"
+	local addr="$2"
+	local domain="$3"
+	local default_route="${4:-false}"
+	local ifidx
+	local octets
+	ifidx="$(cat "/sys/class/net/$ifname/ifindex")"
+	octets="${addr//./ }"
+	busctl --system call org.freedesktop.resolve1 /org/freedesktop/resolve1 org.freedesktop.resolve1.Manager SetLinkDNS "ia(iay)" "$ifidx" 1 2 4 $octets || fail "failed to configure resolved DNS for $ifname"
+	busctl --system call org.freedesktop.resolve1 /org/freedesktop/resolve1 org.freedesktop.resolve1.Manager SetLinkDefaultRoute "ib" "$ifidx" "$default_route" || fail "failed to configure resolved default route for $ifname"
+	busctl --system call org.freedesktop.resolve1 /org/freedesktop/resolve1 org.freedesktop.resolve1.Manager SetLinkDomains "ia(sb)" "$ifidx" 1 "$domain" true || fail "failed to configure resolved domain $domain for $ifname"
+}
+
 run_debug() {
 	local fallback_env=()
 	if [[ "$no_upstream" == 1 ]]; then
@@ -167,14 +196,31 @@ run_debug() {
 }
 
 assert_query() {
+	local name="${1:-$query_name}"
+	local answer="${2:-203.0.113.10}"
+	local server="${3:-}"
 	local out
-	if ! out="$(dig +time=2 +tries=1 +short "$query_name" A 2>&1)"; then
+	local dig_args=(+time=2 +tries=1 +short)
+	if [[ -n "$server" ]]; then
+		dig_args+=("@$server")
+	fi
+	if ! out="$(dig "${dig_args[@]}" "$name" A 2>&1)"; then
 		fail "dig failed: $out"
 	fi
-	if ! grep -q "203.0.113.10" <<<"$out"; then
+	if ! grep -q "$answer" <<<"$out"; then
 		fail "dig returned unexpected answer: $out"
 	fi
-	wait_for_log "dns request .*${query_name}\\./1/1" "$debug_log" || fail "debug dns did not log intercepted query $query_name"
+	wait_for_log "dns request .*${name}\\./1/1" "$debug_log" || fail "debug dns did not log intercepted query $name"
+}
+
+debug_dns_addr() {
+	sed -n 's/^proxying DNS on \([^:]*\):53 until Ctrl+C$/\1/p' "$debug_log" | tail -n1
+}
+
+assert_upstream_query() {
+	local log="$1"
+	local name="$2"
+	wait_for_log "upstream DNS query .*name=${name}\\." "$log" || fail "upstream did not receive $name"
 }
 
 mirror_resolvconf_record_to_docker_resolvconf() {
@@ -238,6 +284,30 @@ case "$case_name" in
 		fi
 		run_debug
 		assert_query
+		;;
+	systemd-resolved-split)
+		corp_addr="10.53.1.1"
+		public_addr="10.53.2.1"
+		ip link add sysnetdns1 type dummy
+		ip link add sysnetdns2 type dummy
+		ip addr add "$corp_addr/32" dev sysnetdns1
+		ip addr add "$public_addr/32" dev sysnetdns2
+		ip link set sysnetdns1 up
+		ip link set sysnetdns2 up
+		start_upstream "$corp_addr" "203.0.113.11" "/tmp/sysnet-upstream-corp.log"
+		start_upstream "$public_addr" "203.0.113.12" "/tmp/sysnet-upstream-public.log"
+		start_systemd_resolved 0
+		configure_resolved_link_dns sysnetdns1 "$corp_addr" "corp.test" false
+		configure_resolved_link_dns sysnetdns2 "$public_addr" "public.test" false
+		run_debug
+		debug_addr="$(debug_dns_addr)"
+		[[ -n "$debug_addr" ]] || fail "could not find debug DNS address"
+		corp_query="sysnet-split-corp-$$.corp.test"
+		public_query="sysnet-split-public-$$.public.test"
+		assert_query "$corp_query" "203.0.113.11" "$debug_addr"
+		assert_query "$public_query" "203.0.113.12" "$debug_addr"
+		assert_upstream_query "/tmp/sysnet-upstream-corp.log" "$corp_query"
+		assert_upstream_query "/tmp/sysnet-upstream-public.log" "$public_query"
 		;;
 	*)
 		fail "unknown case $case_name"

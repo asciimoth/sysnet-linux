@@ -19,6 +19,8 @@ that `DnsMode` selects the matching `DNSProvider` implementation:
   pointing at `127.0.0.53`, expected mode `systemd-resolved`.
 - `systemd-resolved-no-upstream`: systemd-resolved with no configured link or
   global DNS servers, expected mode `systemd-resolved`.
+- `systemd-resolved-split`: systemd-resolved with two route-only domains on
+  separate links, expected mode `systemd-resolved`.
 
 Every case starts a deterministic DNS upstream, then starts `debug dns`. In the
 regular cases that server is configured as the original upstream. In
@@ -31,6 +33,8 @@ log the request and return the upstream answer `203.0.113.10`. That proves both
 detection and provider setup worked: normal system DNS traffic was redirected
 to the debug DNS server, while provider forwarding still used either the
 original upstream or the constructor fallback.
+The split resolved case uses two upstreams with different answers and verifies
+that `corp.test` and `public.test` requests reach the matching upstream.
 
 The Docker runs are privileged because the debug resolved path creates a TUN
 interface and all providers bind or rewrite system DNS state inside the
