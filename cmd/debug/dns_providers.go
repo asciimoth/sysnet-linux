@@ -6,10 +6,32 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"strings"
 
 	gdns "github.com/asciimoth/gonnect/dns"
 	"github.com/asciimoth/sysnet-linux/dns"
 )
+
+func debugDNSFallbackAddrs() ([]netip.AddrPort, error) {
+	raw := os.Getenv("SYSNET_DEBUG_DNS_FALLBACKS")
+	if raw == "" {
+		return nil, nil
+	}
+
+	var addrs []netip.AddrPort
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		addr, err := netip.ParseAddrPort(part)
+		if err != nil {
+			return nil, fmt.Errorf("parse SYSNET_DEBUG_DNS_FALLBACKS %q: %w", part, err)
+		}
+		addrs = append(addrs, addr)
+	}
+	return addrs, nil
+}
 
 func runResolvedDebug(ctx context.Context) error {
 	tun, err := createDummyTUN("sysnetdbg%d")
@@ -25,11 +47,15 @@ func runResolvedDebug(ctx context.Context) error {
 	}
 	fmt.Printf("assigned debug DNS address %s/32 to %s\n", addr, tun.name)
 
+	fallbacks, err := debugDNSFallbackAddrs()
+	if err != nil {
+		return err
+	}
 	resolved, err := dns.NewResolved(dns.Env{
 		Logf: func(format string, args ...any) {
 			fmt.Printf(format+"\n", args...)
 		},
-	}, tun.ifindex)
+	}, tun.ifindex, fallbacks...)
 	if err != nil {
 		return err
 	}
@@ -62,11 +88,15 @@ func runResolvedDebug(ctx context.Context) error {
 
 func runDirectDebug(ctx context.Context) error {
 	addr := netip.MustParseAddr("127.0.0.1")
+	fallbacks, err := debugDNSFallbackAddrs()
+	if err != nil {
+		return err
+	}
 	direct, err := dns.NewDirect(dns.Env{
 		Logf: func(format string, args ...any) {
 			fmt.Printf(format+"\n", args...)
 		},
-	})
+	}, fallbacks...)
 	if err != nil {
 		return err
 	}
@@ -100,11 +130,15 @@ func runDirectDebug(ctx context.Context) error {
 func runDebianResolvconfDebug(ctx context.Context) error {
 	const record = "sysnet-linux"
 	addr := netip.MustParseAddr("127.0.0.1")
+	fallbacks, err := debugDNSFallbackAddrs()
+	if err != nil {
+		return err
+	}
 	provider, err := dns.NewDebianResolvconf(dns.Env{
 		Logf: func(format string, args ...any) {
 			fmt.Printf(format+"\n", args...)
 		},
-	}, record)
+	}, record, fallbacks...)
 	if err != nil {
 		return err
 	}
@@ -138,11 +172,15 @@ func runDebianResolvconfDebug(ctx context.Context) error {
 func runOpenresolvDebug(ctx context.Context) error {
 	const record = "sysnet-linux"
 	addr := netip.MustParseAddr("127.0.0.1")
+	fallbacks, err := debugDNSFallbackAddrs()
+	if err != nil {
+		return err
+	}
 	provider, err := dns.NewOpenresolv(dns.Env{
 		Logf: func(format string, args ...any) {
 			fmt.Printf(format+"\n", args...)
 		},
-	}, record)
+	}, record, fallbacks...)
 	if err != nil {
 		return err
 	}
