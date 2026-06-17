@@ -15,9 +15,13 @@ func TestOpenresolvForwardsToOriginalAfterSetDNS(t *testing.T) {
 	env := newFakeDebianResolvconfEnv(
 		"nameserver " + upstream.addrPort.Addr().String() + "\n",
 	)
-	env.dial = redirectDNSDial(upstream.addrPort)
 
-	r, err := NewOpenresolv(env.env(), "sysnet-linux")
+	r, err := NewOpenresolv(
+		env.env(),
+		testNetwork(),
+		redirectDNSNetwork(upstream.addrPort),
+		"sysnet-linux",
+	)
 	if err != nil {
 		t.Fatalf("NewOpenresolv: %v", err)
 	}
@@ -48,9 +52,13 @@ func TestOpenresolvSetDNSCanBeRepeatedAndAvoidsManagedLoop(t *testing.T) {
 		"nameserver " + upstream.addrPort.Addr().String(),
 		"",
 	}, "\n"))
-	env.dial = redirectDNSDial(upstream.addrPort)
 
-	r, err := NewOpenresolv(env.env(), "sysnet-linux")
+	r, err := NewOpenresolv(
+		env.env(),
+		testNetwork(),
+		redirectDNSNetwork(upstream.addrPort),
+		"sysnet-linux",
+	)
 	if err != nil {
 		t.Fatalf("NewOpenresolv: %v", err)
 	}
@@ -79,6 +87,8 @@ func TestOpenresolvUnsetDNSIsIdempotent(t *testing.T) {
 	env := newFakeDebianResolvconfEnv("nameserver 192.0.2.1\n")
 	r, err := NewOpenresolv(
 		env.env(),
+		testNetwork(),
+		testNetwork(),
 		"sysnet-linux",
 		netip.MustParseAddrPort("127.0.0.1:53"),
 	)
@@ -112,6 +122,8 @@ func TestOpenresolvCloseDeletesActiveManagedState(t *testing.T) {
 	env := newFakeDebianResolvconfEnv("nameserver 192.0.2.1\n")
 	r, err := NewOpenresolv(
 		env.env(),
+		testNetwork(),
+		testNetwork(),
 		"sysnet-linux",
 		netip.MustParseAddrPort("127.0.0.1:53"),
 	)
@@ -143,7 +155,13 @@ func TestOpenresolvUsesFallbackWhenNoOriginalUpstream(t *testing.T) {
 	fallback := startTestDNSUpstream(t, [4]byte{10, 3, 0, 3})
 	env := newFakeDebianResolvconfEnv("# no nameservers\n")
 
-	r, err := NewOpenresolv(env.env(), "sysnet-linux", fallback.addrPort)
+	r, err := NewOpenresolv(
+		env.env(),
+		testNetwork(),
+		testNetwork(),
+		"sysnet-linux",
+		fallback.addrPort,
+	)
 	if err != nil {
 		t.Fatalf("NewOpenresolv: %v", err)
 	}
@@ -157,6 +175,8 @@ func TestOpenresolvSurfacesCommandErrors(t *testing.T) {
 	env.commandErr = errors.New("resolvconf failed")
 	r, err := NewOpenresolv(
 		env.env(),
+		testNetwork(),
+		testNetwork(),
 		"sysnet-linux",
 		netip.MustParseAddrPort("127.0.0.1:53"),
 	)

@@ -5,12 +5,10 @@ package dns
 import (
 	"context"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"time"
 
-	"github.com/asciimoth/gonnect"
 	"github.com/godbus/dbus/v5"
 )
 
@@ -24,7 +22,6 @@ type Env struct {
 	ReadFile       func(path string) ([]byte, error)
 	WriteFile      func(path string, data []byte, perm os.FileMode) error
 	Remove         func(path string) error
-	Dial           gonnect.Dial
 	CommandContext func(
 		ctx context.Context,
 		name string,
@@ -80,9 +77,6 @@ func (env Env) withDefaults() Env {
 	}
 	if env.Remove == nil {
 		env.Remove = os.Remove
-	}
-	if env.Dial == nil {
-		env.Dial = (&net.Dialer{}).DialContext
 	}
 	if env.CommandContext == nil {
 		env.CommandContext = func(

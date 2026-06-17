@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/asciimoth/gonnect"
 	gdns "github.com/asciimoth/gonnect/dns"
 	"github.com/godbus/dbus/v5"
 	"golang.org/x/sys/unix"
@@ -120,15 +121,17 @@ type Resolved struct {
 	mgr   dbus.BusObject
 	base  *gdns.Router
 
-	mu           sync.Mutex
-	dnsMu        sync.Mutex
-	closed       bool
-	clients      map[string]gdns.Interface
-	fallback     []netip.AddrPort
-	setDNS       netip.Addr
-	setDNSActive bool
-	upstreamSig  []string
-	watchCancel  context.CancelFunc
+	mu            sync.Mutex
+	dnsMu         sync.Mutex
+	closed        bool
+	listenNetwork gonnect.Network
+	dialNetwork   gonnect.Network
+	clients       map[string]gdns.Interface
+	fallback      []netip.AddrPort
+	setDNS        netip.Addr
+	setDNSActive  bool
+	upstreamSig   []string
+	watchCancel   context.CancelFunc
 
 	targetServers []netip.AddrPort
 	targetDomains []resolvedLinkDomain
@@ -144,14 +147,24 @@ var _ DNSProvider = (*Resolved)(nil)
 // ifidx is the kernel network interface index to configure through resolved's
 // per-link D-Bus API. Requests are forwarded directly to the DNS servers that
 // resolved reports for that link, so SetDNS does not create a DNS loop through
-// the newly installed server. fallback is used only if resolved does not report
-// any usable link or global DNS servers.
+// the newly installed server. listenNetwork is used for listening operations and
+// dialNetwork is used for all outgoing upstream DNS requests. fallback is used
+// only if resolved does not report any usable link or global DNS servers.
 func NewResolved(
 	env Env,
+	listenNetwork gonnect.Network,
+	dialNetwork gonnect.Network,
 	ifidx int,
 	fallback ...netip.AddrPort,
 ) (*Resolved, error) {
 	env = env.withDefaults()
+	if err := requireDNSNetworks(
+		"resolved",
+		listenNetwork,
+		dialNetwork,
+	); err != nil {
+		return nil, err
+	}
 	ifidx32, err := resolvedIfIndex(ifidx)
 	if err != nil {
 		return nil, err
@@ -164,9 +177,11 @@ func NewResolved(
 	}
 
 	r := &Resolved{
-		env:   env,
-		ifidx: ifidx32,
-		conn:  conn,
+		env:           env,
+		ifidx:         ifidx32,
+		conn:          conn,
+		listenNetwork: listenNetwork,
+		dialNetwork:   dialNetwork,
 		mgr: conn.Object(
 			dbusResolvedObject,
 			dbus.ObjectPath(dbusResolvedPath),
@@ -652,7 +667,10 @@ func (r *Resolved) setUpstreamConfig(cfg resolvedUpstreamConfig) error {
 	)
 	clients := make(map[string]gdns.Interface, len(cfg.routes))
 	for _, route := range cfg.routes {
-		clients[route.name] = gdns.NewClient(nil, route.urls...)
+		clients[route.name] = gdns.NewClient(
+			upstreamDNSDial(r.dialNetwork),
+			route.urls...,
+		)
 	}
 	routeFunc := resolvedRouteFunc(cfg.routes)
 

@@ -130,7 +130,7 @@ func newTestResolved(
 	t.Helper()
 	r, err := NewResolved(Env{
 		ResolvedBus: func() (DBusConn, error) { return bus, nil },
-	}, int(bus.ifidx), fallback...)
+	}, testNetwork(), testNetwork(), int(bus.ifidx), fallback...)
 	if err != nil {
 		t.Fatalf("NewResolved: %v", err)
 	}

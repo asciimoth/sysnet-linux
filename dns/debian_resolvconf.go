@@ -44,7 +44,8 @@ type DebianResolvconf struct {
 	mu              sync.Mutex
 	closed          bool
 	base            *gdns.Router
-	dial            gonnect.Dial
+	listenNetwork   gonnect.Network
+	dialNetwork     gonnect.Network
 	client          gdns.Interface
 	iface           string
 	fallback        []netip.AddrPort
@@ -59,25 +60,37 @@ var _ DNSProvider = (*DebianResolvconf)(nil)
 // NewDebianResolvconf returns a DNSProvider backed by Debian resolvconf.
 //
 // env provides access to the host environment. Any nil callbacks are replaced
-// with production defaults. iface is the resolvconf record name to own, for
-// example "sysnet-linux". fallback is used only when /etc/resolv.conf has no
-// original nameserver after excluding the managed server installed by SetDNS.
+// with production defaults. listenNetwork is used for listening operations and
+// dialNetwork is used for all outgoing upstream DNS requests. iface is the
+// resolvconf record name to own, for example "sysnet-linux". fallback is used
+// only when /etc/resolv.conf has no original nameserver after excluding the
+// managed server installed by SetDNS.
 func NewDebianResolvconf(
 	env Env,
+	listenNetwork gonnect.Network,
+	dialNetwork gonnect.Network,
 	iface string,
 	fallback ...netip.AddrPort,
 ) (*DebianResolvconf, error) {
 	env = env.withDefaults()
+	if err := requireDNSNetworks(
+		"debian-resolvconf",
+		listenNetwork,
+		dialNetwork,
+	); err != nil {
+		return nil, err
+	}
 	if iface == "" {
 		return nil, errors.New("debian-resolvconf: empty interface name")
 	}
 
 	r := &DebianResolvconf{
-		env:      env,
-		base:     gdns.NewRouter(),
-		dial:     env.Dial,
-		iface:    iface,
-		fallback: append([]netip.AddrPort(nil), fallback...),
+		env:           env,
+		base:          gdns.NewRouter(),
+		listenNetwork: listenNetwork,
+		dialNetwork:   dialNetwork,
+		iface:         iface,
+		fallback:      append([]netip.AddrPort(nil), fallback...),
 	}
 
 	bs, err := env.ReadFile(resolvconffile.Path)
@@ -233,10 +246,10 @@ func (r *DebianResolvconf) refreshUpstreams(exclude []netip.Addr) error {
 	}
 
 	r.mu.Lock()
-	dial := r.dial
+	dialNetwork := r.dialNetwork
 	r.mu.Unlock()
 
-	client := gdns.NewClient(dial, urls...)
+	client := gdns.NewClient(upstreamDNSDial(dialNetwork), urls...)
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()

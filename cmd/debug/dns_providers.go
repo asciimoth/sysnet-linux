@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/asciimoth/gonnect"
 	gdns "github.com/asciimoth/gonnect/dns"
 	"github.com/asciimoth/sysnet-linux/dns"
 )
@@ -26,7 +27,11 @@ func debugDNSFallbackAddrs() ([]netip.AddrPort, error) {
 		}
 		addr, err := netip.ParseAddrPort(part)
 		if err != nil {
-			return nil, fmt.Errorf("parse SYSNET_DEBUG_DNS_FALLBACKS %q: %w", part, err)
+			return nil, fmt.Errorf(
+				"parse SYSNET_DEBUG_DNS_FALLBACKS %q: %w",
+				part,
+				err,
+			)
 		}
 		addrs = append(addrs, addr)
 	}
@@ -34,6 +39,9 @@ func debugDNSFallbackAddrs() ([]netip.AddrPort, error) {
 }
 
 func runResolvedDebug(ctx context.Context) error {
+	listenNetwork := gonnect.NativeConfig{}.Build()
+	dialNetwork := gonnect.NativeConfig{}.Build()
+
 	tun, err := createDummyTUN("sysnetdbg%d")
 	if err != nil {
 		return err
@@ -55,7 +63,7 @@ func runResolvedDebug(ctx context.Context) error {
 		Logf: func(format string, args ...any) {
 			fmt.Printf(format+"\n", args...)
 		},
-	}, tun.ifindex, fallbacks...)
+	}, listenNetwork, dialNetwork, tun.ifindex, fallbacks...)
 	if err != nil {
 		return err
 	}
@@ -65,7 +73,7 @@ func runResolvedDebug(ctx context.Context) error {
 		}
 	}()
 
-	pc, err := listenDNS(addr)
+	pc, err := listenDNS(ctx, listenNetwork, addr)
 	if err != nil {
 		return err
 	}
@@ -87,6 +95,9 @@ func runResolvedDebug(ctx context.Context) error {
 }
 
 func runDirectDebug(ctx context.Context) error {
+	listenNetwork := gonnect.NativeConfig{}.Build()
+	dialNetwork := gonnect.NativeConfig{}.Build()
+
 	addr := netip.MustParseAddr("127.0.0.1")
 	fallbacks, err := debugDNSFallbackAddrs()
 	if err != nil {
@@ -96,7 +107,7 @@ func runDirectDebug(ctx context.Context) error {
 		Logf: func(format string, args ...any) {
 			fmt.Printf(format+"\n", args...)
 		},
-	}, fallbacks...)
+	}, listenNetwork, dialNetwork, fallbacks...)
 	if err != nil {
 		return err
 	}
@@ -106,7 +117,7 @@ func runDirectDebug(ctx context.Context) error {
 		}
 	}()
 
-	pc, err := listenDNS(addr)
+	pc, err := listenDNS(ctx, listenNetwork, addr)
 	if err != nil {
 		return err
 	}
@@ -128,6 +139,9 @@ func runDirectDebug(ctx context.Context) error {
 }
 
 func runDebianResolvconfDebug(ctx context.Context) error {
+	listenNetwork := gonnect.NativeConfig{}.Build()
+	dialNetwork := gonnect.NativeConfig{}.Build()
+
 	const record = "sysnet-linux"
 	addr := netip.MustParseAddr("127.0.0.1")
 	fallbacks, err := debugDNSFallbackAddrs()
@@ -138,7 +152,7 @@ func runDebianResolvconfDebug(ctx context.Context) error {
 		Logf: func(format string, args ...any) {
 			fmt.Printf(format+"\n", args...)
 		},
-	}, record, fallbacks...)
+	}, listenNetwork, dialNetwork, record, fallbacks...)
 	if err != nil {
 		return err
 	}
@@ -148,7 +162,7 @@ func runDebianResolvconfDebug(ctx context.Context) error {
 		}
 	}()
 
-	pc, err := listenDNS(addr)
+	pc, err := listenDNS(ctx, listenNetwork, addr)
 	if err != nil {
 		return err
 	}
@@ -170,6 +184,9 @@ func runDebianResolvconfDebug(ctx context.Context) error {
 }
 
 func runOpenresolvDebug(ctx context.Context) error {
+	listenNetwork := gonnect.NativeConfig{}.Build()
+	dialNetwork := gonnect.NativeConfig{}.Build()
+
 	const record = "sysnet-linux"
 	addr := netip.MustParseAddr("127.0.0.1")
 	fallbacks, err := debugDNSFallbackAddrs()
@@ -180,7 +197,7 @@ func runOpenresolvDebug(ctx context.Context) error {
 		Logf: func(format string, args ...any) {
 			fmt.Printf(format+"\n", args...)
 		},
-	}, record, fallbacks...)
+	}, listenNetwork, dialNetwork, record, fallbacks...)
 	if err != nil {
 		return err
 	}
@@ -190,7 +207,7 @@ func runOpenresolvDebug(ctx context.Context) error {
 		}
 	}()
 
-	pc, err := listenDNS(addr)
+	pc, err := listenDNS(ctx, listenNetwork, addr)
 	if err != nil {
 		return err
 	}

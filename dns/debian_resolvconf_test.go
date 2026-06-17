@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"net"
 	"net/netip"
 	"os"
 	"reflect"
@@ -20,9 +19,13 @@ func TestDebianResolvconfForwardsToOriginalAfterSetDNS(t *testing.T) {
 	env := newFakeDebianResolvconfEnv(
 		"nameserver " + upstream.addrPort.Addr().String() + "\n",
 	)
-	env.dial = redirectDNSDial(upstream.addrPort)
 
-	r, err := NewDebianResolvconf(env.env(), "sysnet-linux")
+	r, err := NewDebianResolvconf(
+		env.env(),
+		testNetwork(),
+		redirectDNSNetwork(upstream.addrPort),
+		"sysnet-linux",
+	)
 	if err != nil {
 		t.Fatalf("NewDebianResolvconf: %v", err)
 	}
@@ -53,9 +56,13 @@ func TestDebianResolvconfSetDNSCanBeRepeatedAndAvoidsManagedLoop(t *testing.T) {
 		"nameserver " + upstream.addrPort.Addr().String(),
 		"",
 	}, "\n"))
-	env.dial = redirectDNSDial(upstream.addrPort)
 
-	r, err := NewDebianResolvconf(env.env(), "sysnet-linux")
+	r, err := NewDebianResolvconf(
+		env.env(),
+		testNetwork(),
+		redirectDNSNetwork(upstream.addrPort),
+		"sysnet-linux",
+	)
 	if err != nil {
 		t.Fatalf("NewDebianResolvconf: %v", err)
 	}
@@ -84,6 +91,8 @@ func TestDebianResolvconfUnsetDNSIsIdempotent(t *testing.T) {
 	env := newFakeDebianResolvconfEnv("nameserver 192.0.2.1\n")
 	r, err := NewDebianResolvconf(
 		env.env(),
+		testNetwork(),
+		testNetwork(),
 		"sysnet-linux",
 		netip.MustParseAddrPort("127.0.0.1:53"),
 	)
@@ -117,6 +126,8 @@ func TestDebianResolvconfCloseDeletesActiveManagedState(t *testing.T) {
 	env := newFakeDebianResolvconfEnv("nameserver 192.0.2.1\n")
 	r, err := NewDebianResolvconf(
 		env.env(),
+		testNetwork(),
+		testNetwork(),
 		"sysnet-linux",
 		netip.MustParseAddrPort("127.0.0.1:53"),
 	)
@@ -148,7 +159,13 @@ func TestDebianResolvconfUsesFallbackWhenNoOriginalUpstream(t *testing.T) {
 	fallback := startTestDNSUpstream(t, [4]byte{10, 2, 0, 3})
 	env := newFakeDebianResolvconfEnv("# no nameservers\n")
 
-	r, err := NewDebianResolvconf(env.env(), "sysnet-linux", fallback.addrPort)
+	r, err := NewDebianResolvconf(
+		env.env(),
+		testNetwork(),
+		testNetwork(),
+		"sysnet-linux",
+		fallback.addrPort,
+	)
 	if err != nil {
 		t.Fatalf("NewDebianResolvconf: %v", err)
 	}
@@ -162,6 +179,8 @@ func TestDebianResolvconfSurfacesCommandErrors(t *testing.T) {
 	env.commandErr = errors.New("resolvconf failed")
 	r, err := NewDebianResolvconf(
 		env.env(),
+		testNetwork(),
+		testNetwork(),
 		"sysnet-linux",
 		netip.MustParseAddrPort("127.0.0.1:53"),
 	)
@@ -226,7 +245,6 @@ type fakeDebianResolvconfEnv struct {
 	files      map[string][]byte
 	readErr    error
 	commandErr error
-	dial       func(context.Context, string, string) (net.Conn, error)
 	commands   []fakeCommand
 }
 
@@ -248,7 +266,6 @@ func newFakeDebianResolvconfEnv(contents string) *fakeDebianResolvconfEnv {
 func (e *fakeDebianResolvconfEnv) env() Env {
 	return Env{
 		ReadFile:       e.readFile,
-		Dial:           e.dial,
 		CommandContext: e.commandContext,
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/asciimoth/gonnect"
 	"github.com/asciimoth/sysnet-linux/dns/resolvconffile"
 )
 
@@ -18,9 +19,12 @@ func TestDirectForwardsToOriginalAfterSetDNS(t *testing.T) {
 	env := newFakeDirectEnv(
 		"nameserver " + upstream.addrPort.Addr().String() + "\n",
 	)
-	env.dial = redirectDNSDial(upstream.addrPort)
 
-	d, err := NewDirect(env.env())
+	d, err := NewDirect(
+		env.env(),
+		testNetwork(),
+		redirectDNSNetwork(upstream.addrPort),
+	)
 	if err != nil {
 		t.Fatalf("NewDirect: %v", err)
 	}
@@ -45,9 +49,12 @@ func TestDirectSetDNSCanBeRepeatedAndAvoidsManagedLoop(t *testing.T) {
 		"nameserver " + upstream.addrPort.Addr().String(),
 		"",
 	}, "\n"))
-	env.dial = redirectDNSDial(upstream.addrPort)
 
-	d, err := NewDirect(env.env())
+	d, err := NewDirect(
+		env.env(),
+		testNetwork(),
+		redirectDNSNetwork(upstream.addrPort),
+	)
 	if err != nil {
 		t.Fatalf("NewDirect: %v", err)
 	}
@@ -66,7 +73,12 @@ func TestDirectSetDNSCanBeRepeatedAndAvoidsManagedLoop(t *testing.T) {
 func TestDirectUnsetDNSIsIdempotentAndRestoresOriginal(t *testing.T) {
 	original := "nameserver 192.0.2.1\nsearch example.com\n"
 	env := newFakeDirectEnv(original)
-	d, err := NewDirect(env.env(), netip.MustParseAddrPort("127.0.0.1:53"))
+	d, err := NewDirect(
+		env.env(),
+		testNetwork(),
+		testNetwork(),
+		netip.MustParseAddrPort("127.0.0.1:53"),
+	)
 	if err != nil {
 		t.Fatalf("NewDirect: %v", err)
 	}
@@ -88,7 +100,12 @@ func TestDirectUnsetDNSIsIdempotentAndRestoresOriginal(t *testing.T) {
 
 func TestDirectCloseRollsBackAbsentOriginal(t *testing.T) {
 	env := newFakeDirectEnvAbsent()
-	d, err := NewDirect(env.env(), netip.MustParseAddrPort("127.0.0.1:53"))
+	d, err := NewDirect(
+		env.env(),
+		testNetwork(),
+		testNetwork(),
+		netip.MustParseAddrPort("127.0.0.1:53"),
+	)
 	if err != nil {
 		t.Fatalf("NewDirect: %v", err)
 	}
@@ -108,7 +125,12 @@ func TestDirectCloseRollsBackAbsentOriginal(t *testing.T) {
 
 func TestDirectSkipsRollbackWhenCurrentFileIsExternallyChanged(t *testing.T) {
 	env := newFakeDirectEnv("nameserver 192.0.2.1\n")
-	d, err := NewDirect(env.env(), netip.MustParseAddrPort("127.0.0.1:53"))
+	d, err := NewDirect(
+		env.env(),
+		testNetwork(),
+		testNetwork(),
+		netip.MustParseAddrPort("127.0.0.1:53"),
+	)
 	if err != nil {
 		t.Fatalf("NewDirect: %v", err)
 	}
@@ -131,7 +153,12 @@ func TestDirectUsesFallbackWhenNoOriginalUpstream(t *testing.T) {
 	fallback := startTestDNSUpstream(t, [4]byte{10, 1, 0, 3})
 	env := newFakeDirectEnv("# no nameservers\n")
 
-	d, err := NewDirect(env.env(), fallback.addrPort)
+	d, err := NewDirect(
+		env.env(),
+		testNetwork(),
+		testNetwork(),
+		fallback.addrPort,
+	)
 	if err != nil {
 		t.Fatalf("NewDirect: %v", err)
 	}
@@ -143,7 +170,12 @@ func TestDirectUsesFallbackWhenNoOriginalUpstream(t *testing.T) {
 func TestDirectSurfacesFileErrors(t *testing.T) {
 	env := newFakeDirectEnv("nameserver 192.0.2.1\n")
 	env.writeErr = errors.New("write failed")
-	d, err := NewDirect(env.env(), netip.MustParseAddrPort("127.0.0.1:53"))
+	d, err := NewDirect(
+		env.env(),
+		testNetwork(),
+		testNetwork(),
+		netip.MustParseAddrPort("127.0.0.1:53"),
+	)
 	if err != nil {
 		t.Fatalf("NewDirect: %v", err)
 	}
@@ -188,7 +220,6 @@ type fakeDirectEnv struct {
 	readErr   error
 	writeErr  error
 	removeErr error
-	dial      func(context.Context, string, string) (net.Conn, error)
 }
 
 func newFakeDirectEnv(contents string) *fakeDirectEnv {
@@ -208,7 +239,6 @@ func (e *fakeDirectEnv) env() Env {
 		ReadFile:  e.readFile,
 		WriteFile: e.writeFile,
 		Remove:    e.remove,
-		Dial:      e.dial,
 	}
 }
 
@@ -246,14 +276,29 @@ func (e *fakeDirectEnv) remove(path string) error {
 	return nil
 }
 
-func redirectDNSDial(
-	target netip.AddrPort,
-) func(context.Context, string, string) (net.Conn, error) {
-	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		_, port, err := net.SplitHostPort(address)
-		if err == nil && port == "53" {
-			address = target.String()
-		}
-		return (&net.Dialer{}).DialContext(ctx, network, address)
+func testNetwork() gonnect.Network {
+	return gonnect.NativeConfig{}.Build()
+}
+
+type redirectNetwork struct {
+	gonnect.Network
+	target netip.AddrPort
+}
+
+func redirectDNSNetwork(target netip.AddrPort) gonnect.Network {
+	return redirectNetwork{
+		Network: testNetwork(),
+		target:  target,
 	}
+}
+
+func (n redirectNetwork) Dial(
+	ctx context.Context,
+	network, address string,
+) (net.Conn, error) {
+	_, port, err := net.SplitHostPort(address)
+	if err == nil && port == "53" {
+		address = n.target.String()
+	}
+	return n.Network.Dial(ctx, network, address)
 }

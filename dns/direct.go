@@ -39,7 +39,8 @@ type Direct struct {
 	mu              sync.Mutex
 	closed          bool
 	base            *gdns.Router
-	dial            gonnect.Dial
+	listenNetwork   gonnect.Network
+	dialNetwork     gonnect.Network
 	client          gdns.Interface
 	fallback        []netip.AddrPort
 	original        []byte
@@ -55,15 +56,30 @@ var _ DNSProvider = (*Direct)(nil)
 // NewDirect returns a DNSProvider backed by direct /etc/resolv.conf writes.
 //
 // env provides access to the host environment. Any nil callbacks are replaced
-// with production defaults. fallback is used only when /etc/resolv.conf has no
-// original nameserver after excluding the managed server installed by SetDNS.
-func NewDirect(env Env, fallback ...netip.AddrPort) (*Direct, error) {
+// with production defaults. listenNetwork is used for listening operations and
+// dialNetwork is used for all outgoing upstream DNS requests. fallback is used
+// only when /etc/resolv.conf has no original nameserver after excluding the
+// managed server installed by SetDNS.
+func NewDirect(
+	env Env,
+	listenNetwork gonnect.Network,
+	dialNetwork gonnect.Network,
+	fallback ...netip.AddrPort,
+) (*Direct, error) {
 	env = env.withDefaults()
+	if err := requireDNSNetworks(
+		"direct",
+		listenNetwork,
+		dialNetwork,
+	); err != nil {
+		return nil, err
+	}
 	d := &Direct{
-		env:      env,
-		base:     gdns.NewRouter(),
-		dial:     env.Dial,
-		fallback: append([]netip.AddrPort(nil), fallback...),
+		env:           env,
+		base:          gdns.NewRouter(),
+		listenNetwork: listenNetwork,
+		dialNetwork:   dialNetwork,
+		fallback:      append([]netip.AddrPort(nil), fallback...),
 	}
 
 	bs, err := env.ReadFile(resolvconffile.Path)
@@ -219,10 +235,10 @@ func (d *Direct) refreshUpstreams(exclude []netip.Addr) error {
 	}
 
 	d.mu.Lock()
-	dial := d.dial
+	dialNetwork := d.dialNetwork
 	d.mu.Unlock()
 
-	client := gdns.NewClient(dial, urls...)
+	client := gdns.NewClient(upstreamDNSDial(dialNetwork), urls...)
 	d.mu.Lock()
 	if d.closed {
 		d.mu.Unlock()
