@@ -15,6 +15,8 @@ func main() {
 	switch os.Args[1] {
 	case "dns":
 		os.Exit(runDNSCommand(os.Args[2:]))
+	case "subnet":
+		os.Exit(runSubnetCommand(os.Args[2:]))
 	case "-h", "--help", "help":
 		printUsage(os.Stdout)
 	default:
@@ -27,5 +29,6 @@ func main() {
 func printUsage(out *os.File) {
 	fmt.Fprintf(out, "usage: %s <subcommand>\n\n", os.Args[0])
 	fmt.Fprintln(out, "subcommands:")
-	fmt.Fprintln(out, "  dns    debug system DNS integration")
+	fmt.Fprintln(out, "  dns       debug system DNS integration")
+	fmt.Fprintln(out, "  subnet    debug subnet allocator")
 }
