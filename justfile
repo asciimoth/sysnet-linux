@@ -9,6 +9,10 @@ debug-subnet:
 	go build -o ./debug ./cmd/debug
 	./debug subnet
 
+debug-killswitch:
+	go build -o ./debug ./cmd/debug
+	./debug killswitch
+
 e2e-dns *cases:
 	./e2e/dns/run.sh {{cases}}
 
