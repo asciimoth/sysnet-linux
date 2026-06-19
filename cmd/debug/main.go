@@ -19,6 +19,8 @@ func main() {
 		os.Exit(runKillswitchCommand(os.Args[2:]))
 	case "subnet":
 		os.Exit(runSubnetCommand(os.Args[2:]))
+	case "tun-name":
+		os.Exit(runTUNNameCommand(os.Args[2:]))
 	case "-h", "--help", "help":
 		printUsage(os.Stdout)
 	default:
@@ -34,4 +36,8 @@ func printUsage(out *os.File) {
 	fmt.Fprintln(out, "  dns         debug system DNS integration")
 	fmt.Fprintln(out, "  killswitch  debug killswitch temporary rulesets")
 	fmt.Fprintln(out, "  subnet      debug subnet allocator")
+	fmt.Fprintln(
+		out,
+		"  tun-name    create a TUN using a random templated name",
+	)
 }

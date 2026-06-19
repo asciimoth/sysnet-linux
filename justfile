@@ -5,6 +5,10 @@ debug-dns:
 	go build -o ./debug ./cmd/debug
 	sudo ./debug dns
 
+debug-tun:
+	go build -o ./debug ./cmd/debug
+	sudo ./debug tun-name debug
+
 debug-subnet:
 	go build -o ./debug ./cmd/debug
 	./debug subnet
