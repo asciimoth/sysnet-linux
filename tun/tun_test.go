@@ -3,12 +3,15 @@ package tun
 
 import (
 	"errors"
+	"net/netip"
 	"os"
 	"slices"
 	"syscall"
 	"testing"
 
+	"github.com/asciimoth/gonnect/sysnet"
 	gtun "github.com/asciimoth/gonnect/tun"
+	"golang.org/x/sys/unix"
 )
 
 func TestCreateDefaultTUNRetriesOccupiedNames(t *testing.T) {
@@ -84,6 +87,131 @@ func TestCreateDefaultTUNReturnsRandomError(t *testing.T) {
 		t.Fatalf("CreateDefaultTUN error = %v, want random error", err)
 	}
 
+}
+
+func TestTunConfigFunctionsReturnUnknownTunForNilFile(t *testing.T) {
+	tun := fakeTun{name: "vpn-test"}
+
+	errChecks := []struct {
+		name string
+		fn   func() error
+	}{
+		{
+			name: "SetTunMTU",
+			fn: func() error {
+				return SetTunMTU(tun, 1400)
+			},
+		},
+		{
+			name: "SetTunAddrs",
+			fn: func() error {
+				return SetTunAddrs(tun, []string{"10.0.0.1/32"})
+			},
+		},
+		{
+			name: "AddTunAddr",
+			fn: func() error {
+				return AddTunAddr(tun, "10.0.0.1/32")
+			},
+		},
+		{
+			name: "SetTunRoutes",
+			fn: func() error {
+				return SetTunRoutes(tun, []string{"10.0.0.0/24"})
+			},
+		},
+		{
+			name: "AddTunRoute",
+			fn: func() error {
+				return AddTunRoute(tun, "10.0.0.0/24")
+			},
+		},
+	}
+	for _, check := range errChecks {
+		if err := check.fn(); !errors.Is(err, sysnet.ErrUnknownTun) {
+			t.Fatalf("%s error = %v, want ErrUnknownTun", check.name, err)
+		}
+	}
+
+	if _, err := GetTunAddrs(tun); !errors.Is(err, sysnet.ErrUnknownTun) {
+		t.Fatalf("GetTunAddrs error = %v, want ErrUnknownTun", err)
+	}
+	if _, err := GetTunRotue(tun); !errors.Is(err, sysnet.ErrUnknownTun) {
+		t.Fatalf("GetTunRotue error = %v, want ErrUnknownTun", err)
+	}
+	if _, err := SetTunName(tun); !errors.Is(err, sysnet.ErrUnknownTun) {
+		t.Fatalf("SetTunName error = %v, want ErrUnknownTun", err)
+	}
+}
+
+func TestIsNetlinkDumpRequestRequiresFullDumpMask(t *testing.T) {
+	if !isNetlinkDumpRequest(unix.NLM_F_REQUEST | unix.NLM_F_DUMP) {
+		t.Fatal("NLM_F_DUMP request was not detected as dump")
+	}
+
+	flags := uint16(
+		unix.NLM_F_REQUEST |
+			unix.NLM_F_ACK |
+			unix.NLM_F_REPLACE |
+			unix.NLM_F_CREATE,
+	)
+	if isNetlinkDumpRequest(flags) {
+		t.Fatal("replace/create request was detected as dump")
+	}
+}
+
+func TestNetlinkReceiveBufferAllowsLargeDumpDatagrams(t *testing.T) {
+	if netlinkReceiveBufferSize < 1<<20 {
+		t.Fatalf(
+			"netlinkReceiveBufferSize = %d, want at least 1 MiB",
+			netlinkReceiveBufferSize,
+		)
+	}
+}
+
+func TestRouteDstBytesUsesFullAddressLength(t *testing.T) {
+	prefix := netip.MustParsePrefix("10.112.0.0/24")
+	got := routeDstBytes(prefix)
+	want := []byte{10, 112, 0, 0}
+	if !slices.Equal(got, want) {
+		t.Fatalf("routeDstBytes(%v) = %#v, want %#v", prefix, got, want)
+	}
+}
+
+func TestParseTunAddrPrefixPreservesHostAddress(t *testing.T) {
+	got, err := parseTunAddrPrefix("10.0.0.1/24")
+	if err != nil {
+		t.Fatalf("parseTunAddrPrefix error = %v", err)
+	}
+	want := netip.MustParsePrefix("10.0.0.1/24")
+	if got != want {
+		t.Fatalf("parseTunAddrPrefix = %v, want %v", got, want)
+	}
+}
+
+func TestParseTunRoutePrefixMasksHostAddress(t *testing.T) {
+	got, err := parseTunRoutePrefix("10.0.0.1/24")
+	if err != nil {
+		t.Fatalf("parseTunRoutePrefix error = %v", err)
+	}
+	want := netip.MustParsePrefix("10.0.0.0/24")
+	if got != want {
+		t.Fatalf("parseTunRoutePrefix = %v, want %v", got, want)
+	}
+}
+
+func TestParseTunAddrPrefixesRejectsInvalidReplacementSet(t *testing.T) {
+	_, err := parseTunAddrPrefixes([]string{"10.0.0.1/24", "not-a-cidr"})
+	if err == nil {
+		t.Fatal("parseTunAddrPrefixes accepted invalid address")
+	}
+}
+
+func TestParseTunRoutePrefixesRejectsInvalidReplacementSet(t *testing.T) {
+	_, err := parseTunRoutePrefixes([]string{"10.0.0.0/24", "not-a-cidr"})
+	if err == nil {
+		t.Fatal("parseTunRoutePrefixes accepted invalid route")
+	}
 }
 
 func replaceCreateTUNTestHooks(t *testing.T) {

@@ -1,5 +1,6 @@
 [default.extend-words]
 importas = "importas"
+oif = "oif"
 
 [files]
 extend-exclude = ["filter_test.go"]
