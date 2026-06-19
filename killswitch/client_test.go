@@ -254,10 +254,12 @@ type testAdminServer struct {
 	msgs     chan mutationPayload
 	done     chan struct{}
 	once     sync.Once
+	wg       sync.WaitGroup
 
 	mu         sync.Mutex
 	interfaces []apiInterface
 	encoders   map[*json.Encoder]bool
+	conns      map[net.Conn]bool
 }
 
 func startTestAdminServer(t *testing.T, interfaces ...string) *testAdminServer {
@@ -285,13 +287,16 @@ func startTestAdminServerAt(
 		done:       make(chan struct{}),
 		interfaces: namedInterfaces(interfaces...),
 		encoders:   make(map[*json.Encoder]bool),
+		conns:      make(map[net.Conn]bool),
 	}
 	t.Cleanup(server.close)
+	server.wg.Add(1)
 	go server.acceptLoop(t)
 	return server
 }
 
 func (s *testAdminServer) acceptLoop(t *testing.T) {
+	defer s.wg.Done()
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -303,11 +308,15 @@ func (s *testAdminServer) acceptLoop(t *testing.T) {
 				return
 			}
 		}
+		s.wg.Add(1)
 		go s.handleConn(t, conn)
 	}
 }
 
 func (s *testAdminServer) handleConn(t *testing.T, conn net.Conn) {
+	defer s.wg.Done()
+	s.addConn(conn)
+	defer s.removeConn(conn)
 	defer conn.Close() //nolint:errcheck
 	dec := json.NewDecoder(conn)
 	enc := json.NewEncoder(conn)
@@ -317,7 +326,7 @@ func (s *testAdminServer) handleConn(t *testing.T, conn net.Conn) {
 	for {
 		var msg envelope
 		if err := dec.Decode(&msg); err != nil {
-			if !errors.Is(err, net.ErrClosed) {
+			if !s.isDone() && !errors.Is(err, net.ErrClosed) {
 				t.Logf("decode admin message: %v", err)
 			}
 			return
@@ -426,10 +435,41 @@ func (s *testAdminServer) removeEncoder(enc *json.Encoder) {
 	delete(s.encoders, enc)
 }
 
+func (s *testAdminServer) addConn(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.conns[conn] = true
+}
+
+func (s *testAdminServer) removeConn(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.conns, conn)
+}
+
+func (s *testAdminServer) isDone() bool {
+	select {
+	case <-s.done:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *testAdminServer) close() {
 	s.once.Do(func() {
 		close(s.done)
 		_ = s.listener.Close()
+		s.mu.Lock()
+		conns := make([]net.Conn, 0, len(s.conns))
+		for conn := range s.conns {
+			conns = append(conns, conn)
+		}
+		s.mu.Unlock()
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+		s.wg.Wait()
 	})
 }
 
