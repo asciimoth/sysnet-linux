@@ -20,4 +20,7 @@ debug-killswitch:
 e2e-dns *cases:
 	./e2e/dns/run.sh {{cases}}
 
-test-total: test e2e-dns
+e2e-routing:
+	./e2e/routing/run.sh
+
+test-total: test e2e-dns e2e-routing
