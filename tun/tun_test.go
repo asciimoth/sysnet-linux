@@ -11,7 +11,6 @@ import (
 
 	"github.com/asciimoth/gonnect/sysnet"
 	gtun "github.com/asciimoth/gonnect/tun"
-	"golang.org/x/sys/unix"
 )
 
 func TestCreateDefaultTUNRetriesOccupiedNames(t *testing.T) {
@@ -144,40 +143,6 @@ func TestTunConfigFunctionsReturnUnknownTunForNilFile(t *testing.T) {
 	}
 }
 
-func TestIsNetlinkDumpRequestRequiresFullDumpMask(t *testing.T) {
-	if !isNetlinkDumpRequest(unix.NLM_F_REQUEST | unix.NLM_F_DUMP) {
-		t.Fatal("NLM_F_DUMP request was not detected as dump")
-	}
-
-	flags := uint16(
-		unix.NLM_F_REQUEST |
-			unix.NLM_F_ACK |
-			unix.NLM_F_REPLACE |
-			unix.NLM_F_CREATE,
-	)
-	if isNetlinkDumpRequest(flags) {
-		t.Fatal("replace/create request was detected as dump")
-	}
-}
-
-func TestNetlinkReceiveBufferAllowsLargeDumpDatagrams(t *testing.T) {
-	if netlinkReceiveBufferSize < 1<<20 {
-		t.Fatalf(
-			"netlinkReceiveBufferSize = %d, want at least 1 MiB",
-			netlinkReceiveBufferSize,
-		)
-	}
-}
-
-func TestRouteDstBytesUsesFullAddressLength(t *testing.T) {
-	prefix := netip.MustParsePrefix("10.112.0.0/24")
-	got := routeDstBytes(prefix)
-	want := []byte{10, 112, 0, 0}
-	if !slices.Equal(got, want) {
-		t.Fatalf("routeDstBytes(%v) = %#v, want %#v", prefix, got, want)
-	}
-}
-
 func TestParseTunAddrPrefixPreservesHostAddress(t *testing.T) {
 	got, err := parseTunAddrPrefix("10.0.0.1/24")
 	if err != nil {
@@ -197,6 +162,43 @@ func TestParseTunRoutePrefixMasksHostAddress(t *testing.T) {
 	want := netip.MustParsePrefix("10.0.0.0/24")
 	if got != want {
 		t.Fatalf("parseTunRoutePrefix = %v, want %v", got, want)
+	}
+}
+
+func TestNetlinkAddrFromStringPreservesHostAddress(t *testing.T) {
+	got, err := netlinkAddrFromString("10.0.0.1/24")
+	if err != nil {
+		t.Fatalf("netlinkAddrFromString error = %v", err)
+	}
+	if got.IP.String() != "10.0.0.1" {
+		t.Fatalf("netlinkAddrFromString IP = %v, want 10.0.0.1", got.IP)
+	}
+	ones, bits := got.Mask.Size()
+	if ones != 24 || bits != 32 {
+		t.Fatalf("netlinkAddrFromString mask = %d/%d, want 24/32", ones, bits)
+	}
+}
+
+func TestNetlinkRouteFromPrefixMasksHostAddress(t *testing.T) {
+	got, err := netlinkRouteFromPrefix(3, netip.MustParsePrefix("10.0.0.1/24"))
+	if err != nil {
+		t.Fatalf("netlinkRouteFromPrefix error = %v", err)
+	}
+	if got.LinkIndex != 3 {
+		t.Fatalf("netlinkRouteFromPrefix LinkIndex = %d, want 3", got.LinkIndex)
+	}
+	if got.Dst.String() != "10.0.0.0/24" {
+		t.Fatalf("netlinkRouteFromPrefix Dst = %v, want 10.0.0.0/24", got.Dst)
+	}
+}
+
+func TestNetlinkRouteFromDefaultPrefixUsesNilDst(t *testing.T) {
+	got, err := netlinkRouteFromPrefix(3, netip.MustParsePrefix("0.0.0.0/0"))
+	if err != nil {
+		t.Fatalf("netlinkRouteFromPrefix error = %v", err)
+	}
+	if got.Dst != nil {
+		t.Fatalf("netlinkRouteFromPrefix Dst = %v, want nil", got.Dst)
 	}
 }
 
