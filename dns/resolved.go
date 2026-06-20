@@ -103,10 +103,11 @@ type resolvedLinkDomain struct {
 
 // Resolved is a DNSProvider backed by systemd-resolved.
 //
-// A Resolved instance owns one system bus connection and one resolved link. The
-// link is identified by Linux interface index, because that is what resolved's
-// Manager.SetLink* methods accept. Close reverts the link configuration and
-// releases the internal forwarding client.
+// A Resolved instance owns one system bus connection and, when configured with
+// an interface index, one resolved link. The link is identified by Linux
+// interface index, because that is what resolved's Manager.SetLink* methods
+// accept. Close reverts the link configuration and releases the internal
+// forwarding client.
 //
 // Resolved deliberately does not use systemd-resolved itself as its request
 // forwarder. It forwards through direct gonnect DNS clients backed by the
@@ -145,11 +146,13 @@ var _ DNSProvider = (*Resolved)(nil)
 // with production defaults.
 //
 // ifidx is the kernel network interface index to configure through resolved's
-// per-link D-Bus API. Requests are forwarded directly to the DNS servers that
-// resolved reports for that link, so SetDNS does not create a DNS loop through
-// the newly installed server. listenNetwork is used for listening operations and
-// dialNetwork is used for all outgoing upstream DNS requests. fallback is used
-// only if resolved does not report any usable link or global DNS servers.
+// per-link D-Bus API. Pass 0 when the interface does not exist yet, then call
+// SetInterfaceIndex before SetDNS. Requests are forwarded directly to the DNS
+// servers that resolved reports for that link, so SetDNS does not create a DNS
+// loop through the newly installed server. listenNetwork is used for listening
+// operations and dialNetwork is used for all outgoing upstream DNS requests.
+// fallback is used only if resolved does not report any usable link or global
+// DNS servers.
 func NewResolved(
 	env Env,
 	listenNetwork gonnect.Network,
@@ -165,7 +168,7 @@ func NewResolved(
 	); err != nil {
 		return nil, err
 	}
-	ifidx32, err := resolvedIfIndex(ifidx)
+	ifidx32, err := resolvedOptionalIfIndex(ifidx)
 	if err != nil {
 		return nil, err
 	}
@@ -209,6 +212,84 @@ func resolvedIfIndex(ifidx int) (int32, error) {
 		return 0, fmt.Errorf("resolved: invalid interface index %d", ifidx)
 	}
 	return int32(ifidx), nil //nolint:gosec // ifidx is bounds-checked above.
+}
+
+func resolvedOptionalIfIndex(ifidx int) (int32, error) {
+	if ifidx == 0 {
+		return 0, nil
+	}
+	return resolvedIfIndex(ifidx)
+}
+
+// InterfaceIndex returns the current resolved link interface index, or 0 when
+// no link is configured.
+func (r *Resolved) InterfaceIndex() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return int(r.ifidx)
+}
+
+// SetInterfaceIndex changes the resolved link managed by this provider.
+//
+// Passing 0 clears the configured link. If managed DNS is active, the old link
+// is reverted and the DNS configuration is reapplied to the new link. Clearing
+// the link while managed DNS is active is rejected; call UnsetDNS first.
+func (r *Resolved) SetInterfaceIndex(ifidx int) error {
+	ifidx32, err := resolvedOptionalIfIndex(ifidx)
+	if err != nil {
+		return err
+	}
+
+	r.env.Logf("resolved: SetInterfaceIndex(%d)", ifidx)
+	r.dnsMu.Lock()
+	defer r.dnsMu.Unlock()
+
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return gdns.ErrClosed
+	}
+	oldIfidx := r.ifidx
+	managedDNS := r.setDNS
+	managedDNSActive := r.setDNSActive
+	r.mu.Unlock()
+
+	if oldIfidx == ifidx32 {
+		return nil
+	}
+	if managedDNSActive && ifidx32 == 0 {
+		return errors.New(
+			"resolved: cannot clear interface index while DNS is active",
+		)
+	}
+
+	err = r.revertLink(oldIfidx)
+
+	r.mu.Lock()
+	r.ifidx = ifidx32
+	r.targetServers = nil
+	r.targetDomains = nil
+	r.upstreamSig = nil
+	r.mu.Unlock()
+
+	exclude := netip.Addr{}
+	if managedDNSActive {
+		exclude = managedDNS
+	}
+	if refreshErr := r.refreshUpstreams(exclude); refreshErr != nil {
+		err = errors.Join(err, refreshErr)
+	}
+	if managedDNSActive {
+		if applyErr := r.applyDNS(managedDNS); applyErr != nil {
+			err = errors.Join(err, applyErr)
+		}
+	}
+	return err
+}
+
+// UpdateInterfaceIndex is an alias for SetInterfaceIndex.
+func (r *Resolved) UpdateInterfaceIndex(ifidx int) error {
+	return r.SetInterfaceIndex(ifidx)
 }
 
 // Requests returns the queue consumed by the internal forwarding client.
@@ -312,18 +393,22 @@ func (r *Resolved) UnsetDNS() error {
 }
 
 func (r *Resolved) applyDNS(server netip.Addr) error {
-	r.env.Logf("resolved: applying managed DNS %s to ifidx %d", server, r.ifidx)
+	ifidx, err := r.requireInterfaceIndex()
+	if err != nil {
+		return err
+	}
+	r.env.Logf("resolved: applying managed DNS %s to ifidx %d", server, ifidx)
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
 		resolvedReconfigTimeout,
 	)
 	defer cancel()
 
-	err := r.mgr.CallWithContext(
+	err = r.mgr.CallWithContext(
 		ctx,
 		dbusResolvedInterface+".SetLinkDNS",
 		0,
-		r.ifidx,
+		ifidx,
 		[]resolvedLinkNameserver{resolvedNameserver(server)},
 	).Store()
 	if err != nil {
@@ -335,7 +420,7 @@ func (r *Resolved) applyDNS(server netip.Addr) error {
 		ctx,
 		dbusResolvedInterface+".SetLinkDomains",
 		0,
-		r.ifidx,
+		ifidx,
 		[]resolvedLinkDomain{{Domain: ".", RoutingOnly: true}},
 	).Store()
 	if err != nil {
@@ -348,7 +433,7 @@ func (r *Resolved) applyDNS(server netip.Addr) error {
 		ctx,
 		dbusResolvedInterface+".SetLinkDefaultRoute",
 		0,
-		r.ifidx,
+		ifidx,
 		true,
 	).Store()
 	if err != nil {
@@ -369,7 +454,7 @@ func (r *Resolved) applyDNS(server netip.Addr) error {
 		ctx,
 		dbusResolvedInterface+".SetLinkLLMNR",
 		0,
-		r.ifidx,
+		ifidx,
 		"no",
 	).Err; err != nil {
 		r.env.Logf("resolved: SetLinkLLMNR best-effort error: %v", err)
@@ -378,7 +463,7 @@ func (r *Resolved) applyDNS(server netip.Addr) error {
 		ctx,
 		dbusResolvedInterface+".SetLinkMulticastDNS",
 		0,
-		r.ifidx,
+		ifidx,
 		"no",
 	).Err; err != nil {
 		r.env.Logf("resolved: SetLinkMulticastDNS best-effort error: %v", err)
@@ -387,7 +472,7 @@ func (r *Resolved) applyDNS(server netip.Addr) error {
 		ctx,
 		dbusResolvedInterface+".SetLinkDNSSEC",
 		0,
-		r.ifidx,
+		ifidx,
 		"no",
 	).Err; err != nil {
 		r.env.Logf("resolved: SetLinkDNSSEC best-effort error: %v", err)
@@ -396,7 +481,7 @@ func (r *Resolved) applyDNS(server netip.Addr) error {
 		ctx,
 		dbusResolvedInterface+".SetLinkDNSOverTLS",
 		0,
-		r.ifidx,
+		ifidx,
 		"no",
 	).Err; err != nil {
 		r.env.Logf("resolved: SetLinkDNSOverTLS best-effort error: %v", err)
@@ -525,15 +610,21 @@ func (r *Resolved) syncResolvedState() error {
 	managedDNS := r.setDNS
 	managedDNSActive := r.setDNSActive
 	fallback := append([]netip.AddrPort(nil), r.fallback...)
+	ifidx := r.ifidx
 	r.mu.Unlock()
 
-	linkServers, err := r.linkDNSServers()
-	if err != nil {
-		return err
-	}
-	linkDomains, err := r.linkDomains()
-	if err != nil {
-		linkDomains = nil
+	var linkServers []netip.AddrPort
+	var linkDomains []resolvedLinkDomain
+	if ifidx != 0 {
+		var err error
+		linkServers, err = r.linkDNSServers()
+		if err != nil {
+			return err
+		}
+		linkDomains, err = r.linkDomains()
+		if err != nil {
+			linkDomains = nil
+		}
 	}
 
 	needsApply, err := r.reapplyDNSIfNeeded(
@@ -755,7 +846,19 @@ func (r *Resolved) Close() error {
 }
 
 func (r *Resolved) revertDNS() error {
-	r.env.Logf("resolved: reverting link %d", r.ifidx)
+	ifidx, err := resolvedOptionalIfIndex(r.InterfaceIndex())
+	if err != nil {
+		return err
+	}
+	return r.revertLink(ifidx)
+}
+
+func (r *Resolved) revertLink(ifidx int32) error {
+	if ifidx == 0 {
+		r.env.Logf("resolved: no link configured, skipping revert")
+		return nil
+	}
+	r.env.Logf("resolved: reverting link %d", ifidx)
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
 		resolvedReconfigTimeout,
@@ -764,15 +867,17 @@ func (r *Resolved) revertDNS() error {
 
 	var err error
 	if r.mgr != nil {
-		err = errors.Join(
-			err,
-			r.mgr.CallWithContext(
-				ctx,
-				dbusResolvedInterface+".RevertLink",
-				0,
-				r.ifidx,
-			).Err,
-		)
+		callErr := r.mgr.CallWithContext(
+			ctx,
+			dbusResolvedInterface+".RevertLink",
+			0,
+			ifidx,
+		).Err
+		if isResolvedNoSuchLink(callErr) {
+			r.env.Logf("resolved: link %d is gone, skipping revert", ifidx)
+		} else {
+			err = errors.Join(err, callErr)
+		}
 	}
 	return err
 }
@@ -794,14 +899,19 @@ func (r *Resolved) upstreamConfig(
 	fallback []netip.AddrPort,
 	exclude []netip.Addr,
 ) (resolvedUpstreamConfig, error) {
-	targetServers, err := r.linkDNSServers()
-	if err != nil {
-		return resolvedUpstreamConfig{}, err
-	}
+	var targetServers []netip.AddrPort
+	var targetDomains []resolvedLinkDomain
+	if r.InterfaceIndex() != 0 {
+		var err error
+		targetServers, err = r.linkDNSServers()
+		if err != nil {
+			return resolvedUpstreamConfig{}, err
+		}
 
-	targetDomains, err := r.linkDomains()
-	if err != nil {
-		targetDomains = nil
+		targetDomains, err = r.linkDomains()
+		if err != nil {
+			targetDomains = nil
+		}
 	}
 
 	return r.upstreamConfigFromLink(
@@ -819,6 +929,7 @@ func (r *Resolved) upstreamConfigFromLink(
 	targetDomains []resolvedLinkDomain,
 ) (resolvedUpstreamConfig, error) {
 	r.mu.Lock()
+	targetIfidx := r.ifidx
 	savedTargetServers := append([]netip.AddrPort(nil), r.targetServers...)
 	savedTargetDomains := append([]resolvedLinkDomain(nil), r.targetDomains...)
 	r.mu.Unlock()
@@ -837,15 +948,17 @@ func (r *Resolved) upstreamConfigFromLink(
 		managerDomains = nil
 	}
 
-	if len(targetServers) == 0 {
+	if len(targetServers) == 0 && targetIfidx != 0 {
 		if servers := filterAddr(
-			managerServers[r.ifidx],
+			managerServers[targetIfidx],
 			exclude,
 		); len(
 			servers,
 		) > 0 {
 			targetServers = servers
-			targetDomains = globalDomainsAsLinkDomains(managerDomains[r.ifidx])
+			targetDomains = globalDomainsAsLinkDomains(
+				managerDomains[targetIfidx],
+			)
 		} else {
 			targetServers = filterAddr(savedTargetServers, exclude)
 			targetDomains = savedTargetDomains
@@ -867,7 +980,7 @@ func (r *Resolved) upstreamConfigFromLink(
 		return ifindices[i] < ifindices[j]
 	})
 	for _, ifidx := range ifindices {
-		if ifidx == r.ifidx {
+		if targetIfidx != 0 && ifidx == targetIfidx {
 			continue
 		}
 		servers := managerServers[ifidx]
@@ -1193,17 +1306,30 @@ func (r *Resolved) linkDNSServers() ([]netip.AddrPort, error) {
 }
 
 func (r *Resolved) linkObject(ctx context.Context) (dbus.BusObject, error) {
+	ifidx, err := r.requireInterfaceIndex()
+	if err != nil {
+		return nil, err
+	}
 	var path dbus.ObjectPath
 	if err := r.mgr.CallWithContext(
 		ctx,
 		dbusResolvedInterface+".GetLink",
 		0,
-		r.ifidx,
+		ifidx,
 	).Store(&path); err != nil {
-		return nil, fmt.Errorf("resolved: GetLink(%d): %w", r.ifidx, err)
+		return nil, fmt.Errorf("resolved: GetLink(%d): %w", ifidx, err)
 	}
 
 	return r.conn.Object(dbusResolvedObject, path), nil
+}
+
+func (r *Resolved) requireInterfaceIndex() (int32, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ifidx == 0 {
+		return 0, errors.New("resolved: no interface index configured")
+	}
+	return r.ifidx, nil
 }
 
 func (r *Resolved) linkConfigNeedsApply(
@@ -1414,6 +1540,10 @@ func (r *Resolved) managerDomains() (map[int32][]resolvedGlobalDomain, error) {
 func (r *Resolved) globalDNSServers() ([]netip.AddrPort, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DbusTimeout)
 	defer cancel()
+	targetIfidx, err := resolvedOptionalIfIndex(r.InterfaceIndex())
+	if err != nil {
+		return nil, err
+	}
 
 	var v dbus.Variant
 	if err := r.mgr.CallWithContext(
@@ -1433,7 +1563,7 @@ func (r *Resolved) globalDNSServers() ([]netip.AddrPort, error) {
 
 	out := make([]netip.AddrPort, 0, len(raw))
 	for _, server := range raw {
-		if server.IfIndex == r.ifidx {
+		if targetIfidx != 0 && server.IfIndex == targetIfidx {
 			continue
 		}
 		if addr, ok := addrFromResolved(server.Family, server.Address); ok {
@@ -1447,6 +1577,10 @@ func (r *Resolved) globalDNSServers() ([]netip.AddrPort, error) {
 func (r *Resolved) globalDNSServersLegacy(
 	ctx context.Context,
 ) ([]netip.AddrPort, error) {
+	targetIfidx, err := resolvedOptionalIfIndex(r.InterfaceIndex())
+	if err != nil {
+		return nil, err
+	}
 	var v dbus.Variant
 	if err := r.mgr.CallWithContext(
 		ctx,
@@ -1465,7 +1599,7 @@ func (r *Resolved) globalDNSServersLegacy(
 
 	out := make([]netip.AddrPort, 0, len(raw))
 	for _, server := range raw {
-		if server.IfIndex == r.ifidx {
+		if targetIfidx != 0 && server.IfIndex == targetIfidx {
 			continue
 		}
 		if addr, ok := addrFromResolved(server.Family, server.Address); ok {
@@ -1565,4 +1699,20 @@ func isDBusUnknownMethod(err error) bool {
 	var dbusErr dbus.Error
 	return errors.As(err, &dbusErr) &&
 		dbusErr.Name == dbus.ErrMsgUnknownMethod.Name
+}
+
+func isResolvedNoSuchLink(err error) bool {
+	var dbusErr dbus.Error
+	if !errors.As(err, &dbusErr) {
+		return false
+	}
+	if strings.HasSuffix(dbusErr.Name, ".NoSuchLink") {
+		return true
+	}
+	for _, body := range dbusErr.Body {
+		if strings.Contains(fmt.Sprint(body), "not known") {
+			return true
+		}
+	}
+	return false
 }

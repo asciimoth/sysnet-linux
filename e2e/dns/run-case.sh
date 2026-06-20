@@ -39,7 +39,7 @@ set -euo pipefail
 # real provider-owned resolvconf record, then copy the expected generated
 # nameserver into Docker's mounted file before running dig.
 
-case_name="${1:?usage: sysnet-dns-e2e <direct|direct-no-upstream|debian-resolvconf|debian-resolvconf-no-upstream|openresolv|openresolv-no-upstream|systemd-resolved|systemd-resolved-no-upstream|systemd-resolved-split>}"
+case_name="${1:?usage: sysnet-dns-e2e <direct|direct-no-upstream|debian-resolvconf|debian-resolvconf-no-upstream|openresolv|openresolv-no-upstream|systemd-resolved|systemd-resolved-no-upstream|systemd-resolved-split|systemd-resolved-dynamic-ifidx>}"
 expected_mode="${case_name%-no-upstream}"
 if [[ "$case_name" == systemd-resolved-* ]]; then
 	expected_mode="systemd-resolved"
@@ -185,14 +185,21 @@ configure_resolved_link_dns() {
 }
 
 run_debug() {
-	local fallback_env=()
+	local debug_env=()
 	if [[ "$no_upstream" == 1 ]]; then
-		fallback_env=("SYSNET_DEBUG_DNS_FALLBACKS=${upstream_addr}:53")
+		debug_env+=("SYSNET_DEBUG_DNS_FALLBACKS=${upstream_addr}:53")
 	fi
-	env "${fallback_env[@]}" /usr/local/bin/sysnet-debug dns >"$debug_log" 2>&1 &
+	if [[ "$case_name" == systemd-resolved-dynamic-ifidx ]]; then
+		debug_env+=("SYSNET_DEBUG_RESOLVED_DYNAMIC_IFIDX=1")
+	fi
+	env "${debug_env[@]}" /usr/local/bin/sysnet-debug dns >"$debug_log" 2>&1 &
 	cleanup_pids+=("$!")
 	wait_for_log "^${expected_mode} <nil>$" "$debug_log" || fail "debug dns did not report DnsMode $expected_mode"
 	wait_for_log "proxying DNS on .*:53 until Ctrl\\+C" "$debug_log" || fail "debug dns did not start proxying"
+	if [[ "$case_name" == systemd-resolved-dynamic-ifidx ]]; then
+		wait_for_log "created resolved provider without interface index" "$debug_log" || fail "resolved provider was not created without interface index"
+		wait_for_log "updated resolved interface index to [0-9]+" "$debug_log" || fail "resolved interface index was not updated dynamically"
+	fi
 }
 
 assert_query() {
@@ -282,6 +289,13 @@ case "$case_name" in
 		else
 			start_systemd_resolved 1
 		fi
+		run_debug
+		assert_query
+		;;
+	systemd-resolved-dynamic-ifidx)
+		upstream_addr="$(ip -4 -o addr show dev eth0 | awk '{split($4, a, "/"); print a[1]; exit}')"
+		start_upstream
+		start_systemd_resolved 1
 		run_debug
 		assert_query
 		;;

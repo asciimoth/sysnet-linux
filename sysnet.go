@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -178,6 +179,11 @@ type Config struct {
 	KillswitchAllowExclude bool
 	Logf                   func(format string, args ...any)
 	Callbacks              Callbacks
+
+	// ExtraClosers are resources owned by System in addition to the standard
+	// injected components. They are closed by System.Close after DNS, routing,
+	// and killswitch state has been released.
+	ExtraClosers []io.Closer
 }
 
 // System composes the Linux DNS, TUN, routing, p-mark, and killswitch helpers.
@@ -216,6 +222,7 @@ type System struct {
 	killswitchAllowExclude bool
 	logf                   func(format string, args ...any)
 	callbacks              Callbacks
+	extraClosers           []io.Closer
 
 	tuns       map[gtun.Tun]*tunState
 	defaultTun *defaultTunState
@@ -272,7 +279,8 @@ func NewSystem(config Config) (*System, error) {
 	}
 	tracker := config.RuleTracker
 	if tracker == nil &&
-		(config.Features.MatcherRules || config.Features.TunRules) {
+		(config.Features.MatcherRules ||
+			(config.Features.TunRules && config.Features.Pmark)) {
 		tracker = multirule.New()
 	}
 	ownerLookup := config.OwnerLookup
@@ -312,7 +320,10 @@ func NewSystem(config Config) (*System, error) {
 		killswitchAllowExclude: config.KillswitchAllowExclude,
 		logf:                   logf,
 		callbacks:              config.Callbacks,
-		tuns:                   make(map[gtun.Tun]*tunState),
+		extraClosers: append(
+			[]io.Closer(nil),
+			config.ExtraClosers...),
+		tuns: make(map[gtun.Tun]*tunState),
 	}
 	s.reserveDefaultTunIP()
 	s.outNet = s.buildMarkedNetwork()
@@ -400,6 +411,11 @@ func (s *System) Close() error {
 	}
 	if s.killswitch != nil {
 		err = errors.Join(err, s.killswitch.Close())
+	}
+	for i := len(s.extraClosers) - 1; i >= 0; i-- {
+		if s.extraClosers[i] != nil {
+			err = errors.Join(err, s.extraClosers[i].Close())
+		}
 	}
 	return err
 }

@@ -4,6 +4,7 @@ package dns
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"reflect"
@@ -122,15 +123,108 @@ func TestResolvedUsesFallbackWhenResolvedReportsNoUpstream(t *testing.T) {
 	assertAResponse(t, r, "fallback.example.", [4]byte{10, 0, 0, 40})
 }
 
+func TestResolvedAllowsNoInterfaceAtConstructionAndSetLater(t *testing.T) {
+	upstream := startTestDNSUpstream(t, [4]byte{10, 0, 0, 50})
+	managed := netip.MustParseAddr("100.64.0.50")
+
+	bus := newFakeResolvedBus(0)
+	bus.setManagerDNS(8, upstream.addrPort)
+
+	r := newTestResolvedWithIfidx(t, bus, 0)
+	defer closeResolved(t, r)
+
+	if got := r.InterfaceIndex(); got != 0 {
+		t.Fatalf("InterfaceIndex = %d, want 0", got)
+	}
+	assertAResponse(t, r, "initial.example.", [4]byte{10, 0, 0, 50})
+
+	if err := r.SetDNS(managed); err == nil {
+		t.Fatal("SetDNS without interface index succeeded")
+	}
+	if err := r.SetInterfaceIndex(8); err != nil {
+		t.Fatalf("SetInterfaceIndex: %v", err)
+	}
+	if got := r.InterfaceIndex(); got != 8 {
+		t.Fatalf("InterfaceIndex = %d, want 8", got)
+	}
+	if err := r.SetDNS(managed); err != nil {
+		t.Fatalf("SetDNS after SetInterfaceIndex: %v", err)
+	}
+	assertManagedDNSOn(t, bus, 8, managed)
+}
+
+func TestResolvedSetInterfaceIndexReappliesActiveDNS(t *testing.T) {
+	upstreamA := startTestDNSUpstream(t, [4]byte{10, 0, 0, 60})
+	upstreamB := startTestDNSUpstream(t, [4]byte{10, 0, 0, 61})
+	managed := netip.MustParseAddr("100.64.0.60")
+
+	bus := newFakeResolvedBus(7)
+	bus.setManagerDNS(7, upstreamA.addrPort)
+	bus.setManagerDNS(8, upstreamB.addrPort)
+
+	r := newTestResolved(t, bus)
+	defer closeResolved(t, r)
+
+	if err := r.SetDNS(managed); err != nil {
+		t.Fatalf("SetDNS: %v", err)
+	}
+	assertManagedDNSOn(t, bus, 7, managed)
+
+	if err := r.SetInterfaceIndex(8); err != nil {
+		t.Fatalf("SetInterfaceIndex active: %v", err)
+	}
+	assertManagedDNSOn(t, bus, 8, managed)
+	assertRevertedLinks(t, bus, 7)
+	assertAResponse(t, r, "moved.example.", [4]byte{10, 0, 0, 61})
+}
+
+func TestResolvedSetInterfaceIndexIgnoresMissingOldLink(t *testing.T) {
+	upstreamA := startTestDNSUpstream(t, [4]byte{10, 0, 0, 62})
+	upstreamB := startTestDNSUpstream(t, [4]byte{10, 0, 0, 63})
+	managed := netip.MustParseAddr("100.64.0.62")
+
+	bus := newFakeResolvedBus(7)
+	bus.setManagerDNS(7, upstreamA.addrPort)
+	bus.setManagerDNS(8, upstreamB.addrPort)
+
+	r := newTestResolved(t, bus)
+	defer closeResolved(t, r)
+
+	if err := r.SetDNS(managed); err != nil {
+		t.Fatalf("SetDNS: %v", err)
+	}
+	bus.revertErr = map[int32]error{
+		7: dbus.Error{
+			Name: "org.freedesktop.resolve1.NoSuchLink",
+			Body: []any{"Link 7 not known"},
+		},
+	}
+	if err := r.SetInterfaceIndex(8); err != nil {
+		t.Fatalf("SetInterfaceIndex with missing old link: %v", err)
+	}
+	assertManagedDNSOn(t, bus, 8, managed)
+	assertAResponse(t, r, "missing-old-link.example.", [4]byte{10, 0, 0, 63})
+}
+
 func newTestResolved(
 	t *testing.T,
 	bus *fakeResolvedBus,
 	fallback ...netip.AddrPort,
 ) *Resolved {
 	t.Helper()
+	return newTestResolvedWithIfidx(t, bus, int(bus.ifidx), fallback...)
+}
+
+func newTestResolvedWithIfidx(
+	t *testing.T,
+	bus *fakeResolvedBus,
+	ifidx int,
+	fallback ...netip.AddrPort,
+) *Resolved {
+	t.Helper()
 	r, err := NewResolved(Env{
 		ResolvedBus: func() (DBusConn, error) { return bus, nil },
-	}, testNetwork(), testNetwork(), int(bus.ifidx), fallback...)
+	}, testNetwork(), testNetwork(), ifidx, fallback...)
 	if err != nil {
 		t.Fatalf("NewResolved: %v", err)
 	}
@@ -175,8 +269,21 @@ func assertAResponse(
 
 func assertManagedDNS(t *testing.T, bus *fakeResolvedBus, want netip.Addr) {
 	t.Helper()
+	assertManagedDNSOn(t, bus, bus.ifidx, want)
+}
+
+func assertManagedDNSOn(
+	t *testing.T,
+	bus *fakeResolvedBus,
+	ifidx int32,
+	want netip.Addr,
+) {
+	t.Helper()
 	bus.mu.Lock()
 	defer bus.mu.Unlock()
+	if bus.linkIfidx != ifidx {
+		t.Fatalf("managed link ifidx = %d, want %d", bus.linkIfidx, ifidx)
+	}
 	if len(bus.linkDNS) != 1 || bus.linkDNS[0].Addr() != want {
 		t.Fatalf("link DNS = %v, want %s", bus.linkDNS, want)
 	}
@@ -191,6 +298,15 @@ func assertManagedDNS(t *testing.T, bus *fakeResolvedBus, want netip.Addr) {
 	}
 	if !bus.defaultRoute {
 		t.Fatal("link default route is false, want true")
+	}
+}
+
+func assertRevertedLinks(t *testing.T, bus *fakeResolvedBus, want ...int32) {
+	t.Helper()
+	bus.mu.Lock()
+	defer bus.mu.Unlock()
+	if !reflect.DeepEqual(bus.revertedLinks, want) {
+		t.Fatalf("reverted links = %v, want %v", bus.revertedLinks, want)
 	}
 }
 
@@ -276,10 +392,13 @@ type fakeResolvedBus struct {
 
 	ifidx int32
 
-	linkDNS      []netip.AddrPort
-	linkDomains  []resolvedLinkDomain
-	defaultRoute bool
-	revertDNS    []netip.AddrPort
+	linkIfidx     int32
+	linkDNS       []netip.AddrPort
+	linkDomains   []resolvedLinkDomain
+	defaultRoute  bool
+	revertDNS     []netip.AddrPort
+	revertErr     map[int32]error
+	revertedLinks []int32
 
 	managerDNS     map[int32][]netip.AddrPort
 	managerDomains map[int32][]resolvedGlobalDomain
@@ -377,18 +496,28 @@ func (o fakeResolvedObject) CallWithContext(
 	call := &dbus.Call{Done: make(chan *dbus.Call, 1)}
 	switch method {
 	case dbusResolvedInterface + ".GetLink":
-		call.Body = []any{dbus.ObjectPath(dbusResolvedPath + "/link/_7")}
+		call.Body = []any{dbus.ObjectPath(
+			fmt.Sprintf("%s/link/_%d", dbusResolvedPath, args[0].(int32)),
+		)}
 	case dbusResolvedInterface + ".SetLinkDNS":
+		o.bus.linkIfidx = args[0].(int32)
 		o.bus.linkDNS = linkNameserversAsAddrPorts(
 			args[1].([]resolvedLinkNameserver),
 		)
 	case dbusResolvedInterface + ".SetLinkDomains":
+		o.bus.linkIfidx = args[0].(int32)
 		o.bus.linkDomains = append(
 			[]resolvedLinkDomain(nil),
 			args[1].([]resolvedLinkDomain)...)
 	case dbusResolvedInterface + ".SetLinkDefaultRoute":
+		o.bus.linkIfidx = args[0].(int32)
 		o.bus.defaultRoute = args[1].(bool)
 	case dbusResolvedInterface + ".RevertLink":
+		o.bus.revertedLinks = append(o.bus.revertedLinks, args[0].(int32))
+		if err := o.bus.revertErr[args[0].(int32)]; err != nil {
+			call.Err = err
+			break
+		}
 		o.bus.linkDNS = append([]netip.AddrPort(nil), o.bus.revertDNS...)
 		o.bus.linkDomains = nil
 		o.bus.defaultRoute = false

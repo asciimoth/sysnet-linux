@@ -45,13 +45,20 @@ func (s *System) ListRules() sysnet.RulesInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var info sysnet.RulesInfo
-	if s.features.TunRules && s.pmark != nil && s.ruleTracker != nil {
+	if s.tunRulesSupportedLocked() {
 		info.TunRules = append(info.TunRules, supportedRules...)
 	}
 	if s.features.MatcherRules && s.ruleTracker != nil && s.ownerLookup != nil {
 		info.MatcherRules = append(info.MatcherRules, supportedRules...)
 	}
 	return info
+}
+
+func (s *System) tunRulesSupportedLocked() bool {
+	return s.features.TunRules &&
+		s.features.Pmark &&
+		s.pmark != nil &&
+		s.ruleTracker != nil
 }
 
 // RuleVerify checks whether a rule value is syntactically valid.

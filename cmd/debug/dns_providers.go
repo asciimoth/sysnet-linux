@@ -42,6 +42,29 @@ func runResolvedDebug(ctx context.Context) error {
 	listenNetwork := gonnect.NativeConfig{}.Build()
 	dialNetwork := gonnect.NativeConfig{}.Build()
 
+	fallbacks, err := debugDNSFallbackAddrs()
+	if err != nil {
+		return err
+	}
+	dynamicIfidx := os.Getenv("SYSNET_DEBUG_RESOLVED_DYNAMIC_IFIDX") == "1"
+	var resolved *dns.Resolved
+	if dynamicIfidx {
+		resolved, err = dns.NewResolved(dns.Env{
+			Logf: func(format string, args ...any) {
+				fmt.Printf(format+"\n", args...)
+			},
+		}, listenNetwork, dialNetwork, 0, fallbacks...)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := resolved.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "resolved close: %v\n", err)
+			}
+		}()
+		fmt.Println("created resolved provider without interface index")
+	}
+
 	tun, err := createDummyTUN("sysnetdbg%d")
 	if err != nil {
 		return err
@@ -55,23 +78,26 @@ func runResolvedDebug(ctx context.Context) error {
 	}
 	fmt.Printf("assigned debug DNS address %s/32 to %s\n", addr, tun.name)
 
-	fallbacks, err := debugDNSFallbackAddrs()
-	if err != nil {
-		return err
-	}
-	resolved, err := dns.NewResolved(dns.Env{
-		Logf: func(format string, args ...any) {
-			fmt.Printf(format+"\n", args...)
-		},
-	}, listenNetwork, dialNetwork, tun.ifindex, fallbacks...)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := resolved.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "resolved close: %v\n", err)
+	if dynamicIfidx {
+		if err := resolved.SetInterfaceIndex(tun.ifindex); err != nil {
+			return err
 		}
-	}()
+		fmt.Printf("updated resolved interface index to %d\n", tun.ifindex)
+	} else {
+		resolved, err = dns.NewResolved(dns.Env{
+			Logf: func(format string, args ...any) {
+				fmt.Printf(format+"\n", args...)
+			},
+		}, listenNetwork, dialNetwork, tun.ifindex, fallbacks...)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := resolved.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "resolved close: %v\n", err)
+			}
+		}()
+	}
 
 	pc, err := listenDNS(ctx, listenNetwork, addr)
 	if err != nil {

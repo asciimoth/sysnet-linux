@@ -6,6 +6,7 @@ package linux
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -16,15 +17,151 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asciimoth/gonnect"
 	gdns "github.com/asciimoth/gonnect/dns"
 	"github.com/asciimoth/gonnect/sockowner"
 	"github.com/asciimoth/gonnect/sysnet"
 	gtun "github.com/asciimoth/gonnect/tun"
 	pmark "github.com/asciimoth/p-mark"
 	"github.com/asciimoth/p-mark/multirule"
+	linuxdns "github.com/asciimoth/sysnet-linux/dns"
 	"github.com/asciimoth/sysnet-linux/killswitch"
 	"github.com/asciimoth/sysnet-linux/routing"
 )
+
+func TestNewAutoBuildsAvailableComponents(t *testing.T) {
+	oldEnv := autoSystemEnv
+	defer func() { autoSystemEnv = oldEnv }()
+
+	closer := &fakeCloser{}
+	autoSystemEnv = systemAutoEnvironment{
+		hasCapability: func(int) bool { return true },
+		probeTUN: func(TUNFactory) error {
+			return nil
+		},
+		newRoutingManager: func() (RoutingManager, error) {
+			return &fakeRouting{}, nil
+		},
+		newDNSProvider: func(
+			SystemConfig,
+			gonnect.Network,
+			gonnect.Network,
+		) (linuxdns.DNSProvider, error) {
+			return newFakeDNSProvider(), nil
+		},
+		newPmark: func(
+			SystemConfig,
+			func(format string, args ...any),
+		) (PmarkController, []io.Closer, error) {
+			return &fakePmark{}, []io.Closer{closer}, nil
+		},
+		newKillswitch: func(string, killswitch.Logf) KillswitchClient {
+			return &fakeKillswitch{}
+		},
+	}
+
+	s, err := New(SystemConfig{
+		Pmark: PmarkConfig{PinPath: filepath.Join(t.TempDir(), "pmark")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	features := s.Features()
+	if !features.Tun || !features.DefaultTun || !features.DynTun ||
+		!features.DynDefaultTun || !features.TunNames || !features.StrictMode {
+		t.Fatalf("Features() = %+v, want native feature set", features)
+	}
+	rules := s.ListRules()
+	if len(rules.TunRules) != len(supportedRules) ||
+		len(rules.MatcherRules) != len(supportedRules) {
+		t.Fatalf("ListRules() = %+v, want all rule contexts", rules)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !closer.closed {
+		t.Fatal("auto-owned closer was not closed by System.Close")
+	}
+}
+
+func TestNewAutoDegradesUnavailableComponents(t *testing.T) {
+	oldEnv := autoSystemEnv
+	defer func() { autoSystemEnv = oldEnv }()
+
+	autoSystemEnv = systemAutoEnvironment{
+		hasCapability: func(int) bool { return false },
+		probeTUN: func(TUNFactory) error {
+			t.Fatal("probeTUN should not run without CAP_NET_ADMIN")
+			return nil
+		},
+		newRoutingManager: func() (RoutingManager, error) {
+			t.Fatal(
+				"routing manager should not be created without CAP_NET_ADMIN",
+			)
+			return nil, nil
+		},
+		newDNSProvider: func(
+			SystemConfig,
+			gonnect.Network,
+			gonnect.Network,
+		) (linuxdns.DNSProvider, error) {
+			return nil, errors.New("no DNS backend")
+		},
+		newPmark: func(
+			SystemConfig,
+			func(format string, args ...any),
+		) (PmarkController, []io.Closer, error) {
+			return nil, nil, nil
+		},
+		newKillswitch: func(string, killswitch.Logf) KillswitchClient {
+			return &fakeKillswitch{}
+		},
+	}
+
+	s, err := New(SystemConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	features := s.Features()
+	if features.Tun || features.DefaultTun || features.DynTun ||
+		features.DynDefaultTun || features.TunNames || features.StrictMode {
+		t.Fatalf(
+			"Features() = %+v, want TUN/routing features disabled",
+			features,
+		)
+	}
+	if err := s.VerifyTunOpts(
+		sysnet.TunOpts{},
+	); !errors.Is(
+		err,
+		sysnet.ErrNotSupported,
+	) {
+		t.Fatalf("VerifyTunOpts error = %v, want ErrNotSupported", err)
+	}
+	rules := s.ListRules()
+	if len(rules.TunRules) != 0 {
+		t.Fatalf("TunRules len = %d, want 0", len(rules.TunRules))
+	}
+	if len(rules.MatcherRules) != len(supportedRules) {
+		t.Fatalf(
+			"MatcherRules len = %d, want %d",
+			len(rules.MatcherRules),
+			len(supportedRules),
+		)
+	}
+	if s.dnsProvider != nil || s.routingManager != nil || s.killswitch == nil ||
+		s.pmark != nil {
+		t.Fatalf(
+			"components = dns:%v routing:%v killswitch:%v pmark:%v, want only killswitch built",
+			s.dnsProvider != nil,
+			s.routingManager != nil,
+			s.killswitch != nil,
+			s.pmark != nil,
+		)
+	}
+}
 
 func TestFeaturesAndRulesDegradeWithDependencies(t *testing.T) {
 	s, err := NewSystem(Config{
@@ -76,6 +213,54 @@ func TestFeaturesAndRulesDegradeWithDependencies(t *testing.T) {
 			len(rules.MatcherRules),
 			len(supportedRules),
 		)
+	}
+}
+
+func TestTunRulesRequirePmarkFeatureEnabled(t *testing.T) {
+	s, err := NewSystem(Config{
+		Features: FeatureConfig{
+			Tun:          true,
+			DefaultTun:   true,
+			TunRules:     true,
+			MatcherRules: true,
+			DNSControl:   true,
+			Routing:      true,
+			Pmark:        false,
+		},
+		DNSProvider:    newFakeDNSProvider(),
+		RoutingManager: &fakeRouting{},
+		Pmark:          &fakePmark{},
+		TUNFactory:     &fakeTUNFactory{},
+		TunConfig:      &fakeTunConfig{},
+		RuleTracker:    multirule.New(),
+		OwnerLookup: func(sockowner.FlowTuple) (*sockowner.SocketOwner, error) {
+			return &sockowner.SocketOwner{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	rules := s.ListRules()
+	if len(rules.TunRules) != 0 {
+		t.Fatalf("TunRules len = %d, want 0", len(rules.TunRules))
+	}
+	if len(rules.MatcherRules) != len(supportedRules) {
+		t.Fatalf(
+			"MatcherRules len = %d, want %d",
+			len(rules.MatcherRules),
+			len(supportedRules),
+		)
+	}
+	err = s.VerifyDefaultTunOpts(sysnet.DefaultTunOpts{
+		TunAddrs:  []string{"10.55.0.1/32"},
+		TunRoutes: []string{"0.0.0.0/0"},
+		DnsIP:     "10.55.0.1",
+		Exclude:   []sysnet.Rule{{Type: "pid", Rule: "7"}},
+	})
+	if !errors.Is(err, sysnet.ErrNotSupported) {
+		t.Fatalf("VerifyDefaultTunOpts error = %v, want ErrNotSupported", err)
 	}
 }
 
@@ -394,6 +579,308 @@ func TestBuildDefaultTunAppliesSideEffectsAndCloseRollsBack(t *testing.T) {
 	}
 }
 
+func TestBuildDefaultTunSetsDNSProviderInterfaceIndex(t *testing.T) {
+	dnsProvider := newFakeInterfaceDNSProvider()
+	s, err := NewSystem(Config{
+		Features: FeatureConfig{
+			Tun:        true,
+			DefaultTun: true,
+			DNSControl: true,
+			Routing:    true,
+		},
+		DNSProvider:    dnsProvider,
+		RoutingManager: &fakeRouting{},
+		TUNFactory:     &fakeTUNFactory{},
+		TunConfig:      &fakeTunConfig{},
+		PacketListen:   (&fakePacketListen{}).listen,
+		TUNIndex:       func(gtun.Tun) (int, error) { return 99, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	dt, err := s.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs:  []string{"10.55.0.1/32"},
+		TunRoutes: []string{"0.0.0.0/0"},
+		DnsIP:     "10.55.0.1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dnsProvider.interfaceIndices; len(got) != 1 || got[0] != 99 {
+		t.Fatalf("SetInterfaceIndex calls = %v, want [99]", got)
+	}
+	if dnsProvider.setDNS != netip.MustParseAddr("10.55.0.1") {
+		t.Fatalf("SetDNS = %v, want 10.55.0.1", dnsProvider.setDNS)
+	}
+	if err := dt.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := dnsProvider.interfaceIndices; len(got) != 2 || got[1] != 0 {
+		t.Fatalf("SetInterfaceIndex calls = %v, want clear to 0 on close", got)
+	}
+}
+
+func TestBuildDefaultTunRecreatesMissingLinkAndUpdatesInterfaceIndex(
+	t *testing.T,
+) {
+	dnsProvider := newFakeInterfaceDNSProvider()
+	routingManager := &fakeRouting{}
+	factory := &fakeTUNFactory{}
+	packetListen := &fakePacketListen{}
+	linkDeleted := false
+	s, err := NewSystem(Config{
+		Features: FeatureConfig{
+			Tun:        true,
+			DefaultTun: true,
+			DNSControl: true,
+			Routing:    true,
+		},
+		DNSProvider:    dnsProvider,
+		RoutingManager: routingManager,
+		TUNFactory:     factory,
+		TunConfig:      &fakeTunConfig{},
+		PacketListen:   packetListen.listen,
+		TUNIndex: func(t gtun.Tun) (int, error) {
+			if len(factory.created) > 0 && t == factory.created[0] {
+				if linkDeleted {
+					return 0, errors.New("link deleted")
+				}
+				return 99, nil
+			}
+			if len(factory.created) > 1 && t == factory.created[1] {
+				return 123, nil
+			}
+			return 0, errors.New("unknown tun")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	first, err := s.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs: []string{"10.55.0.1/32"},
+		DnsIP:    "10.55.0.1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	linkDeleted = true
+	second, err := s.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs: []string{"10.55.0.1/32"},
+		DnsIP:    "10.55.0.1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(factory.created) != 2 {
+		t.Fatalf("created TUNs = %d, want 2", len(factory.created))
+	}
+	if !factory.created[0].closed {
+		t.Fatal("old deleted-link TUN was not closed")
+	}
+	if len(packetListen.addrs) != 2 {
+		t.Fatalf("packet listen calls = %d, want 2", len(packetListen.addrs))
+	}
+	if !packetListen.conns[0].isClosed() {
+		t.Fatal("old DNS listener was not closed after link recreation")
+	}
+	if packetListen.conns[1].isClosed() {
+		t.Fatal("new DNS listener was closed after link recreation")
+	}
+	if got := dnsProvider.interfaceIndices; len(got) != 2 ||
+		got[0] != 99 || got[1] != 123 {
+		t.Fatalf("SetInterfaceIndex calls = %v, want [99 123]", got)
+	}
+	if routingManager.applied == nil || routingManager.applied.TUNIndex != 123 {
+		t.Fatalf(
+			"routing applied = %+v, want TUNIndex 123",
+			routingManager.applied,
+		)
+	}
+	first.SetDns(dnsProvider)
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBuildDefaultTunWithoutTunRulesSkipsPmarkChecker(t *testing.T) {
+	pmarkCtl := &fakePmark{}
+	s, err := NewSystem(Config{
+		Features: FeatureConfig{
+			Tun:        true,
+			DefaultTun: true,
+			DNSControl: true,
+			Routing:    true,
+			Pmark:      true,
+		},
+		DNSProvider:    newFakeDNSProvider(),
+		RoutingManager: &fakeRouting{},
+		Pmark:          pmarkCtl,
+		TUNFactory:     &fakeTUNFactory{},
+		TunConfig:      &fakeTunConfig{},
+		PacketListen:   (&fakePacketListen{}).listen,
+		TUNIndex:       func(gtun.Tun) (int, error) { return 99, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	dt, err := s.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs:  []string{"10.55.0.1/32"},
+		TunRoutes: []string{"0.0.0.0/0"},
+		DnsIP:     "10.55.0.1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pmarkCtl.setChecker != 0 || pmarkCtl.force != 0 {
+		t.Fatalf(
+			"pmark calls set=%d force=%d, want none",
+			pmarkCtl.setChecker,
+			pmarkCtl.force,
+		)
+	}
+	if err := dt.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBuildDefaultTunRebindsDNSListenerOnDNSIPChange(t *testing.T) {
+	dnsProvider := newFakeDNSProvider()
+	packetListen := &fakePacketListen{}
+	s, err := NewSystem(Config{
+		Features: FeatureConfig{
+			Tun:        true,
+			DefaultTun: true,
+			DNSControl: true,
+			Routing:    true,
+		},
+		DNSProvider:    dnsProvider,
+		RoutingManager: &fakeRouting{},
+		TUNFactory:     &fakeTUNFactory{},
+		TunConfig:      &fakeTunConfig{},
+		PacketListen:   packetListen.listen,
+		TUNIndex:       func(gtun.Tun) (int, error) { return 99, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	first, err := s.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs:  []string{"10.55.0.1/32"},
+		TunRoutes: []string{"0.0.0.0/0"},
+		DnsIP:     "10.55.0.1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs:  []string{"10.55.0.2/32"},
+		TunRoutes: []string{"0.0.0.0/0"},
+		DnsIP:     "10.55.0.2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(packetListen.addrs) != 2 {
+		t.Fatalf("packet listen calls = %d, want 2", len(packetListen.addrs))
+	}
+	if packetListen.addrs[0] != "10.55.0.1:53" ||
+		packetListen.addrs[1] != "10.55.0.2:53" {
+		t.Fatalf(
+			"packet listen addrs = %#v, want both DNS binds",
+			packetListen.addrs,
+		)
+	}
+	if !packetListen.conns[0].isClosed() {
+		t.Fatal("old DNS listener was not closed after DNS IP rebuild")
+	}
+	if packetListen.conns[1].isClosed() {
+		t.Fatal("new DNS listener was closed after successful rebuild")
+	}
+	if dnsProvider.setDNS != netip.MustParseAddr("10.55.0.2") {
+		t.Fatalf("SetDNS = %v, want 10.55.0.2", dnsProvider.setDNS)
+	}
+	first.SetDns(dnsProvider)
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBuildDefaultTunFailedRebuildClosesActiveDefaultTun(t *testing.T) {
+	dnsProvider := newFakeDNSProvider()
+	routingManager := &fakeRouting{}
+	factory := &fakeTUNFactory{}
+	packetListen := &fakePacketListen{}
+	s, err := NewSystem(Config{
+		Features: FeatureConfig{
+			Tun:        true,
+			DefaultTun: true,
+			DNSControl: true,
+			Routing:    true,
+		},
+		DNSProvider:    dnsProvider,
+		RoutingManager: routingManager,
+		TUNFactory:     factory,
+		TunConfig:      &fakeTunConfig{},
+		PacketListen:   packetListen.listen,
+		TUNIndex:       func(gtun.Tun) (int, error) { return 99, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	first, err := s.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs:  []string{"10.55.0.1/32"},
+		TunRoutes: []string{"0.0.0.0/0"},
+		DnsIP:     "10.55.0.1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dnsProvider.setErr = errors.New("set dns failed")
+	_, err = s.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs:  []string{"10.55.0.2/32"},
+		TunRoutes: []string{"0.0.0.0/0"},
+		DnsIP:     "10.55.0.2",
+	})
+	if !errors.Is(err, dnsProvider.setErr) {
+		t.Fatalf("BuildDefaultTun error = %v, want %v", err, dnsProvider.setErr)
+	}
+	if s.defaultTun != nil {
+		t.Fatal("failed rebuild left an active default tun")
+	}
+	if len(factory.created) != 1 || !factory.created[0].closed {
+		t.Fatalf(
+			"default tun closed = %v, want true",
+			len(factory.created) == 1 && factory.created[0].closed,
+		)
+	}
+	if len(packetListen.conns) != 2 {
+		t.Fatalf("packet listeners = %d, want 2", len(packetListen.conns))
+	}
+	if !packetListen.conns[0].isClosed() || !packetListen.conns[1].isClosed() {
+		t.Fatal(
+			"failed rebuild did not close old and replacement DNS listeners",
+		)
+	}
+	if !dnsProvider.unset {
+		t.Fatal("failed rebuild did not unset DNS")
+	}
+	if routingManager.rollback == nil {
+		t.Fatal("failed rebuild did not rollback routing")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type fakeTUNFactory struct {
 	created []*fakeTun
 }
@@ -482,6 +969,7 @@ func (f *fakeTunConfig) SetTunName(gtun.Tun) ([]string, error) {
 type fakeDNSProvider struct {
 	ch     chan gdns.Request
 	setDNS netip.Addr
+	setErr error
 	unset  bool
 }
 
@@ -491,11 +979,28 @@ func newFakeDNSProvider() *fakeDNSProvider {
 func (f *fakeDNSProvider) Requests() chan<- gdns.Request { return f.ch }
 func (f *fakeDNSProvider) Close() error                  { return nil }
 func (f *fakeDNSProvider) SetDNS(addr netip.Addr) error {
+	if f.setErr != nil {
+		return f.setErr
+	}
 	f.setDNS = addr
 	return nil
 }
 func (f *fakeDNSProvider) UnsetDNS() error {
 	f.unset = true
+	return nil
+}
+
+type fakeInterfaceDNSProvider struct {
+	*fakeDNSProvider
+	interfaceIndices []int
+}
+
+func newFakeInterfaceDNSProvider() *fakeInterfaceDNSProvider {
+	return &fakeInterfaceDNSProvider{fakeDNSProvider: newFakeDNSProvider()}
+}
+
+func (f *fakeInterfaceDNSProvider) SetInterfaceIndex(ifidx int) error {
+	f.interfaceIndices = append(f.interfaceIndices, ifidx)
 	return nil
 }
 
@@ -561,9 +1066,20 @@ func (f *fakeKillswitch) DeleteTMPRuleset(id uint64) error {
 }
 func (f *fakeKillswitch) Close() error { return nil }
 
+type fakeCloser struct {
+	closed bool
+}
+
+func (f *fakeCloser) Close() error {
+	f.closed = true
+	return nil
+}
+
 type fakePacketListen struct {
-	addr string
-	conn *fakePacketConn
+	addr  string
+	addrs []string
+	conn  *fakePacketConn
+	conns []*fakePacketConn
 }
 
 func (f *fakePacketListen) listen(
@@ -572,6 +1088,8 @@ func (f *fakePacketListen) listen(
 ) (net.PacketConn, error) {
 	f.addr = addr
 	f.conn = newFakePacketConn()
+	f.addrs = append(f.addrs, addr)
+	f.conns = append(f.conns, f.conn)
 	return f.conn, nil
 }
 
@@ -597,6 +1115,15 @@ func (f *fakePacketConn) WriteTo(
 func (f *fakePacketConn) Close() error {
 	f.once.Do(func() { close(f.closed) })
 	return nil
+}
+
+func (f *fakePacketConn) isClosed() bool {
+	select {
+	case <-f.closed:
+		return true
+	default:
+		return false
+	}
 }
 
 func (f *fakePacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }

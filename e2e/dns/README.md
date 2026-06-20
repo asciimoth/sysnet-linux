@@ -21,6 +21,9 @@ that `DnsMode` selects the matching `DNSProvider` implementation:
   global DNS servers, expected mode `systemd-resolved`.
 - `systemd-resolved-split`: systemd-resolved with two route-only domains on
   separate links, expected mode `systemd-resolved`.
+- `systemd-resolved-dynamic-ifidx`: systemd-resolved where the resolved
+  provider is constructed before its target interface index is set, expected
+  mode `systemd-resolved`.
 
 Every case starts a deterministic DNS upstream, then starts `debug dns`. In the
 regular cases that server is configured as the original upstream. In
@@ -35,6 +38,8 @@ to the debug DNS server, while provider forwarding still used either the
 original upstream or the constructor fallback.
 The split resolved case uses two upstreams with different answers and verifies
 that `corp.test` and `public.test` requests reach the matching upstream.
+The dynamic-ifidx resolved case verifies that the provider can start with no
+target interface and add the TUN interface index later before installing DNS.
 
 The Docker runs are privileged because the debug resolved path creates a TUN
 interface and all providers bind or rewrite system DNS state inside the

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"sync"
@@ -26,11 +27,14 @@ type defaultTunState struct {
 	system     *System
 	tun        gtun.Tun
 	server     *gdns.Server
+	dnsIP      netip.Addr
 	generation uint64
 
 	routingConfig *routing.Config
 	ruleIDs       []uint64
 	killswitchID  uint64
+	pmarkChecker  bool
+	dnsIfidxSet   bool
 }
 
 type defaultTun struct {
@@ -39,6 +43,10 @@ type defaultTun struct {
 }
 
 var _ sysnet.DefaultTun = (*defaultTun)(nil)
+
+type dnsInterfaceIndexer interface {
+	SetInterfaceIndex(int) error
+}
 
 // VerifyDefaultTunOpts validates DefaultTun options without mutating host state.
 func (s *System) VerifyDefaultTunOpts(opts sysnet.DefaultTunOpts) error {
@@ -54,7 +62,10 @@ func (s *System) VerifyDefaultTunOpts(opts sysnet.DefaultTunOpts) error {
 		return sysnet.ErrNotSupported
 	}
 	if len(opts.Exclude) > 0 || len(opts.Include) > 0 {
-		if !s.features.TunRules || s.pmark == nil || s.ruleTracker == nil {
+		s.mu.Lock()
+		tunRulesSupported := s.tunRulesSupportedLocked()
+		s.mu.Unlock()
+		if !tunRulesSupported {
 			return sysnet.ErrNotSupported
 		}
 	}
@@ -98,7 +109,9 @@ func (s *System) BuildDefaultTun(
 	}
 
 	s.mu.Lock()
+	tunRulesSupported := s.tunRulesSupportedLocked()
 	state := s.defaultTun
+	rebuilding := state != nil
 	if state == nil {
 		t, err := s.tunFactory.CreateTUN(defaultTunBaseName, opts.MTU)
 		if err != nil {
@@ -108,56 +121,122 @@ func (s *System) BuildDefaultTun(
 		state = &defaultTunState{system: s, tun: t}
 		s.defaultTun = state
 	}
-	state.generation++
-	generation := state.generation
 	s.mu.Unlock()
 
-	state.mu.Lock()
-	if state.server != nil {
-		state.server.Detach()
+	tunRecreated := false
+	if rebuilding {
+		var err error
+		tunRecreated, err = s.ensureDefaultTunLink(state, opts.MTU)
+		if err != nil {
+			return nil, err
+		}
 	}
-	state.unregisterRulesLocked()
+
+	state.mu.Lock()
+	oldServer := state.server
+	oldDNSIP := state.dnsIP
+	oldRuleIDs := append([]uint64(nil), state.ruleIDs...)
+	oldPmarkChecker := state.pmarkChecker
 	state.mu.Unlock()
 
-	if err := s.tunConfig.SetTunMTU(state.tun, opts.MTU); err != nil {
+	var (
+		server                = oldServer
+		serverReplaced        bool
+		pmarkCheckerInstalled bool
+		ruleIDs               []uint64
+		appliedRC             *routing.Config
+	)
+	fail := func(cause error) (sysnet.DefaultTun, error) {
+		err := cause
+		for _, id := range ruleIDs {
+			s.unregisterRule(id)
+		}
+		if serverReplaced && server != nil {
+			server.Detach()
+			err = errors.Join(err, server.Close())
+		}
+		if !oldPmarkChecker && pmarkCheckerInstalled {
+			_, e := s.pmark.SetChecker(nil)
+			err = errors.Join(err, e)
+		}
+		if appliedRC != nil {
+			state.mu.Lock()
+			state.routingConfig = appliedRC
+			state.mu.Unlock()
+		}
+		s.mu.Lock()
+		active := s.defaultTun == state
+		if active {
+			s.defaultTun = nil
+		}
+		s.mu.Unlock()
+		if active {
+			err = errors.Join(err, state.closeActive())
+			if s.callbacks.DefaultTunClosed != nil {
+				s.callbacks.DefaultTunClosed()
+			}
+		}
 		return nil, err
+	}
+
+	if err := s.tunConfig.SetTunMTU(state.tun, opts.MTU); err != nil {
+		return fail(err)
 	}
 	if err := s.tunConfig.SetTunAddrs(state.tun, addrs); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	if err := s.tunConfig.SetTunRoutes(state.tun, routes); err != nil {
-		return nil, err
+		return fail(err)
 	}
-	if state.server == nil {
+	if tunRecreated && server != nil && oldDNSIP == dnsIP {
+		server.Detach()
+		if err := server.Close(); err != nil {
+			return fail(err)
+		}
+		if oldServer == server {
+			oldServer = nil
+		}
+		server = nil
+	}
+	if server == nil || oldDNSIP != dnsIP || tunRecreated {
 		conn, err := s.packetListen(
 			context.Background(),
 			"udp",
 			net.JoinHostPort(dnsIP.String(), "53"),
 		)
 		if err != nil {
-			return nil, err
+			return fail(err)
 		}
-		state.mu.Lock()
-		state.server = gdns.NewServer(conn, nil)
-		state.mu.Unlock()
+		server = gdns.NewServer(conn, nil)
+		serverReplaced = true
+	} else if server != nil {
+		server.Detach()
 	}
 
-	ruleIDs, check, err := s.defaultTunChecker(opts)
-	if err != nil {
-		return nil, err
-	}
-	if s.pmark != nil {
-		if _, err := s.pmark.SetChecker(check); err != nil {
-			return nil, err
+	var check pmark.CheckFunc
+	if tunRulesSupported {
+		var err error
+		ruleIDs, check, err = s.defaultTunChecker(opts)
+		if err != nil {
+			return fail(err)
 		}
+	}
+	if check != nil {
+		if _, err := s.pmark.SetChecker(check); err != nil {
+			return fail(err)
+		}
+		pmarkCheckerInstalled = true
 		if err := s.pmark.ForceProcessTraversal(); err != nil {
-			return nil, err
+			return fail(err)
 		}
 	}
 
 	index, err := s.tunIndex(state.tun)
 	if err != nil {
-		return nil, err
+		return fail(err)
+	}
+	if err := s.setDefaultTunDNSInterface(state, index); err != nil {
+		return fail(err)
 	}
 	rc := routing.DefaultConfig()
 	rc.TUNIndex = index
@@ -177,20 +256,33 @@ func (s *System) BuildDefaultTun(
 		rc.Strictness = routing.NonStrict
 	}
 	if err := s.routingManager.Apply(rc); err != nil {
-		return nil, err
+		return fail(err)
 	}
+	appliedRC = &rc
 	if err := s.dnsProvider.SetDNS(dnsIP); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	if err := s.updateKillswitch(state, rc.Mode); err != nil {
-		return nil, err
+		return fail(err)
 	}
 
 	state.mu.Lock()
+	generation := state.generation + 1
+	state.server = server
+	state.dnsIP = dnsIP
 	state.ruleIDs = ruleIDs
 	state.routingConfig = &rc
+	state.pmarkChecker = pmarkCheckerInstalled
+	state.dnsIfidxSet = s.dnsProviderSupportsInterfaceIndex()
 	state.generation = generation
 	state.mu.Unlock()
+	for _, id := range oldRuleIDs {
+		s.unregisterRule(id)
+	}
+	if serverReplaced && oldServer != nil {
+		oldServer.Detach()
+		_ = oldServer.Close()
+	}
 
 	wrapper := &defaultTun{defaultTunState: state, generation: generation}
 	if s.callbacks.DefaultTunCreated != nil {
@@ -208,9 +300,42 @@ func (s *System) BuildDefaultTun(
 	return wrapper, nil
 }
 
+func (s *System) ensureDefaultTunLink(
+	state *defaultTunState,
+	mtu int,
+) (bool, error) {
+	state.mu.Lock()
+	t := state.tun
+	state.mu.Unlock()
+
+	if _, err := s.tunIndex(t); err == nil {
+		return false, nil
+	}
+
+	replacement, err := s.tunFactory.CreateTUN(defaultTunBaseName, mtu)
+	if err != nil {
+		return false, err
+	}
+
+	state.mu.Lock()
+	old := state.tun
+	state.tun = replacement
+	state.mu.Unlock()
+
+	if old != nil {
+		_ = old.Close()
+	}
+	return true, nil
+}
+
 func (s *System) defaultTunChecker(
 	opts sysnet.DefaultTunOpts,
 ) ([]uint64, pmark.CheckFunc, error) {
+	if s.ruleTracker == nil {
+		return nil, func(pmark.ProcessInfo) (int8, uint64, bool) {
+			return 0, 0, false
+		}, nil
+	}
 	priority64, err := strconv.ParseInt(strconv.Itoa(s.pmarkPriority), 10, 8)
 	if err != nil {
 		return nil, nil, fmt.Errorf(
@@ -286,6 +411,36 @@ func (s *System) updateKillswitch(
 	return nil
 }
 
+func (s *System) dnsProviderSupportsInterfaceIndex() bool {
+	_, ok := s.dnsProvider.(dnsInterfaceIndexer)
+	return ok
+}
+
+func (s *System) setDefaultTunDNSInterface(
+	state *defaultTunState,
+	ifidx int,
+) error {
+	provider, ok := s.dnsProvider.(dnsInterfaceIndexer)
+	if !ok {
+		return nil
+	}
+	if err := provider.SetInterfaceIndex(ifidx); err != nil {
+		return err
+	}
+	state.mu.Lock()
+	state.dnsIfidxSet = true
+	state.mu.Unlock()
+	return nil
+}
+
+func (s *System) clearDefaultTunDNSInterface() error {
+	provider, ok := s.dnsProvider.(dnsInterfaceIndexer)
+	if !ok {
+		return nil
+	}
+	return provider.SetInterfaceIndex(0)
+}
+
 func (d *defaultTun) SetDns(resolver gdns.Interface) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -325,6 +480,10 @@ func (d *defaultTunState) closeActive() error {
 	d.routingConfig = nil
 	ksID := d.killswitchID
 	d.killswitchID = 0
+	pmarkChecker := d.pmarkChecker
+	d.pmarkChecker = false
+	dnsIfidxSet := d.dnsIfidxSet
+	d.dnsIfidxSet = false
 	d.unregisterRulesLocked()
 	d.mu.Unlock()
 
@@ -336,13 +495,16 @@ func (d *defaultTunState) closeActive() error {
 	if d.system.dnsProvider != nil {
 		err = errors.Join(err, d.system.dnsProvider.UnsetDNS())
 	}
+	if dnsIfidxSet {
+		err = errors.Join(err, d.system.clearDefaultTunDNSInterface())
+	}
 	if rc != nil && d.system.routingManager != nil {
 		err = errors.Join(err, d.system.routingManager.Rollback(*rc))
 	}
 	if ksID != 0 && d.system.killswitch != nil {
 		err = errors.Join(err, d.system.killswitch.DeleteTMPRuleset(ksID))
 	}
-	if d.system.pmark != nil {
+	if pmarkChecker && d.system.pmark != nil {
 		_, e := d.system.pmark.SetChecker(nil)
 		err = errors.Join(err, e)
 	}
@@ -352,9 +514,15 @@ func (d *defaultTunState) closeActive() error {
 
 func (d *defaultTunState) unregisterRulesLocked() {
 	for _, id := range d.ruleIDs {
-		d.system.ruleTracker.UnregisterRule(id)
+		d.system.unregisterRule(id)
 	}
 	d.ruleIDs = nil
+}
+
+func (s *System) unregisterRule(id uint64) {
+	if s.ruleTracker != nil {
+		s.ruleTracker.UnregisterRule(id)
+	}
 }
 
 func (d *defaultTun) File() *os.File { return d.tun.File() }

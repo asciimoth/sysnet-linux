@@ -15,6 +15,7 @@ if [[ $# -eq 0 ]]; then
 		systemd-resolved
 		systemd-resolved-no-upstream
 		systemd-resolved-split
+		systemd-resolved-dynamic-ifidx
 	)
 else
 	cases=("$@")
