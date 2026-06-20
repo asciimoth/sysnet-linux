@@ -3,8 +3,8 @@ module github.com/asciimoth/sysnet-linux
 go 1.25.5
 
 require (
-	github.com/asciimoth/gonnect v0.23.0
-	github.com/asciimoth/tuntap v0.3.8
+	github.com/asciimoth/gonnect v0.24.0
+	github.com/asciimoth/tuntap v0.3.9
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/vishvananda/netlink v1.3.1
 	golang.org/x/sys v0.44.0
