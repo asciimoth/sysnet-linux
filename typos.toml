@@ -3,5 +3,5 @@ importas = "importas"
 oif = "oif"
 
 [files]
-extend-exclude = ["filter_test.go"]
+extend-exclude = ["sysnet_test.go"]
 

@@ -23,4 +23,7 @@ e2e-dns *cases:
 e2e-routing:
 	./e2e/routing/run.sh
 
-test-total: test e2e-dns e2e-routing
+e2e-system:
+	./e2e/system/run.sh
+
+test-total: test e2e-dns e2e-routing e2e-system
