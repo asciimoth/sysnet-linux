@@ -216,16 +216,40 @@ func GetTunRotue(tun gtun.Tun) ([]string, error) {
 
 // SetTunName updates name of provided Tun.
 //
-// The current gonnect sysnet.System interface does not provide a replacement
-// name argument, so this function validates that the Tun is known through its
-// File and returns the current kernel interface name. If File is nil,
-// sysnet.ErrUnknownTun is returned.
-func SetTunName(tun gtun.Tun) ([]string, error) {
+// The Tun must expose a non-nil File; otherwise sysnet.ErrUnknownTun is
+// returned.
+func SetTunName(tun gtun.Tun, name string) ([]string, error) {
 	info, err := tunFileInfo(tun)
 	if err != nil {
 		return nil, err
 	}
-	return []string{info.name}, nil
+	wasUp := info.link.Attrs().Flags&net.FlagUp != 0
+	if wasUp {
+		if err := netlink.LinkSetDown(info.link); err != nil {
+			return nil, fmt.Errorf("set interface %s down: %w", info.name, err)
+		}
+	}
+	if err := netlink.LinkSetName(info.link, name); err != nil {
+		if wasUp {
+			_ = netlink.LinkSetUp(info.link)
+		}
+		return nil, fmt.Errorf(
+			"rename interface %s to %s: %w",
+			info.name,
+			name,
+			err,
+		)
+	}
+	renamed, err := tunFileInfo(tun)
+	if err != nil {
+		return nil, err
+	}
+	if wasUp {
+		if err := netlink.LinkSetUp(renamed.link); err != nil {
+			return nil, fmt.Errorf("set interface %s up: %w", renamed.name, err)
+		}
+	}
+	return []string{renamed.name}, nil
 }
 
 type tunInfo struct {

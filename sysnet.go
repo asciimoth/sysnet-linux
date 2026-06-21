@@ -112,7 +112,7 @@ type TunConfigurator interface {
 	SetTunRoutes(gtun.Tun, []string) error
 	AddTunRoute(gtun.Tun, string) error
 	GetTunRotue(gtun.Tun) ([]string, error)
-	SetTunName(gtun.Tun) ([]string, error)
+	SetTunName(gtun.Tun, string) ([]string, error)
 }
 
 type systemTunConfigurator struct{}
@@ -141,8 +141,12 @@ func (systemTunConfigurator) AddTunRoute(t gtun.Tun, route string) error {
 func (systemTunConfigurator) GetTunRotue(t gtun.Tun) ([]string, error) {
 	return linuxtun.GetTunRotue(t)
 }
-func (systemTunConfigurator) SetTunName(t gtun.Tun) ([]string, error) {
-	return linuxtun.SetTunName(t)
+
+func (systemTunConfigurator) SetTunName(
+	t gtun.Tun,
+	name string,
+) ([]string, error) {
+	return linuxtun.SetTunName(t, name)
 }
 
 // PacketListenFunc opens the UDP socket backing the DefaultTun DNS server.
@@ -645,11 +649,11 @@ func (s *System) GetTunRotue(t gtun.Tun) ([]string, error) {
 	return s.tunConfig.GetTunRotue(t)
 }
 
-func (s *System) SetTunName(t gtun.Tun) ([]string, error) {
+func (s *System) SetTunName(t gtun.Tun, name string) ([]string, error) {
 	if !s.ownedRegularTun(t) {
 		return nil, sysnet.ErrUnknownTun
 	}
-	return s.tunConfig.SetTunName(t)
+	return s.tunConfig.SetTunName(t, name)
 }
 
 func nativeTunIndex(t gtun.Tun) (int, error) {

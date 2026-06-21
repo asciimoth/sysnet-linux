@@ -490,6 +490,16 @@ func TestBuildTunConfiguresAndChecksOwnership(t *testing.T) {
 	if got := cfg.routes[tun][0]; got != "0.0.0.0/0" {
 		t.Fatalf("configured route = %q, want 0.0.0.0/0", got)
 	}
+	names, err := s.SetTunName(tun, "renamed0")
+	if err != nil {
+		t.Fatalf("SetTunName error = %v", err)
+	}
+	if got := cfg.names[tun]; got != "renamed0" {
+		t.Fatalf("configured name = %q, want renamed0", got)
+	}
+	if len(names) != 1 || names[0] != "renamed0" {
+		t.Fatalf("SetTunName = %v, want [renamed0]", names)
+	}
 	if err := s.SetTunMTU(
 		&fakeTun{},
 		1500,
@@ -498,6 +508,15 @@ func TestBuildTunConfiguresAndChecksOwnership(t *testing.T) {
 		sysnet.ErrUnknownTun,
 	) {
 		t.Fatalf("SetTunMTU(unknown) = %v, want ErrUnknownTun", err)
+	}
+	if _, err := s.SetTunName(
+		&fakeTun{},
+		"unknown0",
+	); !errors.Is(
+		err,
+		sysnet.ErrUnknownTun,
+	) {
+		t.Fatalf("SetTunName(unknown) = %v, want ErrUnknownTun", err)
 	}
 }
 
@@ -920,6 +939,7 @@ type fakeTunConfig struct {
 	mtu    map[gtun.Tun]int
 	addrs  map[gtun.Tun][]string
 	routes map[gtun.Tun][]string
+	names  map[gtun.Tun]string
 }
 
 func (f *fakeTunConfig) init() {
@@ -927,6 +947,7 @@ func (f *fakeTunConfig) init() {
 		f.mtu = map[gtun.Tun]int{}
 		f.addrs = map[gtun.Tun][]string{}
 		f.routes = map[gtun.Tun][]string{}
+		f.names = map[gtun.Tun]string{}
 	}
 }
 func (f *fakeTunConfig) SetTunMTU(t gtun.Tun, mtu int) error {
@@ -962,8 +983,10 @@ func (f *fakeTunConfig) GetTunRotue(t gtun.Tun) ([]string, error) {
 	f.init()
 	return append([]string(nil), f.routes[t]...), nil
 }
-func (f *fakeTunConfig) SetTunName(gtun.Tun) ([]string, error) {
-	return []string{"fake0"}, nil
+func (f *fakeTunConfig) SetTunName(t gtun.Tun, name string) ([]string, error) {
+	f.init()
+	f.names[t] = name
+	return []string{name}, nil
 }
 
 type fakeDNSProvider struct {

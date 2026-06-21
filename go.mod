@@ -3,10 +3,10 @@ module github.com/asciimoth/sysnet-linux
 go 1.25.5
 
 require (
-	github.com/asciimoth/gonnect v0.24.0
-	github.com/asciimoth/gonnect-netstack v0.4.22
+	github.com/asciimoth/gonnect v0.25.1
+	github.com/asciimoth/gonnect-netstack v0.4.23
 	github.com/asciimoth/p-mark v0.2.0
-	github.com/asciimoth/tuntap v0.3.9
+	github.com/asciimoth/tuntap v0.3.10
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/vishvananda/netlink v1.3.1
 	golang.org/x/sys v0.44.0

@@ -764,6 +764,38 @@ func checkRegularTun(system *linux.System) error {
 			addrs,
 		)
 	}
+	renamed := fmt.Sprintf("snr%d", os.Getpid())
+	names, err := system.SetTunName(t, renamed)
+	if err != nil {
+		return fmt.Errorf("rename regular TUN: %w", err)
+	}
+	if len(names) != 1 || names[0] != renamed {
+		return fmt.Errorf("SetTunName = %v, want [%s]", names, renamed)
+	}
+	iface, err := net.InterfaceByName(renamed)
+	if err != nil {
+		return fmt.Errorf("lookup renamed regular TUN %s: %w", renamed, err)
+	}
+	if iface.Name != renamed {
+		return fmt.Errorf(
+			"regular TUN interface = %s, want %s",
+			iface.Name,
+			renamed,
+		)
+	}
+	if err := system.AddTunAddr(t, "10.67.0.2/32"); err != nil {
+		return fmt.Errorf("add regular TUN addr after rename: %w", err)
+	}
+	addrs, err = system.GetTunAddrs(t)
+	if err != nil {
+		return fmt.Errorf("get renamed regular TUN addrs: %w", err)
+	}
+	if !contains(addrs, "10.67.0.2/32") {
+		return fmt.Errorf(
+			"renamed regular TUN addrs = %v, want 10.67.0.2/32",
+			addrs,
+		)
+	}
 	if err := system.SetTunMTU(
 		nil,
 		1400,
@@ -803,7 +835,7 @@ func checkRegularTun(system *linux.System) error {
 	) {
 		return fmt.Errorf("GetTunRotue(nil) = %v, want ErrUnknownTun", err)
 	}
-	if _, err := system.SetTunName(nil); !errors.Is(
+	if _, err := system.SetTunName(nil, "unused0"); !errors.Is(
 		err,
 		sysnet.ErrUnknownTun,
 	) {
@@ -974,7 +1006,7 @@ func checkDefaultTunLifecycle(
 	); err != nil {
 		return err
 	}
-	if _, err := system.SetTunName(rebuilt); !errors.Is(
+	if _, err := system.SetTunName(rebuilt, "unused0"); !errors.Is(
 		err,
 		sysnet.ErrUnknownTun,
 	) {

@@ -138,7 +138,13 @@ func TestTunConfigFunctionsReturnUnknownTunForNilFile(t *testing.T) {
 	if _, err := GetTunRotue(tun); !errors.Is(err, sysnet.ErrUnknownTun) {
 		t.Fatalf("GetTunRotue error = %v, want ErrUnknownTun", err)
 	}
-	if _, err := SetTunName(tun); !errors.Is(err, sysnet.ErrUnknownTun) {
+	if _, err := SetTunName(
+		tun,
+		"renamed0",
+	); !errors.Is(
+		err,
+		sysnet.ErrUnknownTun,
+	) {
 		t.Fatalf("SetTunName error = %v, want ErrUnknownTun", err)
 	}
 }
