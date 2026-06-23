@@ -19,6 +19,7 @@ import (
 	"github.com/asciimoth/p-mark/fwmark"
 	"github.com/asciimoth/sysnet-linux/killswitch"
 	"github.com/asciimoth/sysnet-linux/routing"
+	gtunconfig "github.com/asciimoth/sysnet-linux/tun"
 )
 
 type defaultTunState struct {
@@ -112,8 +113,9 @@ func (s *System) BuildDefaultTun(
 	tunRulesSupported := s.tunRulesSupportedLocked()
 	state := s.defaultTun
 	rebuilding := state != nil
+	mtu := gtunconfig.NormalizeMTU(opts.MTU)
 	if state == nil {
-		t, err := s.tunFactory.CreateTUN(defaultTunBaseName, opts.MTU)
+		t, err := s.tunFactory.CreateTUN(defaultTunBaseName, mtu)
 		if err != nil {
 			s.mu.Unlock()
 			return nil, err
@@ -126,7 +128,7 @@ func (s *System) BuildDefaultTun(
 	tunRecreated := false
 	if rebuilding {
 		var err error
-		tunRecreated, err = s.ensureDefaultTunLink(state, opts.MTU)
+		tunRecreated, err = s.ensureDefaultTunLink(state, mtu)
 		if err != nil {
 			return nil, err
 		}

@@ -222,6 +222,31 @@ func TestTunConfigFunctionsReturnUnknownTunForNilFile(t *testing.T) {
 	}
 }
 
+func TestNormalizeMTU(t *testing.T) {
+	tests := []struct {
+		name string
+		mtu  int
+		want int
+	}{
+		{name: "zero", mtu: 0, want: defaultTunMTU},
+		{name: "below minimum", mtu: minTunMTU - 1, want: defaultTunMTU},
+		{name: "minimum", mtu: minTunMTU, want: minTunMTU},
+		{name: "explicit", mtu: 1400, want: 1400},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := NormalizeMTU(test.mtu); got != test.want {
+				t.Fatalf(
+					"NormalizeMTU(%d) = %d, want %d",
+					test.mtu,
+					got,
+					test.want,
+				)
+			}
+		})
+	}
+}
+
 func TestParseTunAddrPrefixPreservesHostAddress(t *testing.T) {
 	got, err := parseTunAddrPrefix("10.0.0.1/24")
 	if err != nil {

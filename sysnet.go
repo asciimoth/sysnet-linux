@@ -520,7 +520,8 @@ func (s *System) BuildTun(opts sysnet.TunOpts) (gtun.Tun, error) {
 	if len(baseName) == 0 {
 		baseName = defaultTunBaseName
 	}
-	t, err := s.tunFactory.CreateTUN(baseName, opts.MTU)
+	mtu := linuxtun.NormalizeMTU(opts.MTU)
+	t, err := s.tunFactory.CreateTUN(baseName, mtu)
 	if err != nil {
 		return nil, err
 	}

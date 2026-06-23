@@ -19,15 +19,21 @@ const (
 	minTunMTU     = 576
 )
 
+// NormalizeMTU returns the effective TUN MTU used by Linux configuration.
+func NormalizeMTU(mtu int) int {
+	if mtu < minTunMTU {
+		return defaultTunMTU
+	}
+	return mtu
+}
+
 // SetTunMTU updates MTU of provided Tun.
 //
 // The Tun must expose a non-nil File; otherwise sysnet.ErrUnknownTun is
 // returned. Values lower than the IPv4 minimum MTU are replaced with a sensible
 // default of 1420 bytes.
 func SetTunMTU(tun gtun.Tun, mtu int) error {
-	if mtu < minTunMTU {
-		mtu = defaultTunMTU
-	}
+	mtu = NormalizeMTU(mtu)
 
 	info, err := tunFileInfo(tun)
 	if err != nil {
