@@ -180,6 +180,8 @@ type Config struct {
 	UserMarkMask  uint32
 	PmarkPriority int
 
+	DefaultTunBaseName string
+
 	KillswitchAllowExclude bool
 	Logf                   func(format string, args ...any)
 	Callbacks              Callbacks
@@ -201,6 +203,8 @@ type System struct {
 	defaultTunIP    net.IP
 	defaultTunCIDR  string
 	defaultTunDNSIP netip.Addr
+
+	baseName string
 
 	outNet   gonnect.Network
 	localNet gonnect.Network
@@ -324,6 +328,7 @@ func NewSystem(config Config) (*System, error) {
 		killswitchAllowExclude: config.KillswitchAllowExclude,
 		logf:                   logf,
 		callbacks:              config.Callbacks,
+		baseName:               config.DefaultTunBaseName,
 		extraClosers: append(
 			[]io.Closer(nil),
 			config.ExtraClosers...),
@@ -511,7 +516,11 @@ func (s *System) BuildTun(opts sysnet.TunOpts) (gtun.Tun, error) {
 	if err := s.VerifyTunOpts(opts); err != nil {
 		return nil, err
 	}
-	t, err := s.tunFactory.CreateTUN(defaultTunBaseName, opts.MTU)
+	baseName := s.baseName
+	if len(baseName) == 0 {
+		baseName = defaultTunBaseName
+	}
+	t, err := s.tunFactory.CreateTUN(baseName, opts.MTU)
 	if err != nil {
 		return nil, err
 	}

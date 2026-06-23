@@ -99,6 +99,8 @@ type SystemConfig struct {
 	UserMark      uint32
 	UserMarkMask  uint32
 
+	DefaultTunBaseName string
+
 	KillswitchAllowExclude bool
 	Logf                   func(format string, args ...any)
 	Callbacks              Callbacks
@@ -239,6 +241,7 @@ func New(config SystemConfig) (*System, error) {
 		Logf:                   logf,
 		Callbacks:              config.Callbacks,
 		ExtraClosers:           extraClosers,
+		DefaultTunBaseName:     config.DefaultTunBaseName,
 	})
 	if err != nil {
 		closeAll(extraClosers)

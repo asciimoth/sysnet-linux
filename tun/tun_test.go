@@ -16,10 +16,10 @@ import (
 func TestCreateDefaultTUNRetriesOccupiedNames(t *testing.T) {
 	replaceCreateTUNTestHooks(t)
 
-	suffixes := []string{"first11111", "second2222"}
+	suffixes := []string{"first111111", "second22222"}
 	randomString = func(length int) (string, error) {
-		if length != randomNameLength {
-			t.Fatalf("random length = %d, want %d", length, randomNameLength)
+		if length != 11 {
+			t.Fatalf("random length = %d, want 11", length)
 		}
 		suffix := suffixes[0]
 		suffixes = suffixes[1:]
@@ -27,7 +27,7 @@ func TestCreateDefaultTUNRetriesOccupiedNames(t *testing.T) {
 	}
 
 	var names []string
-	wantTun := fakeTun{name: "vpn-second2222"}
+	wantTun := fakeTun{name: "vpn-second22222"}
 	createTUN = func(name string, mtu int) (gtun.Tun, error) {
 		names = append(names, name)
 		if mtu != 1400 {
@@ -46,10 +46,83 @@ func TestCreateDefaultTUNRetriesOccupiedNames(t *testing.T) {
 	if got != wantTun {
 		t.Fatalf("CreateDefaultTUN returned %#v, want %#v", got, wantTun)
 	}
-	if !slices.Equal(names, []string{"vpn-first11111", "vpn-second2222"}) {
+	if !slices.Equal(names, []string{"vpn-first111111", "vpn-second22222"}) {
 		t.Fatalf("created names = %#v", names)
 	}
 
+}
+
+func TestCreateDefaultTUNTruncatesFinalNameAfterConcatenation(t *testing.T) {
+	replaceCreateTUNTestHooks(t)
+
+	randomString = func(length int) (string, error) {
+		if length != 1 {
+			t.Fatalf("random length = %d, want 1", length)
+		}
+		return "Z", nil
+	}
+
+	var gotName string
+	wantTun := fakeTun{name: "abcdefghijklmno"}
+	createTUN = func(name string, mtu int) (gtun.Tun, error) {
+		gotName = name
+		return wantTun, nil
+	}
+
+	got, err := CreateDefaultTUN("abcdefghijklmnopqrst", 1400)
+	if err != nil {
+		t.Fatalf("CreateDefaultTUN error = %v", err)
+	}
+	if got != wantTun {
+		t.Fatalf("CreateDefaultTUN returned %#v, want %#v", got, wantTun)
+	}
+	if gotName != "abcdefghijklmno" {
+		t.Fatalf("created name = %q, want %q", gotName, "abcdefghijklmno")
+	}
+	if len(gotName) != 15 {
+		t.Fatalf("created name length = %d, want 15", len(gotName))
+	}
+}
+
+func TestCreateDefaultTUNStopsAfterRetryLimit(t *testing.T) {
+	replaceCreateTUNTestHooks(t)
+
+	var randomCalls int
+	randomString = func(length int) (string, error) {
+		randomCalls++
+		if length != 1 {
+			t.Fatalf("random length = %d, want 1", length)
+		}
+		return "Z", nil
+	}
+
+	var createCalls int
+	createTUN = func(name string, mtu int) (gtun.Tun, error) {
+		createCalls++
+		if name != "abcdefghijklmno" {
+			t.Fatalf("created name = %q, want %q", name, "abcdefghijklmno")
+		}
+		return nil, syscall.EBUSY
+	}
+
+	_, err := CreateDefaultTUN("abcdefghijklmnopqrst", 1400)
+	if !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("CreateDefaultTUN error = %v, want EBUSY", err)
+	}
+	if randomCalls != maxCreateTUNNameAttempts {
+		t.Fatalf(
+			"random calls = %d, want %d",
+			randomCalls,
+			maxCreateTUNNameAttempts,
+		)
+	}
+	if createCalls != maxCreateTUNNameAttempts {
+		t.Fatalf(
+			"create calls = %d, want %d",
+			createCalls,
+			maxCreateTUNNameAttempts,
+		)
+	}
 }
 
 func TestCreateDefaultTUNReturnsNonOccupiedError(t *testing.T) {
