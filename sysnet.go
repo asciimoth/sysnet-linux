@@ -538,12 +538,8 @@ func (s *System) BuildTun(opts sysnet.TunOpts) (gtun.Tun, error) {
 	if err := s.VerifyTunOpts(opts); err != nil {
 		return nil, err
 	}
-	baseName := s.baseName
-	if len(baseName) == 0 {
-		baseName = defaultTunBaseName
-	}
 	mtu := linuxtun.NormalizeMTU(opts.MTU)
-	t, err := s.tunFactory.CreateTUN(baseName, mtu)
+	t, err := s.tunFactory.CreateTUN(s.defaultTunBaseName(), mtu)
 	if err != nil {
 		return nil, err
 	}
@@ -592,6 +588,13 @@ func copyTunOpts(opts sysnet.TunOpts) sysnet.TunOpts {
 		TunRoutes: append([]string(nil), opts.TunRoutes...),
 		MTU:       opts.MTU,
 	}
+}
+
+func (s *System) defaultTunBaseName() string {
+	if s.baseName != "" {
+		return s.baseName
+	}
+	return defaultTunBaseName
 }
 
 func (s *System) ownedRegularTun(t gtun.Tun) bool {

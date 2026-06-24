@@ -117,7 +117,7 @@ func (s *System) BuildDefaultTun(
 	rebuilding := state != nil
 	mtu := gtunconfig.NormalizeMTU(opts.MTU)
 	if state == nil {
-		t, err := s.tunFactory.CreateTUN(defaultTunBaseName, mtu)
+		t, err := s.tunFactory.CreateTUN(s.defaultTunBaseName(), mtu)
 		if err != nil {
 			s.mu.Unlock()
 			return nil, err
@@ -329,7 +329,7 @@ func (s *System) ensureDefaultTunLink(
 		return false, nil
 	}
 
-	replacement, err := s.tunFactory.CreateTUN(defaultTunBaseName, mtu)
+	replacement, err := s.tunFactory.CreateTUN(s.defaultTunBaseName(), mtu)
 	if err != nil {
 		return false, err
 	}

@@ -544,6 +544,43 @@ func TestBuildTunNormalizesFactoryMTU(t *testing.T) {
 	}
 }
 
+func TestBuildDefaultTunUsesConfiguredBaseName(t *testing.T) {
+	factory := &fakeTUNFactory{}
+	s, err := NewSystem(Config{
+		Features: FeatureConfig{
+			Tun:        true,
+			DefaultTun: true,
+			DNSControl: true,
+			Routing:    true,
+		},
+		DNSProvider:        newFakeDNSProvider(),
+		RoutingManager:     &fakeRouting{},
+		TUNFactory:         factory,
+		TunConfig:          &fakeTunConfig{},
+		PacketListen:       (&fakePacketListen{}).listen,
+		TUNIndex:           func(gtun.Tun) (int, error) { return 99, nil },
+		DefaultTunBaseName: "customtun",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	dt, err := s.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs: []string{"10.55.0.1/32"},
+		DnsIP:    "10.55.0.1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := factory.names; !slices.Equal(got, []string{"customtun"}) {
+		t.Fatalf("factory base names = %v, want [customtun]", got)
+	}
+	if err := dt.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBuildDefaultTunAppliesSideEffectsAndCloseRollsBack(t *testing.T) {
 	dnsProvider := newFakeDNSProvider()
 	routingManager := &fakeRouting{}
@@ -843,11 +880,12 @@ func TestBuildDefaultTunRecreatesMissingLinkAndUpdatesInterfaceIndex(
 			DNSControl: true,
 			Routing:    true,
 		},
-		DNSProvider:    dnsProvider,
-		RoutingManager: routingManager,
-		TUNFactory:     factory,
-		TunConfig:      &fakeTunConfig{},
-		PacketListen:   packetListen.listen,
+		DNSProvider:        dnsProvider,
+		RoutingManager:     routingManager,
+		TUNFactory:         factory,
+		TunConfig:          &fakeTunConfig{},
+		PacketListen:       packetListen.listen,
+		DefaultTunBaseName: "rebuilttun",
 		TUNIndex: func(t gtun.Tun) (int, error) {
 			if len(factory.created) > 0 && t == factory.created[0] {
 				if linkDeleted {
@@ -887,6 +925,12 @@ func TestBuildDefaultTunRecreatesMissingLinkAndUpdatesInterfaceIndex(
 	}
 	if got := factory.mtus; len(got) != 2 || got[1] != 1420 {
 		t.Fatalf("factory MTUs = %v, want recreated MTU 1420", got)
+	}
+	if got := factory.names; !slices.Equal(
+		got,
+		[]string{"rebuilttun", "rebuilttun"},
+	) {
+		t.Fatalf("factory base names = %v, want rebuilttun for both TUNs", got)
 	}
 	if !factory.created[0].closed {
 		t.Fatal("old deleted-link TUN was not closed")
@@ -1093,12 +1137,14 @@ func TestBuildDefaultTunFailedRebuildClosesActiveDefaultTun(t *testing.T) {
 
 type fakeTUNFactory struct {
 	created []*fakeTun
+	names   []string
 	mtus    []int
 }
 
-func (f *fakeTUNFactory) CreateTUN(_ string, mtu int) (gtun.Tun, error) {
+func (f *fakeTUNFactory) CreateTUN(name string, mtu int) (gtun.Tun, error) {
 	t := &fakeTun{events: make(chan gtun.Event)}
 	f.created = append(f.created, t)
+	f.names = append(f.names, name)
 	f.mtus = append(f.mtus, mtu)
 	return t, nil
 }
