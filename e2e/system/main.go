@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -43,16 +44,24 @@ const (
 	physLinkName = "snrt-phys0"
 	peerLinkName = "snrt-peer0"
 	safeLinkName = "snrt-safe0"
+	rpfLinkName  = "snrt-rpf0"
+	rpfPeerName  = "snrt-rpf1"
+	rpfNetNSName = "snrt-rpf-ns"
 
 	dnsIP         = "10.66.0.1"
 	vtunServiceIP = "10.66.0.2"
 	vtunHTTPPort  = 18080
+	rpfHTTPIP     = "9.9.9.9"
+	rpfHTTPPort   = 18081
+	rpfUDPPort    = 18082
 
 	userMark = 0x4d000001
 
-	socketProbeMode = "socket-probe"
-	socketProbeComm = "system-e2e"
-	curlComm        = "^curl$"
+	socketProbeMode  = "socket-probe"
+	rpfHTTPServeMode = "rpfilter-http-server"
+	rpfUDPServeMode  = "rpfilter-udp-server"
+	socketProbeComm  = "system-e2e"
+	curlComm         = "^curl$"
 )
 
 func main() {
@@ -60,6 +69,18 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == socketProbeMode {
 		if err := runSocketProbe(); err != nil {
 			log.Fatalf("socket probe failed: %v", err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == rpfHTTPServeMode {
+		if err := runRPFilterHTTPServer(); err != nil {
+			log.Fatalf("rpfilter HTTP server failed: %v", err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == rpfUDPServeMode {
+		if err := runRPFilterUDPServer(); err != nil {
+			log.Fatalf("rpfilter UDP server failed: %v", err)
 		}
 		return
 	}
@@ -118,6 +139,9 @@ func run() error {
 		return err
 	}
 	if err := checkDefaultTunLifecycle(system, pmarkCtl); err != nil {
+		return err
+	}
+	if err := checkDefaultTunRPFilter(system); err != nil {
 		return err
 	}
 	if err := checkDefaultTunRebuildDNSMutation(system); err != nil {
@@ -1054,6 +1078,124 @@ func checkDefaultTunLifecycle(
 		"9.9.9.9",
 		0,
 		"dev "+physLinkName,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+type rpfilterCase struct {
+	name    string
+	install func() (func(), error)
+}
+
+func checkDefaultTunRPFilter(system *linux.System) error {
+	targets, stopPeer, err := startRPFilterPeer()
+	if err != nil {
+		return err
+	}
+	defer stopPeer()
+
+	cases := []rpfilterCase{
+		{
+			name:    "original strict return-drop",
+			install: installStrictRPFilter,
+		},
+		{
+			name:    "NixOS nftables strict",
+			install: installNixOSRPFilter,
+		},
+		{
+			name:    "firewalld-style nftables prerouting",
+			install: installFirewalldStyleRPFilter,
+		},
+		{
+			name:    "firewalld mangle-prerouting nftables",
+			install: installFirewalldMangleRPFilter,
+		},
+		{
+			name:    "kernel strict rp_filter with src_valid_mark",
+			install: installKernelStrictRPFilter,
+		},
+	}
+	for _, tc := range cases {
+		if err := checkDefaultTunRPFilterCase(system, targets, tc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkDefaultTunRPFilterCase(
+	system *linux.System,
+	targets rpfilterTargets,
+	tc rpfilterCase,
+) error {
+	stopFilter, err := tc.install()
+	if err != nil {
+		return fmt.Errorf("rpfilter %s install: %w", tc.name, err)
+	}
+	defer stopFilter()
+
+	label := "rpfilter " + tc.name
+
+	if err := markedHTTPGet(
+		system,
+		targets.HTTP,
+		label+" marked HTTP before DefaultTun",
+	); err != nil {
+		return err
+	}
+	if err := markedUDPEcho(
+		system,
+		targets.UDP,
+		label+" marked UDP before DefaultTun",
+	); err != nil {
+		return err
+	}
+
+	dt, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs: []string{dnsIP + "/32"},
+		DnsIP:    dnsIP,
+		MTU:      1400,
+		Strict:   false,
+	})
+	if err != nil {
+		return fmt.Errorf("%s build DefaultTun: %w", label, err)
+	}
+	defer func() { _ = dt.Close() }()
+
+	tunName, err := dt.Name()
+	if err != nil {
+		return fmt.Errorf("%s DefaultTun name: %w", label, err)
+	}
+	if err := expectRoute(
+		label+" unmarked public route",
+		rpfHTTPIP,
+		0,
+		"dev "+tunName,
+	); err != nil {
+		return err
+	}
+	if err := expectRoute(
+		label+" app-bypass public route",
+		rpfHTTPIP,
+		routing.DefaultAppBypassMark,
+		"dev "+rpfLinkName,
+	); err != nil {
+		return err
+	}
+	if err := markedHTTPGet(
+		system,
+		targets.HTTP,
+		label+" marked HTTP after DefaultTun",
+	); err != nil {
+		return err
+	}
+	if err := markedUDPEcho(
+		system,
+		targets.UDP,
+		label+" marked UDP after DefaultTun",
 	); err != nil {
 		return err
 	}
@@ -2283,6 +2425,730 @@ func startVTunHTTPService(dt sysnet.DefaultTun) (string, func(), error) {
 		}
 	}
 	return "http://" + listenAddr.String() + "/", stop, nil
+}
+
+func installStrictRPFilter() (func(), error) {
+	const (
+		tableName      = "sysnet_e2e_rpfilter"
+		preroutingName = "prerouting"
+		filterName     = "rpfilter"
+	)
+	commands := [][]string{
+		{"add", "table", "ip", tableName},
+		{
+			"add",
+			"chain",
+			"ip",
+			tableName,
+			preroutingName,
+			"{ type filter hook prerouting priority mangle; policy accept; }",
+		},
+		{"add", "chain", "ip", tableName, filterName},
+		{
+			"add",
+			"rule",
+			"ip",
+			tableName,
+			filterName,
+			"fib",
+			"saddr",
+			".",
+			"mark",
+			".",
+			"iif",
+			"oif",
+			"!=",
+			"0",
+			"counter",
+			"return",
+		},
+		{
+			"add",
+			"rule",
+			"ip",
+			tableName,
+			filterName,
+			"udp",
+			"sport",
+			"67",
+			"udp",
+			"dport",
+			"68",
+			"counter",
+			"return",
+		},
+		{
+			"add",
+			"rule",
+			"ip",
+			tableName,
+			filterName,
+			"ip",
+			"saddr",
+			"0.0.0.0",
+			"ip",
+			"daddr",
+			"255.255.255.255",
+			"udp",
+			"sport",
+			"68",
+			"udp",
+			"dport",
+			"67",
+			"counter",
+			"return",
+		},
+		{
+			"add",
+			"rule",
+			"ip",
+			tableName,
+			filterName,
+			"counter",
+			"drop",
+		},
+		{
+			"add",
+			"rule",
+			"ip",
+			tableName,
+			preroutingName,
+			"jump",
+			filterName,
+		},
+	}
+	return installNFTRPFilter("strict nft rpfilter", "ip", tableName, commands)
+}
+
+func installNixOSRPFilter() (func(), error) {
+	const (
+		tableName      = "sysnet_e2e_rpfilter_nixos"
+		preroutingName = "rpfilter"
+		allowName      = "rpfilter-allow"
+	)
+	commands := [][]string{
+		{"add", "table", "inet", tableName},
+		{
+			"add",
+			"chain",
+			"inet",
+			tableName,
+			preroutingName,
+			"{ type filter hook prerouting priority mangle + 10; policy drop; }",
+		},
+		{"add", "chain", "inet", tableName, allowName},
+		{
+			"add",
+			"rule",
+			"inet",
+			tableName,
+			preroutingName,
+			"meta",
+			"nfproto",
+			"ipv4",
+			"udp",
+			"sport",
+			"67",
+			"udp",
+			"dport",
+			"68",
+			"accept",
+		},
+		{
+			"add",
+			"rule",
+			"inet",
+			tableName,
+			preroutingName,
+			"meta",
+			"nfproto",
+			"ipv4",
+			"ip",
+			"saddr",
+			"0.0.0.0",
+			"ip",
+			"daddr",
+			"255.255.255.255",
+			"udp",
+			"sport",
+			"68",
+			"udp",
+			"dport",
+			"67",
+			"accept",
+		},
+		{
+			"add",
+			"rule",
+			"inet",
+			tableName,
+			preroutingName,
+			"fib",
+			"saddr",
+			".",
+			"mark",
+			".",
+			"iif",
+			"oif",
+			"exists",
+			"accept",
+		},
+		{
+			"add",
+			"rule",
+			"inet",
+			tableName,
+			preroutingName,
+			"jump",
+			allowName,
+		},
+	}
+	return installNFTRPFilter(
+		"NixOS-style nft rpfilter",
+		"inet",
+		tableName,
+		commands,
+	)
+}
+
+func installFirewalldStyleRPFilter() (func(), error) {
+	const (
+		tableName      = "sysnet_e2e_rpfilter_firewalld"
+		preroutingName = "filter_PREROUTING"
+	)
+	commands := [][]string{
+		{"add", "table", "inet", tableName},
+		{
+			"add",
+			"chain",
+			"inet",
+			tableName,
+			preroutingName,
+			"{ type filter hook prerouting priority filter + 10; policy accept; }",
+		},
+		{
+			"add",
+			"rule",
+			"inet",
+			tableName,
+			preroutingName,
+			"meta",
+			"nfproto",
+			"ipv4",
+			"fib",
+			"saddr",
+			".",
+			"mark",
+			".",
+			"iif",
+			"oif",
+			"missing",
+			"drop",
+		},
+	}
+	return installNFTRPFilter(
+		"firewalld-style nft rpfilter",
+		"inet",
+		tableName,
+		commands,
+	)
+}
+
+func installFirewalldMangleRPFilter() (func(), error) {
+	const (
+		tableName      = "sysnet_e2e_rpfilter_firewalld_mangle"
+		preroutingName = "mangle_PREROUTING"
+	)
+	commands := [][]string{
+		{"add", "table", "inet", tableName},
+		{
+			"add",
+			"chain",
+			"inet",
+			tableName,
+			preroutingName,
+			"{ type filter hook prerouting priority mangle + 10; policy accept; }",
+		},
+		{
+			"add",
+			"rule",
+			"inet",
+			tableName,
+			preroutingName,
+			"meta",
+			"nfproto",
+			"ipv4",
+			"fib",
+			"saddr",
+			".",
+			"mark",
+			".",
+			"iif",
+			"oif",
+			"missing",
+			"drop",
+		},
+	}
+	return installNFTRPFilter(
+		"firewalld mangle-prerouting nft rpfilter",
+		"inet",
+		tableName,
+		commands,
+	)
+}
+
+func installKernelStrictRPFilter() (func(), error) {
+	return applyProcSysctls("kernel strict rp_filter", []procSysctlSetting{
+		{
+			path:  "/proc/sys/net/ipv4/conf/all/rp_filter",
+			value: "0",
+		},
+		{
+			path:  "/proc/sys/net/ipv4/conf/" + rpfLinkName + "/rp_filter",
+			value: "1",
+		},
+		{
+			path:  "/proc/sys/net/ipv4/conf/all/src_valid_mark",
+			value: "0",
+		},
+		{
+			path: "/proc/sys/net/ipv4/conf/" + rpfLinkName +
+				"/src_valid_mark",
+			value: "1",
+		},
+	})
+}
+
+func installNFTRPFilter(
+	label string,
+	family string,
+	tableName string,
+	commands [][]string,
+) (func(), error) {
+	_, _ = commandOutput("nft", "delete", "table", family, tableName)
+	for _, args := range commands {
+		if _, err := commandOutput("nft", args...); err != nil {
+			_, _ = commandOutput("nft", "delete", "table", family, tableName)
+			return func() {}, fmt.Errorf(
+				"install %s %q: %w",
+				label,
+				strings.Join(args, " "),
+				err,
+			)
+		}
+	}
+	return func() {
+		if _, err := commandOutput(
+			"nft",
+			"delete",
+			"table",
+			family,
+			tableName,
+		); err != nil {
+			log.Printf("delete %s table failed: %v", label, err)
+		}
+	}, nil
+}
+
+type procSysctlSetting struct {
+	path  string
+	value string
+}
+
+func applyProcSysctls(
+	label string,
+	settings []procSysctlSetting,
+) (func(), error) {
+	originals := make([]procSysctlSetting, 0, len(settings))
+	restore := func() {
+		for i := len(originals) - 1; i >= 0; i-- {
+			if err := os.WriteFile(
+				originals[i].path,
+				[]byte(originals[i].value),
+				0o644,
+			); err != nil {
+				log.Printf(
+					"restore %s sysctl %s failed: %v",
+					label,
+					originals[i].path,
+					err,
+				)
+			}
+		}
+		_ = flushIPv4RouteCache(label)
+	}
+
+	for _, setting := range settings {
+		raw, err := os.ReadFile(setting.path)
+		if err != nil {
+			restore()
+			return func() {}, fmt.Errorf(
+				"read %s sysctl %s: %w",
+				label,
+				setting.path,
+				err,
+			)
+		}
+		originals = append(originals, procSysctlSetting{
+			path:  setting.path,
+			value: string(raw),
+		})
+		if err := os.WriteFile(
+			setting.path,
+			[]byte(setting.value),
+			0o644,
+		); err != nil {
+			restore()
+			return func() {}, fmt.Errorf(
+				"write %s sysctl %s=%s: %w",
+				label,
+				setting.path,
+				setting.value,
+				err,
+			)
+		}
+	}
+	if err := flushIPv4RouteCache(label); err != nil {
+		restore()
+		return func() {}, err
+	}
+	return restore, nil
+}
+
+func flushIPv4RouteCache(label string) error {
+	if err := os.WriteFile(
+		"/proc/sys/net/ipv4/route/flush",
+		[]byte("1"),
+		0o644,
+	); err != nil {
+		return fmt.Errorf("flush %s IPv4 route cache: %w", label, err)
+	}
+	return nil
+}
+
+type rpfilterTargets struct {
+	HTTP string
+	UDP  string
+}
+
+func startRPFilterPeer() (rpfilterTargets, func(), error) {
+	cleanupRPFilterPeer()
+	cleanups := []func(){cleanupRPFilterPeer}
+	cleanup := func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+	}
+	fail := func(format string, args ...any) (rpfilterTargets, func(), error) {
+		cleanup()
+		return rpfilterTargets{}, func() {}, fmt.Errorf(format, args...)
+	}
+
+	if err := ip("netns", "add", rpfNetNSName); err != nil {
+		return fail("create rpfilter netns: %w", err)
+	}
+	if err := ip(
+		"link",
+		"add",
+		rpfLinkName,
+		"type",
+		"veth",
+		"peer",
+		"name",
+		rpfPeerName,
+	); err != nil {
+		return fail("create rpfilter veth: %w", err)
+	}
+	if err := ip(
+		"link",
+		"set",
+		rpfPeerName,
+		"netns",
+		rpfNetNSName,
+	); err != nil {
+		return fail("move rpfilter peer to netns: %w", err)
+	}
+	commands := [][]string{
+		{"addr", "add", "198.18.0.2/24", "dev", rpfLinkName},
+		{"link", "set", rpfLinkName, "up"},
+		{
+			"route",
+			"add",
+			rpfHTTPIP + "/32",
+			"via",
+			"198.18.0.1",
+			"dev",
+			rpfLinkName,
+		},
+	}
+	for _, args := range commands {
+		if err := ip(args...); err != nil {
+			return fail(
+				"configure rpfilter root link %q: %w",
+				strings.Join(args, " "),
+				err,
+			)
+		}
+	}
+	netnsCommands := [][]string{
+		{"addr", "add", "198.18.0.1/24", "dev", rpfPeerName},
+		{"addr", "add", rpfHTTPIP + "/32", "dev", "lo"},
+		{"link", "set", "lo", "up"},
+		{"link", "set", rpfPeerName, "up"},
+	}
+	for _, args := range netnsCommands {
+		if err := ip(
+			append(
+				[]string{"netns", "exec", rpfNetNSName, "ip"},
+				args...)...); err != nil {
+			return fail(
+				"configure rpfilter peer link %q: %w",
+				strings.Join(args, " "),
+				err,
+			)
+		}
+	}
+
+	httpTarget := net.JoinHostPort(rpfHTTPIP, strconv.Itoa(rpfHTTPPort))
+	stopHTTP, err := startRPFilterHTTPServer(httpTarget)
+	if err != nil {
+		return fail("start rpfilter HTTP peer: %w", err)
+	}
+	cleanups = append(cleanups, stopHTTP)
+
+	udpTarget := net.JoinHostPort(rpfHTTPIP, strconv.Itoa(rpfUDPPort))
+	stopUDP, err := startRPFilterUDPServer(udpTarget)
+	if err != nil {
+		return fail("start rpfilter UDP peer: %w", err)
+	}
+	cleanups = append(cleanups, stopUDP)
+
+	return rpfilterTargets{HTTP: httpTarget, UDP: udpTarget}, cleanup, nil
+}
+
+func cleanupRPFilterPeer() {
+	_ = ip("route", "del", rpfHTTPIP+"/32")
+	_ = ip("link", "del", rpfLinkName)
+	_ = ip("netns", "delete", rpfNetNSName)
+}
+
+func startRPFilterHTTPServer(target string) (func(), error) {
+	return startRPFilterChildServer(rpfHTTPServeMode, target, "HTTP")
+}
+
+func startRPFilterUDPServer(target string) (func(), error) {
+	return startRPFilterChildServer(rpfUDPServeMode, target, "UDP")
+}
+
+func startRPFilterChildServer(
+	mode string,
+	target string,
+	label string,
+) (func(), error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(
+		ctx,
+		"ip",
+		"netns",
+		"exec",
+		rpfNetNSName,
+		os.Args[0],
+		mode,
+		target,
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		return func() {}, fmt.Errorf(
+			"open rpfilter %s server stdout: %w",
+			label,
+			err,
+		)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return func() {}, fmt.Errorf(
+			"start rpfilter %s server command: %w",
+			label,
+			err,
+		)
+	}
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+
+	readyCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		line, err := bufio.NewReader(stdout).ReadString('\n')
+		if err != nil {
+			errCh <- err
+			return
+		}
+		readyCh <- strings.TrimSpace(line)
+	}()
+
+	stop := func() {
+		cancel()
+		select {
+		case err := <-waitCh:
+			if err != nil && !errors.Is(ctx.Err(), context.Canceled) {
+				log.Printf(
+					"rpfilter %s server stopped with error: %v",
+					label,
+					err,
+				)
+			}
+		case <-time.After(time.Second):
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}
+		}
+	}
+
+	select {
+	case line := <-readyCh:
+		if line != "ready" {
+			stop()
+			return func() {}, fmt.Errorf(
+				"rpfilter %s server readiness = %q, want ready",
+				label,
+				line,
+			)
+		}
+	case err := <-errCh:
+		stop()
+		return func() {}, fmt.Errorf(
+			"read rpfilter %s server readiness: %w; stderr=%q",
+			label,
+			err,
+			stderr.String(),
+		)
+	case err := <-waitCh:
+		cancel()
+		return func() {}, fmt.Errorf(
+			"rpfilter %s server exited before ready: %w; stderr=%q",
+			label,
+			err,
+			stderr.String(),
+		)
+	case <-time.After(3 * time.Second):
+		stop()
+		return func() {}, errors.New(
+			"timed out waiting for rpfilter " + label + " server readiness",
+		)
+	}
+	return stop, nil
+}
+
+func runRPFilterHTTPServer() error {
+	if len(os.Args) != 3 {
+		return fmt.Errorf("usage: %s %s <addr>", os.Args[0], rpfHTTPServeMode)
+	}
+	listener, err := net.Listen("tcp4", os.Args[2])
+	if err != nil {
+		return fmt.Errorf("listen rpfilter HTTP server: %w", err)
+	}
+	defer listener.Close()
+	fmt.Println("ready")
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, "sysnet rpfilter ok")
+		}),
+	}
+	if err := server.Serve(
+		listener,
+	); err != nil &&
+		!errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("serve rpfilter HTTP: %w", err)
+	}
+	return nil
+}
+
+func runRPFilterUDPServer() error {
+	if len(os.Args) != 3 {
+		return fmt.Errorf("usage: %s %s <addr>", os.Args[0], rpfUDPServeMode)
+	}
+	conn, err := net.ListenPacket("udp4", os.Args[2])
+	if err != nil {
+		return fmt.Errorf("listen rpfilter UDP server: %w", err)
+	}
+	defer conn.Close()
+
+	fmt.Println("ready")
+	buf := make([]byte, 2048)
+	for {
+		n, addr, err := conn.ReadFrom(buf)
+		if err != nil {
+			return fmt.Errorf("read rpfilter UDP packet: %w", err)
+		}
+		if n == 0 {
+			continue
+		}
+		if _, err := conn.WriteTo(
+			[]byte("sysnet rpfilter udp ok"),
+			addr,
+		); err != nil {
+			return fmt.Errorf("write rpfilter UDP response: %w", err)
+		}
+	}
+}
+
+func markedHTTPGet(system *linux.System, target, label string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := system.OutNet().Dial(ctx, "tcp4", target)
+	if err != nil {
+		return fmt.Errorf("%s dial %s: %w", label, target, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	request := "GET / HTTP/1.1\r\nHost: " + rpfHTTPIP + "\r\nConnection: close\r\n\r\n"
+	if _, err := io.WriteString(conn, request); err != nil {
+		return fmt.Errorf("%s write request: %w", label, err)
+	}
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return fmt.Errorf("%s read response: %w", label, err)
+	}
+	if !strings.Contains(string(buf[:n]), "200 OK") {
+		return fmt.Errorf(
+			"%s response = %q, want HTTP 200",
+			label,
+			string(buf[:n]),
+		)
+	}
+	return nil
+}
+
+func markedUDPEcho(system *linux.System, target, label string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := system.OutNet().Dial(ctx, "udp4", target)
+	if err != nil {
+		return fmt.Errorf("%s dial %s: %w", label, target, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write([]byte("sysnet rpfilter udp")); err != nil {
+		return fmt.Errorf("%s write request: %w", label, err)
+	}
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return fmt.Errorf("%s read response: %w", label, err)
+	}
+	if got := string(buf[:n]); got != "sysnet rpfilter udp ok" {
+		return fmt.Errorf(
+			"%s response = %q, want UDP echo response",
+			label,
+			got,
+		)
+	}
+	return nil
 }
 
 func bridgeTuns(a, b gtun.Tun) {

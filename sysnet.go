@@ -22,6 +22,7 @@ import (
 	gtun "github.com/asciimoth/gonnect/tun"
 	pmark "github.com/asciimoth/p-mark"
 	"github.com/asciimoth/p-mark/multirule"
+	linuxconnmark "github.com/asciimoth/sysnet-linux/connmark"
 	"github.com/asciimoth/sysnet-linux/dns"
 	"github.com/asciimoth/sysnet-linux/killswitch"
 	"github.com/asciimoth/sysnet-linux/routing"
@@ -75,6 +76,13 @@ type RoutingManager interface {
 	Refresh() error
 	Rollback(routing.Config) error
 	Status() (routing.DesiredState, bool)
+	Close() error
+}
+
+// ConnmarkManager is the nftables conntrack-mark surface used by System.
+type ConnmarkManager interface {
+	Apply(linuxconnmark.Config) error
+	Rollback() error
 	Close() error
 }
 
@@ -163,6 +171,7 @@ type Config struct {
 
 	DNSProvider    dns.DNSProvider
 	RoutingManager RoutingManager
+	Connmark       ConnmarkManager
 	Pmark          PmarkController
 	Killswitch     KillswitchClient
 	TUNFactory     TUNFactory
@@ -212,6 +221,7 @@ type System struct {
 
 	dnsProvider    dns.DNSProvider
 	routingManager RoutingManager
+	connmark       ConnmarkManager
 	pmark          PmarkController
 	killswitch     KillswitchClient
 	tunFactory     TUNFactory
@@ -227,6 +237,7 @@ type System struct {
 	userMarkMask  uint32
 	pmarkPriority int
 
+	connmarkRequired       bool
 	killswitchAllowExclude bool
 	logf                   func(format string, args ...any)
 	callbacks              Callbacks
@@ -306,12 +317,19 @@ func NewSystem(config Config) (*System, error) {
 	if tunIndex == nil {
 		tunIndex = nativeTunIndex
 	}
+	connmarkManager := config.Connmark
+	connmarkRequired := connmarkManager != nil
+	if connmarkManager == nil && config.Features.DefaultTun &&
+		config.Features.Routing {
+		connmarkManager = linuxconnmark.NewManager()
+	}
 
 	s := &System{
 		features:               config.Features,
 		allocator:              allocator,
 		dnsProvider:            config.DNSProvider,
 		routingManager:         config.RoutingManager,
+		connmark:               connmarkManager,
 		pmark:                  config.Pmark,
 		killswitch:             config.Killswitch,
 		tunFactory:             factory,
@@ -325,6 +343,7 @@ func NewSystem(config Config) (*System, error) {
 		userMark:               userMark,
 		userMarkMask:           userMask,
 		pmarkPriority:          config.PmarkPriority,
+		connmarkRequired:       connmarkRequired,
 		killswitchAllowExclude: config.KillswitchAllowExclude,
 		logf:                   logf,
 		callbacks:              config.Callbacks,
@@ -417,6 +436,9 @@ func (s *System) Close() error {
 	}
 	if s.routingManager != nil {
 		err = errors.Join(err, s.routingManager.Close())
+	}
+	if s.connmark != nil {
+		err = errors.Join(err, s.connmark.Close())
 	}
 	if s.killswitch != nil {
 		err = errors.Join(err, s.killswitch.Close())

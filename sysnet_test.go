@@ -25,6 +25,7 @@ import (
 	gtun "github.com/asciimoth/gonnect/tun"
 	pmark "github.com/asciimoth/p-mark"
 	"github.com/asciimoth/p-mark/multirule"
+	linuxconnmark "github.com/asciimoth/sysnet-linux/connmark"
 	linuxdns "github.com/asciimoth/sysnet-linux/dns"
 	"github.com/asciimoth/sysnet-linux/killswitch"
 	"github.com/asciimoth/sysnet-linux/routing"
@@ -546,6 +547,7 @@ func TestBuildTunNormalizesFactoryMTU(t *testing.T) {
 func TestBuildDefaultTunAppliesSideEffectsAndCloseRollsBack(t *testing.T) {
 	dnsProvider := newFakeDNSProvider()
 	routingManager := &fakeRouting{}
+	connmarkCtl := &fakeConnmark{}
 	pmarkCtl := &fakePmark{}
 	ks := &fakeKillswitch{}
 	packetListen := &fakePacketListen{}
@@ -561,6 +563,7 @@ func TestBuildDefaultTunAppliesSideEffectsAndCloseRollsBack(t *testing.T) {
 		},
 		DNSProvider:    dnsProvider,
 		RoutingManager: routingManager,
+		Connmark:       connmarkCtl,
 		Pmark:          pmarkCtl,
 		Killswitch:     ks,
 		TUNFactory:     &fakeTUNFactory{},
@@ -590,6 +593,20 @@ func TestBuildDefaultTunAppliesSideEffectsAndCloseRollsBack(t *testing.T) {
 			routingManager.applied,
 		)
 	}
+	if len(connmarkCtl.applied) != 1 {
+		t.Fatalf("connmark apply calls = %d, want 1", len(connmarkCtl.applied))
+	}
+	wantMarks := []linuxconnmark.Mark{
+		{Value: routing.DefaultAppBypassMark, Mask: routing.DefaultMarkMask},
+		{Value: defaultUserMark, Mask: routing.DefaultMarkMask},
+	}
+	if !slices.Equal(connmarkCtl.applied[0].Marks, wantMarks) {
+		t.Fatalf(
+			"connmark marks = %+v, want %+v",
+			connmarkCtl.applied[0].Marks,
+			wantMarks,
+		)
+	}
 	if pmarkCtl.setChecker == 0 || pmarkCtl.force == 0 {
 		t.Fatalf(
 			"pmark calls set=%d force=%d, want both",
@@ -616,8 +633,58 @@ func TestBuildDefaultTunAppliesSideEffectsAndCloseRollsBack(t *testing.T) {
 	if routingManager.rollback == nil {
 		t.Fatal("DefaultTun.Close did not rollback routing")
 	}
+	if connmarkCtl.rollback == 0 {
+		t.Fatal("DefaultTun.Close did not rollback connmark")
+	}
 	if ks.deleted == 0 {
 		t.Fatal("DefaultTun.Close did not delete killswitch ruleset")
+	}
+}
+
+func TestBuildDefaultTunFailsExplicitConnmarkApply(t *testing.T) {
+	connmarkErr := errors.New("connmark boom")
+	dnsProvider := newFakeDNSProvider()
+	routingManager := &fakeRouting{}
+	connmarkCtl := &fakeConnmark{applyErr: connmarkErr}
+	factory := &fakeTUNFactory{}
+	s, err := NewSystem(Config{
+		Features: FeatureConfig{
+			Tun:        true,
+			DefaultTun: true,
+			DNSControl: true,
+			Routing:    true,
+		},
+		DNSProvider:    dnsProvider,
+		RoutingManager: routingManager,
+		Connmark:       connmarkCtl,
+		TUNFactory:     factory,
+		TunConfig:      &fakeTunConfig{},
+		PacketListen:   (&fakePacketListen{}).listen,
+		TUNIndex:       func(gtun.Tun) (int, error) { return 99, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	_, err = s.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs: []string{"10.55.0.1/32"},
+		DnsIP:    "10.55.0.1",
+	})
+	if !errors.Is(err, connmarkErr) {
+		t.Fatalf("BuildDefaultTun error = %v, want %v", err, connmarkErr)
+	}
+	if routingManager.rollback == nil {
+		t.Fatal("failed connmark apply did not rollback routing")
+	}
+	if connmarkCtl.rollback != 0 {
+		t.Fatal("failed connmark apply rolled back unapplied connmark")
+	}
+	if s.defaultTun != nil {
+		t.Fatal("failed connmark apply left an active default tun")
+	}
+	if len(factory.created) != 1 || !factory.created[0].closed {
+		t.Fatal("failed connmark apply did not close created TUN")
 	}
 }
 
@@ -1173,6 +1240,32 @@ func (f *fakeRouting) Rollback(config routing.Config) error {
 
 func (f *fakeRouting) Status() (routing.DesiredState, bool) { return routing.DesiredState{}, false }
 func (f *fakeRouting) Close() error                         { return nil }
+
+type fakeConnmark struct {
+	applied  []linuxconnmark.Config
+	rollback int
+	closed   bool
+	applyErr error
+}
+
+func (f *fakeConnmark) Apply(config linuxconnmark.Config) error {
+	if f.applyErr != nil {
+		return f.applyErr
+	}
+	copied := linuxconnmark.Config{
+		Marks: append([]linuxconnmark.Mark(nil), config.Marks...),
+	}
+	f.applied = append(f.applied, copied)
+	return nil
+}
+func (f *fakeConnmark) Rollback() error {
+	f.rollback++
+	return nil
+}
+func (f *fakeConnmark) Close() error {
+	f.closed = true
+	return nil
+}
 
 type fakePmark struct {
 	setChecker int

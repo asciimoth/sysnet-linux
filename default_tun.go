@@ -17,6 +17,7 @@ import (
 	gtun "github.com/asciimoth/gonnect/tun"
 	pmark "github.com/asciimoth/p-mark"
 	"github.com/asciimoth/p-mark/fwmark"
+	linuxconnmark "github.com/asciimoth/sysnet-linux/connmark"
 	"github.com/asciimoth/sysnet-linux/killswitch"
 	"github.com/asciimoth/sysnet-linux/routing"
 	gtunconfig "github.com/asciimoth/sysnet-linux/tun"
@@ -36,6 +37,7 @@ type defaultTunState struct {
 	killswitchID  uint64
 	pmarkChecker  bool
 	dnsIfidxSet   bool
+	connmarkSet   bool
 }
 
 type defaultTun struct {
@@ -145,6 +147,7 @@ func (s *System) BuildDefaultTun(
 		server                = oldServer
 		serverReplaced        bool
 		pmarkCheckerInstalled bool
+		connmarkSet           bool
 		ruleIDs               []uint64
 		appliedRC             *routing.Config
 	)
@@ -165,6 +168,9 @@ func (s *System) BuildDefaultTun(
 			state.mu.Lock()
 			state.routingConfig = appliedRC
 			state.mu.Unlock()
+		}
+		if connmarkSet && s.connmark != nil {
+			err = errors.Join(err, s.connmark.Rollback())
 		}
 		s.mu.Lock()
 		active := s.defaultTun == state
@@ -264,6 +270,11 @@ func (s *System) BuildDefaultTun(
 		return fail(err)
 	}
 	appliedRC = &rc
+	if ok, err := s.applyConnmark(); err != nil {
+		return fail(err)
+	} else {
+		connmarkSet = ok
+	}
 	if err := s.dnsProvider.SetDNS(dnsIP); err != nil {
 		return fail(err)
 	}
@@ -279,6 +290,7 @@ func (s *System) BuildDefaultTun(
 	state.routingConfig = &rc
 	state.pmarkChecker = pmarkCheckerInstalled
 	state.dnsIfidxSet = s.dnsProviderSupportsInterfaceIndex()
+	state.connmarkSet = connmarkSet
 	state.generation = generation
 	state.mu.Unlock()
 	for _, id := range oldRuleIDs {
@@ -416,6 +428,26 @@ func (s *System) updateKillswitch(
 	return nil
 }
 
+func (s *System) applyConnmark() (bool, error) {
+	if s.connmark == nil {
+		return false, nil
+	}
+	config := linuxconnmark.Config{
+		Marks: []linuxconnmark.Mark{
+			{Value: s.appBypassMark, Mask: s.appBypassMask},
+			{Value: s.userMark, Mask: s.userMarkMask},
+		},
+	}
+	if err := s.connmark.Apply(config); err != nil {
+		if s.connmarkRequired {
+			return false, err
+		}
+		s.logf("default tun connmark setup skipped: %v", err)
+		return false, nil
+	}
+	return true, nil
+}
+
 func (s *System) dnsProviderSupportsInterfaceIndex() bool {
 	_, ok := s.dnsProvider.(dnsInterfaceIndexer)
 	return ok
@@ -489,6 +521,8 @@ func (d *defaultTunState) closeActive() error {
 	d.pmarkChecker = false
 	dnsIfidxSet := d.dnsIfidxSet
 	d.dnsIfidxSet = false
+	connmarkSet := d.connmarkSet
+	d.connmarkSet = false
 	d.unregisterRulesLocked()
 	d.mu.Unlock()
 
@@ -505,6 +539,9 @@ func (d *defaultTunState) closeActive() error {
 	}
 	if rc != nil && d.system.routingManager != nil {
 		err = errors.Join(err, d.system.routingManager.Rollback(*rc))
+	}
+	if connmarkSet && d.system.connmark != nil {
+		err = errors.Join(err, d.system.connmark.Rollback())
 	}
 	if ksID != 0 && d.system.killswitch != nil {
 		err = errors.Join(err, d.system.killswitch.DeleteTMPRuleset(ksID))

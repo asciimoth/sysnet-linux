@@ -1,6 +1,7 @@
 [default.extend-words]
 importas = "importas"
 oif = "oif"
+iif = "iif"
 
 [files]
 extend-exclude = ["sysnet_test.go"]

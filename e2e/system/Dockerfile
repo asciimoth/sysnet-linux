@@ -7,7 +7,8 @@ RUN set -eux; \
 	DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
 		ca-certificates \
 		curl \
-		iproute2; \
+		iproute2 \
+		nftables; \
 	case "$FLAVOR" in \
 		direct) ;; \
 		systemd-resolved) \
