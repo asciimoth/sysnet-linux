@@ -437,12 +437,6 @@ func newAutoPmark(
 		callbacks.Logf = logf
 	}
 	var closers []io.Closer
-	manager, err := fwmark.NewManager(config.Pmark.PinPath, logf)
-	if err != nil {
-		return nil, closers, fmt.Errorf("create fwmark manager: %w", err)
-	}
-	closers = append(closers, manager)
-	callbacks.ProcessUpdate = manager.ProcessUpdateCallback()
 	daemon, err := pmark.NewDaemon(
 		config.Pmark.PinPath,
 		callbacks,
@@ -453,10 +447,35 @@ func newAutoPmark(
 		return nil, closers, fmt.Errorf("create p-mark daemon: %w", err)
 	}
 	closers = append(closers, daemon)
+	manager, err := fwmark.NewManager(config.Pmark.PinPath, logf)
+	if err != nil {
+		return nil, closers, fmt.Errorf("create fwmark manager: %w", err)
+	}
+	closers = append(closers, manager)
+	daemon.UpdateHooks(pmarkCallbacksWithFwmark(
+		callbacks,
+		manager.ProcessUpdateCallback(),
+	))
 	if err := daemon.Run(); err != nil {
 		return nil, closers, fmt.Errorf("run p-mark daemon: %w", err)
 	}
 	return daemon, closers, nil
+}
+
+func pmarkCallbacksWithFwmark(
+	callbacks pmark.Callbacks,
+	fwmarkUpdate func(pmark.ProcessUpdate),
+) pmark.Callbacks {
+	previousUpdate := callbacks.ProcessUpdate
+	callbacks.ProcessUpdate = func(update pmark.ProcessUpdate) {
+		if fwmarkUpdate != nil {
+			fwmarkUpdate(update)
+		}
+		if previousUpdate != nil {
+			previousUpdate(update)
+		}
+	}
+	return callbacks
 }
 
 func closeAll(closers []io.Closer) {

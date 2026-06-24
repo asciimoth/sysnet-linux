@@ -86,6 +86,63 @@ func TestNewAutoBuildsAvailableComponents(t *testing.T) {
 	}
 }
 
+func TestPmarkCallbacksWithFwmarkPreservesHooks(t *testing.T) {
+	var calls []string
+	check := func(pmark.ProcessInfo) (int8, uint64, bool) {
+		calls = append(calls, "check")
+		return 7, 8, true
+	}
+	processEvent := func(pmark.ProcessEvent) {
+		calls = append(calls, "event")
+	}
+	logf := func(string, ...any) {
+		calls = append(calls, "log")
+	}
+	callbacks := pmark.Callbacks{
+		Check:        check,
+		ProcessEvent: processEvent,
+		ProcessUpdate: func(pmark.ProcessUpdate) {
+			calls = append(calls, "caller-update")
+		},
+		Logf: logf,
+	}
+
+	wrapped := pmarkCallbacksWithFwmark(
+		callbacks,
+		func(pmark.ProcessUpdate) {
+			calls = append(calls, "fwmark-update")
+		},
+	)
+	priority, mark, ok := wrapped.Check(pmark.ProcessInfo{})
+	if priority != 7 || mark != 8 || !ok {
+		t.Fatalf(
+			"wrapped Check = (%d, %d, %v), want (7, 8, true)",
+			priority,
+			mark,
+			ok,
+		)
+	}
+	wrapped.ProcessEvent(pmark.ProcessEvent{})
+	wrapped.ProcessUpdate(pmark.ProcessUpdate{})
+	wrapped.Logf("message")
+
+	want := []string{
+		"check",
+		"event",
+		"fwmark-update",
+		"caller-update",
+		"log",
+	}
+	if !slices.Equal(calls, want) {
+		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+}
+
+func TestPmarkCallbacksWithFwmarkAllowsNilUpdates(t *testing.T) {
+	wrapped := pmarkCallbacksWithFwmark(pmark.Callbacks{}, nil)
+	wrapped.ProcessUpdate(pmark.ProcessUpdate{})
+}
+
 func TestNewAutoDegradesUnavailableComponents(t *testing.T) {
 	oldEnv := autoSystemEnv
 	defer func() { autoSystemEnv = oldEnv }()

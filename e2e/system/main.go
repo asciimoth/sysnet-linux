@@ -159,7 +159,7 @@ func run() error {
 	if err := checkFullPmarkEBPFSetup(); err != nil {
 		return err
 	}
-	if err := checkAutoNewPmarkCurrentProcessSetup(); err != nil {
+	if err := checkAutoNewPmarkSocketProbeSetup(); err != nil {
 		return err
 	}
 
@@ -2085,7 +2085,7 @@ func checkFullPmarkEBPFSetup() error {
 	return nil
 }
 
-func checkAutoNewPmarkCurrentProcessSetup() error {
+func checkAutoNewPmarkSocketProbeSetup() error {
 	cleanupBPFFS, err := prepareBPFFS()
 	if err != nil {
 		return err
@@ -2124,19 +2124,13 @@ func checkAutoNewPmarkCurrentProcessSetup() error {
 		)
 	}
 
-	probeConn, err := net.Dial("udp4", "9.9.9.9:53")
-	if err != nil {
-		return fmt.Errorf("auto New pmark open probe socket: %w", err)
-	}
-	defer func() { _ = probeConn.Close() }()
-
 	dt, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{
 		TunAddrs: []string{dnsIP + "/32"},
 		DnsIP:    dnsIP,
 		MTU:      1400,
 		Include: []sysnet.Rule{{
-			Type: "pid",
-			Rule: strconv.Itoa(os.Getpid()),
+			Type: "comm",
+			Rule: socketProbeComm,
 		}},
 	})
 	if err != nil {
@@ -2164,17 +2158,22 @@ func checkAutoNewPmarkCurrentProcessSetup() error {
 	); err != nil {
 		return err
 	}
-	if err := waitForTimeout(5*time.Second, func() error {
-		mark, err := socketMark(probeConn)
-		if err != nil {
-			return err
-		}
-		if mark != userMark {
-			return fmt.Errorf("SO_MARK = %#x, want %#x", mark, userMark)
-		}
-		return nil
-	}); err != nil {
-		return fmt.Errorf("auto New pmark current process socket: %w", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	output, err := commandOutputContext(
+		ctx,
+		os.Args[0],
+		socketProbeMode,
+		"9.9.9.9:53",
+		dnsIP,
+		fmt.Sprintf("%#x", userMark),
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"auto New pmark socket probe with output %q: %w",
+			output,
+			err,
+		)
 	}
 	return nil
 }
