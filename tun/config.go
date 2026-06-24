@@ -148,6 +148,7 @@ func SetTunRoutes(tun gtun.Tun, routes []string) error {
 		return err
 	}
 	for _, route := range current {
+		route = tunRouteDeleteSpec(route)
 		if err := netlink.RouteDel(&route); err != nil &&
 			!errors.Is(err, unix.ESRCH) {
 			return err
@@ -323,6 +324,16 @@ func netlinkRouteFromPrefix(
 		Table:     unix.RT_TABLE_MAIN,
 		Type:      unix.RTN_UNICAST,
 	}, nil
+}
+
+func tunRouteDeleteSpec(route netlink.Route) netlink.Route {
+	route.Flags = 0
+	for _, hop := range route.MultiPath {
+		if hop != nil {
+			hop.Flags = 0
+		}
+	}
+	return route
 }
 
 func parseTunAddrPrefixes(values []string) ([]netip.Prefix, error) {

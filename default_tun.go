@@ -258,6 +258,9 @@ func (s *System) BuildDefaultTun(
 		rc.Strictness = routing.NonStrict
 	}
 	if err := s.routingManager.Apply(rc); err != nil {
+		if errors.Is(err, routing.ErrApplyFailedGuardActive) {
+			err = errors.Join(err, s.routingManager.Rollback(rc))
+		}
 		return fail(err)
 	}
 	appliedRC = &rc

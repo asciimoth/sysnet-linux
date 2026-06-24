@@ -90,14 +90,37 @@ func (m *Manager) Refresh() error {
 	if err != nil {
 		return err
 	}
-	if err := m.flushTable(config, config.SafeTable); err != nil {
+	guardInstalled := false
+	fail := func(err error) error {
+		if guardInstalled {
+			return fmt.Errorf("%w: %w", ErrApplyFailedGuardActive, err)
+		}
 		return err
+	}
+	for _, family := range familyConstants(config.Families) {
+		if err := m.adapter.AddRule(
+			transitionGuard(config, family),
+		); err != nil {
+			return fail(fmt.Errorf("install transition guard: %w", err))
+		}
+		guardInstalled = true
+	}
+	if err := m.flushTable(config, config.SafeTable); err != nil {
+		return fail(err)
 	}
 	for _, route := range desired.SafeRoutes {
 		if err := m.adapter.ReplaceRoute(route); err != nil {
-			return fmt.Errorf("install safe route %s: %w", route.Dst, err)
+			return fail(fmt.Errorf("install safe route %s: %w", route.Dst, err))
 		}
 	}
+	for _, family := range familyConstants(config.Families) {
+		if err := m.adapter.DeleteRule(
+			transitionGuard(config, family),
+		); err != nil {
+			return fail(fmt.Errorf("remove transition guard: %w", err))
+		}
+	}
+	guardInstalled = false
 	m.applied = &desired
 	return nil
 }
@@ -174,20 +197,20 @@ func (m *Manager) applyDesired(desired DesiredState) error {
 	config := desired.Config
 	guardInstalled := false
 
-	for _, family := range familyConstants(config.Families) {
-		if err := m.adapter.AddRule(
-			transitionGuard(config, family),
-		); err != nil {
-			return fmt.Errorf("install transition guard: %w", err)
-		}
-	}
-	guardInstalled = true
-
 	fail := func(err error) error {
 		if guardInstalled {
 			return fmt.Errorf("%w: %w", ErrApplyFailedGuardActive, err)
 		}
 		return err
+	}
+
+	for _, family := range familyConstants(config.Families) {
+		if err := m.adapter.AddRule(
+			transitionGuard(config, family),
+		); err != nil {
+			return fail(fmt.Errorf("install transition guard: %w", err))
+		}
+		guardInstalled = true
 	}
 
 	if err := m.flushTable(config, config.VPNTable); err != nil {

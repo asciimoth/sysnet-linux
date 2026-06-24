@@ -22,6 +22,7 @@ const (
 	peerLinkName = "sysnet-peer0"
 	safeLinkName = "sysnet-br0"
 	safeAltName  = "sysnet-br1"
+	linkDownName = "sysnet-down0"
 	wifiLinkName = "sysnet-wifi0"
 	ethLinkName  = "sysnet-eth0"
 
@@ -98,6 +99,7 @@ func setupLinksAndMainRoutes() error {
 	_ = ip("link", "del", physLinkName)
 	_ = ip("link", "del", safeLinkName)
 	_ = ip("link", "del", safeAltName)
+	_ = ip("link", "del", linkDownName)
 	_ = ip("link", "del", wifiLinkName)
 	_ = ip("link", "del", ethLinkName)
 
@@ -122,8 +124,11 @@ func setupLinksAndMainRoutes() error {
 	if err := ip("link", "add", safeAltName, "type", "dummy"); err != nil {
 		return err
 	}
+	if err := ip("link", "add", linkDownName, "type", "dummy"); err != nil {
+		return err
+	}
 
-	for _, name := range []string{vpnLinkName, physLinkName, peerLinkName, safeLinkName, safeAltName} {
+	for _, name := range []string{vpnLinkName, physLinkName, peerLinkName, safeLinkName, safeAltName, linkDownName} {
 		if err := ip("link", "set", name, "up"); err != nil {
 			return err
 		}
@@ -139,6 +144,7 @@ func setupLinksAndMainRoutes() error {
 		{"addr", "add", "198.51.100.1/24", "dev", peerLinkName},
 		{"addr", "add", "172.28.0.1/16", "dev", safeLinkName},
 		{"addr", "add", "172.29.0.1/16", "dev", safeAltName},
+		{"addr", "add", "172.30.0.1/16", "dev", linkDownName},
 		{"-6", "addr", "add", "2001:db8:100::2/64", "dev", physLinkName},
 		{"-6", "addr", "add", "fd00:28::1/64", "dev", safeLinkName},
 		{"route", "add", "default", "dev", physLinkName, "metric", "100"},
@@ -229,6 +235,16 @@ func setupLinksAndMainRoutes() error {
 		if err := ip(args...); err != nil {
 			return err
 		}
+	}
+	if err := ip(
+		"link",
+		"set",
+		"dev",
+		linkDownName,
+		"carrier",
+		"off",
+	); err != nil {
+		return err
 	}
 	return nil
 }
@@ -587,6 +603,13 @@ func checkExcludeNonStrict(manager *routing.Manager, cfg routing.Config) error {
 		"safe bridge route copied to safe table",
 		safeTable,
 		"172.28.0.0/16",
+	); err != nil {
+		return err
+	}
+	if err := expectTableRoute(
+		"linkdown safe route copied without replaying state flags",
+		safeTable,
+		"172.30.0.0/16",
 	); err != nil {
 		return err
 	}

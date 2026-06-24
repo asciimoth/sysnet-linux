@@ -38,15 +38,35 @@ func CompileDesiredState(
 		if ClassifySafeRoute(route, config.TUNIndex) != RouteSafe {
 			continue
 		}
-		copied := route
-		copied.Table = config.SafeTable
-		if len(route.Multipath) > 0 {
-			copied.Multipath = append([]Nexthop(nil), route.Multipath...)
-		}
-		state.SafeRoutes = append(state.SafeRoutes, copied)
+		state.SafeRoutes = append(
+			state.SafeRoutes,
+			safeTableRoute(route, config.SafeTable),
+		)
 	}
 	sortSafeRoutesForInstall(state.SafeRoutes)
 	return state, nil
+}
+
+func safeTableRoute(route Route, table int) Route {
+	copied := route
+	copied.Table = table
+	copied.Flags = desiredNexthopFlags(route.Flags)
+	if len(route.Multipath) > 0 {
+		copied.Multipath = append([]Nexthop(nil), route.Multipath...)
+		for i := range copied.Multipath {
+			copied.Multipath[i].Flags = desiredNexthopFlags(
+				copied.Multipath[i].Flags,
+			)
+		}
+	}
+	return copied
+}
+
+func desiredNexthopFlags(flags int) int {
+	// Kernel route snapshots can include transient nexthop state such as
+	// LINKDOWN, DEAD, UNRESOLVED, OFFLOAD, and TRAP. Only replay caller-owned
+	// route intent into the safe table.
+	return flags & (unix.RTNH_F_ONLINK | unix.RTNH_F_PERVASIVE)
 }
 
 func sortSafeRoutesForInstall(routes []Route) {

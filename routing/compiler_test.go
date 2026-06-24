@@ -146,6 +146,83 @@ func TestCompileDesiredStateRoutes(t *testing.T) {
 	}
 }
 
+func TestCompileDesiredStateClearsCopiedSafeRouteStateFlags(t *testing.T) {
+	cfg := compilerTestConfig()
+	cfg.Strictness = NonStrict
+
+	got, err := CompileDesiredState(cfg, Snapshot{
+		MainRoutes: []Route{
+			{
+				Family: unix.AF_INET,
+				Dst:    netip.MustParsePrefix("172.17.0.0/16"),
+				Table:  unix.RT_TABLE_MAIN,
+				Flags: unix.RTNH_F_LINKDOWN |
+					unix.RTNH_F_DEAD |
+					unix.RTNH_F_ONLINK,
+				Type: RouteTypeUnicast,
+			},
+			{
+				Family: unix.AF_INET,
+				Dst:    netip.MustParsePrefix("47.47.47.0/24"),
+				Table:  unix.RT_TABLE_MAIN,
+				Type:   RouteTypeUnicast,
+				Multipath: []Nexthop{
+					{
+						LinkIndex: 2,
+						Flags: unix.RTNH_F_LINKDOWN |
+							unix.RTNH_F_OFFLOAD |
+							unix.RTNH_F_ONLINK,
+					},
+					{
+						LinkIndex: 3,
+						Flags: unix.RTNH_F_UNRESOLVED |
+							unix.RTNH_F_TRAP |
+							unix.RTNH_F_PERVASIVE,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CompileDesiredState() error = %v", err)
+	}
+	if len(got.SafeRoutes) != 2 {
+		t.Fatalf("SafeRoutes = %#v, want 2 routes", got.SafeRoutes)
+	}
+
+	connected := safeRouteByPrefix(got.SafeRoutes, "172.17.0.0/16")
+	if connected.Flags != unix.RTNH_F_ONLINK {
+		t.Fatalf("safe route flags = %#x, want ONLINK only", connected.Flags)
+	}
+
+	multipath := safeRouteByPrefix(got.SafeRoutes, "47.47.47.0/24")
+	if len(multipath.Multipath) != 2 {
+		t.Fatalf("multipath nexthops = %#v, want 2", multipath.Multipath)
+	}
+	if multipath.Multipath[0].Flags != unix.RTNH_F_ONLINK {
+		t.Fatalf(
+			"first nexthop flags = %#x, want ONLINK only",
+			multipath.Multipath[0].Flags,
+		)
+	}
+	if multipath.Multipath[1].Flags != unix.RTNH_F_PERVASIVE {
+		t.Fatalf(
+			"second nexthop flags = %#x, want PERVASIVE only",
+			multipath.Multipath[1].Flags,
+		)
+	}
+}
+
+func safeRouteByPrefix(routes []Route, prefix string) Route {
+	dst := netip.MustParsePrefix(prefix)
+	for _, route := range routes {
+		if route.Dst == dst {
+			return route
+		}
+	}
+	return Route{}
+}
+
 func TestCompileDesiredStateInstallsGatewayFreeSafeRoutesFirst(t *testing.T) {
 	cfg := compilerTestConfig()
 	cfg.Strictness = NonStrict

@@ -20,6 +20,8 @@ type fakeAdapter struct {
 	ops    []string
 
 	replaceRouteErr error
+	deleteRouteErr  func(Route) error
+	addRuleErr      func(Rule) error
 }
 
 func newFakeAdapter() *fakeAdapter {
@@ -77,7 +79,13 @@ func (f *fakeAdapter) DeleteRoute(route Route) error {
 		f.ops,
 		fmt.Sprintf("delete-route:%d:%s", route.Table, route.Dst),
 	)
-	f.routes = appendWithoutRoute(f.routes, route)
+	route = routeDeleteSpec(route)
+	if f.deleteRouteErr != nil {
+		if err := f.deleteRouteErr(route); err != nil {
+			return err
+		}
+	}
+	f.routes = appendWithoutRouteForDelete(f.routes, route)
 	return nil
 }
 
@@ -93,6 +101,11 @@ func (f *fakeAdapter) ListRules(family int) ([]Rule, error) {
 
 func (f *fakeAdapter) AddRule(rule Rule) error {
 	f.ops = append(f.ops, fmt.Sprintf("add-rule:%d", rule.Priority))
+	if f.addRuleErr != nil {
+		if err := f.addRuleErr(rule); err != nil {
+			return err
+		}
+	}
 	f.rules = appendWithoutRule(f.rules, rule)
 	f.rules = append(f.rules, rule)
 	return nil
@@ -115,6 +128,12 @@ func appendWithoutRoute(routes []Route, remove Route) []Route {
 func appendWithoutRule(rules []Rule, remove Rule) []Rule {
 	return slices.DeleteFunc(rules, func(rule Rule) bool {
 		return rule == remove
+	})
+}
+
+func appendWithoutRouteForDelete(routes []Route, remove Route) []Route {
+	return slices.DeleteFunc(routes, func(route Route) bool {
+		return sameRoute(routeDeleteSpec(route), remove)
 	})
 }
 

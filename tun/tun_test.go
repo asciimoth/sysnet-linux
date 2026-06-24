@@ -3,6 +3,7 @@ package tun
 
 import (
 	"errors"
+	"net"
 	"net/netip"
 	"os"
 	"slices"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/asciimoth/gonnect/sysnet"
 	gtun "github.com/asciimoth/gonnect/tun"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 func TestCreateDefaultTUNRetriesOccupiedNames(t *testing.T) {
@@ -303,6 +306,41 @@ func TestNetlinkRouteFromDefaultPrefixUsesNilDst(t *testing.T) {
 	}
 	if got.Dst != nil {
 		t.Fatalf("netlinkRouteFromPrefix Dst = %v, want nil", got.Dst)
+	}
+}
+
+func TestTunRouteDeleteSpecClearsRouteStateFlags(t *testing.T) {
+	route := netlink.Route{
+		Dst: &net.IPNet{
+			IP:   net.IPv4(10, 0, 0, 0),
+			Mask: net.CIDRMask(24, 32),
+		},
+		Flags: unix.RTNH_F_LINKDOWN |
+			unix.RTNH_F_DEAD |
+			unix.RTNH_F_ONLINK,
+		MultiPath: []*netlink.NexthopInfo{
+			{
+				LinkIndex: 2,
+				Flags: unix.RTNH_F_UNRESOLVED |
+					unix.RTNH_F_TRAP |
+					unix.RTNH_F_PERVASIVE,
+			},
+			nil,
+		},
+	}
+
+	got := tunRouteDeleteSpec(route)
+	if got.Flags != 0 {
+		t.Fatalf("delete route flags = %#x, want 0", got.Flags)
+	}
+	if got.MultiPath[0].Flags != 0 {
+		t.Fatalf(
+			"delete nexthop flags = %#x, want 0",
+			got.MultiPath[0].Flags,
+		)
+	}
+	if got.Dst.String() != "10.0.0.0/24" {
+		t.Fatalf("delete route dst = %v, want 10.0.0.0/24", got.Dst)
 	}
 }
 

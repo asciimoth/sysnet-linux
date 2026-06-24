@@ -71,7 +71,7 @@ func (a *realAdapter) ReplaceRoute(route Route) error {
 }
 
 func (a *realAdapter) DeleteRoute(route Route) error {
-	nlRoute, err := routeToNetlink(route)
+	nlRoute, err := routeToNetlink(routeDeleteSpec(route))
 	if err != nil {
 		return err
 	}
@@ -82,6 +82,14 @@ func (a *realAdapter) DeleteRoute(route Route) error {
 		return err
 	}
 	return nil
+}
+
+func routeDeleteSpec(route Route) Route {
+	route.Flags = 0
+	for i := range route.Multipath {
+		route.Multipath[i].Flags = 0
+	}
+	return route
 }
 
 func (a *realAdapter) ListRules(family int) ([]Rule, error) {

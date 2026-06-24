@@ -6,6 +6,7 @@ package linux
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -620,6 +621,66 @@ func TestBuildDefaultTunAppliesSideEffectsAndCloseRollsBack(t *testing.T) {
 	}
 }
 
+func TestBuildDefaultTunRollsBackFailedRoutingApply(t *testing.T) {
+	applyErr := fmt.Errorf(
+		"%w: install safe route: %w",
+		routing.ErrApplyFailedGuardActive,
+		errors.New("boom"),
+	)
+	dnsProvider := newFakeInterfaceDNSProvider()
+	routingManager := &fakeRouting{applyErr: applyErr}
+	factory := &fakeTUNFactory{}
+	s, err := NewSystem(Config{
+		Features: FeatureConfig{
+			Tun:        true,
+			DefaultTun: true,
+			DNSControl: true,
+			Routing:    true,
+		},
+		DNSProvider:    dnsProvider,
+		RoutingManager: routingManager,
+		TUNFactory:     factory,
+		TunConfig:      &fakeTunConfig{},
+		PacketListen:   (&fakePacketListen{}).listen,
+		TUNIndex:       func(gtun.Tun) (int, error) { return 99, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	_, err = s.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs:  []string{"10.55.0.1/32"},
+		TunRoutes: []string{"0.0.0.0/0"},
+		DnsIP:     "10.55.0.1",
+	})
+	if !errors.Is(err, routing.ErrApplyFailedGuardActive) {
+		t.Fatalf(
+			"BuildDefaultTun error = %v, want ErrApplyFailedGuardActive",
+			err,
+		)
+	}
+	if routingManager.rollback == nil {
+		t.Fatal("failed routing apply did not rollback the attempted config")
+	}
+	if routingManager.rollback.TUNIndex != 99 {
+		t.Fatalf(
+			"rollback config TUNIndex = %d, want 99",
+			routingManager.rollback.TUNIndex,
+		)
+	}
+	if s.defaultTun != nil {
+		t.Fatal("failed routing apply left an active default tun")
+	}
+	if len(factory.created) != 1 || !factory.created[0].closed {
+		t.Fatal("failed routing apply did not close created TUN")
+	}
+	if got := dnsProvider.interfaceIndices; len(got) != 2 ||
+		got[0] != 99 || got[1] != 0 {
+		t.Fatalf("SetInterfaceIndex calls = %v, want [99 0]", got)
+	}
+}
+
 func TestBuildDefaultTunSetsDNSProviderInterfaceIndex(t *testing.T) {
 	dnsProvider := newFakeInterfaceDNSProvider()
 	s, err := NewSystem(Config{
@@ -1095,12 +1156,13 @@ func (f *fakeInterfaceDNSProvider) SetInterfaceIndex(ifidx int) error {
 type fakeRouting struct {
 	applied  *routing.Config
 	rollback *routing.Config
+	applyErr error
 }
 
 func (f *fakeRouting) Apply(config routing.Config) error {
 	c := config
 	f.applied = &c
-	return nil
+	return f.applyErr
 }
 func (f *fakeRouting) Refresh() error { return nil }
 func (f *fakeRouting) Rollback(config routing.Config) error {
