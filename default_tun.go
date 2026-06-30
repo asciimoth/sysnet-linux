@@ -215,7 +215,7 @@ func (s *System) BuildDefaultTun(
 		if err != nil {
 			return fail(err)
 		}
-		server = gdns.NewServer(conn, nil)
+		server = gdns.NewServer(conn, nil, nil)
 		serverReplaced = true
 	} else if server != nil {
 		server.Detach()

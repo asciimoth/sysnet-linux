@@ -105,7 +105,7 @@ func runResolvedDebug(ctx context.Context) error {
 	}
 	logger := newLoggingDNS(resolved)
 	defer logger.Close()
-	server := gdns.NewServer(pc, logger)
+	server := gdns.NewServer(pc, logger, nil)
 	defer server.Close()
 
 	if err := resolved.SetDNS(addr); err != nil {
@@ -149,7 +149,7 @@ func runDirectDebug(ctx context.Context) error {
 	}
 	logger := newLoggingDNS(direct)
 	defer logger.Close()
-	server := gdns.NewServer(pc, logger)
+	server := gdns.NewServer(pc, logger, nil)
 	defer server.Close()
 
 	if err := direct.SetDNS(addr); err != nil {
@@ -194,7 +194,7 @@ func runDebianResolvconfDebug(ctx context.Context) error {
 	}
 	logger := newLoggingDNS(provider)
 	defer logger.Close()
-	server := gdns.NewServer(pc, logger)
+	server := gdns.NewServer(pc, logger, nil)
 	defer server.Close()
 
 	if err := provider.SetDNS(addr); err != nil {
@@ -239,7 +239,7 @@ func runOpenresolvDebug(ctx context.Context) error {
 	}
 	logger := newLoggingDNS(provider)
 	defer logger.Close()
-	server := gdns.NewServer(pc, logger)
+	server := gdns.NewServer(pc, logger, nil)
 	defer server.Close()
 
 	if err := provider.SetDNS(addr); err != nil {

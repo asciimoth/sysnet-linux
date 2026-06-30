@@ -76,7 +76,7 @@ func NewDirect(
 	}
 	d := &Direct{
 		env:           env,
-		base:          gdns.NewRouter(),
+		base:          gdns.NewRouter(nil),
 		listenNetwork: listenNetwork,
 		dialNetwork:   dialNetwork,
 		fallback:      append([]netip.AddrPort(nil), fallback...),
@@ -238,7 +238,7 @@ func (d *Direct) refreshUpstreams(exclude []netip.Addr) error {
 	dialNetwork := d.dialNetwork
 	d.mu.Unlock()
 
-	client := gdns.NewClient(upstreamDNSDial(dialNetwork), urls...)
+	client := gdns.NewClient(upstreamDNSDial(dialNetwork), nil, urls...)
 	d.mu.Lock()
 	if d.closed {
 		d.mu.Unlock()

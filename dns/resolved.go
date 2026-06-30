@@ -192,7 +192,7 @@ func NewResolved(
 	}
 
 	r.fallback = append([]netip.AddrPort(nil), fallback...)
-	r.base = gdns.NewRouter()
+	r.base = gdns.NewRouter(nil)
 	r.clients = make(map[string]gdns.Interface)
 	env.Logf("resolved: initializing interface index %d", ifidx)
 	if err := r.refreshUpstreams(netip.Addr{}); err != nil {
@@ -760,6 +760,7 @@ func (r *Resolved) setUpstreamConfig(cfg resolvedUpstreamConfig) error {
 	for _, route := range cfg.routes {
 		clients[route.name] = gdns.NewClient(
 			upstreamDNSDial(r.dialNetwork),
+			nil,
 			route.urls...,
 		)
 	}

@@ -3534,7 +3534,7 @@ func queryDefaultTunDNS() (*gdns.Message, error) {
 }
 
 func queryDefaultTunDNSAt(server string) (*gdns.Message, error) {
-	client := gdns.NewClient(nil, "udp://"+net.JoinHostPort(server, "53"))
+	client := gdns.NewClient(nil, nil, "udp://"+net.JoinHostPort(server, "53"))
 	defer func() { _ = client.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

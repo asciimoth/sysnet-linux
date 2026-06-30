@@ -86,7 +86,7 @@ func NewDebianResolvconf(
 
 	r := &DebianResolvconf{
 		env:           env,
-		base:          gdns.NewRouter(),
+		base:          gdns.NewRouter(nil),
 		listenNetwork: listenNetwork,
 		dialNetwork:   dialNetwork,
 		iface:         iface,
@@ -249,7 +249,7 @@ func (r *DebianResolvconf) refreshUpstreams(exclude []netip.Addr) error {
 	dialNetwork := r.dialNetwork
 	r.mu.Unlock()
 
-	client := gdns.NewClient(upstreamDNSDial(dialNetwork), urls...)
+	client := gdns.NewClient(upstreamDNSDial(dialNetwork), nil, urls...)
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()

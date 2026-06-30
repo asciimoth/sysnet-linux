@@ -324,7 +324,7 @@ func startTestDNSUpstream(t *testing.T, answer [4]byte) testDNSUpstream {
 	}
 	addr := pc.LocalAddr().(*net.UDPAddr)
 	provider := newStaticDNSProvider(answer)
-	server := gdns.NewServer(pc, provider)
+	server := gdns.NewServer(pc, provider, nil)
 	t.Cleanup(func() {
 		_ = server.Close()
 		_ = provider.Close()
