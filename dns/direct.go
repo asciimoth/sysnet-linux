@@ -238,7 +238,7 @@ func (d *Direct) refreshUpstreams(exclude []netip.Addr) error {
 	dialNetwork := d.dialNetwork
 	d.mu.Unlock()
 
-	client := gdns.NewClient(upstreamDNSDial(dialNetwork), nil, urls...)
+	client := newUpstreamDNSClient(dialNetwork, urls...)
 	d.mu.Lock()
 	if d.closed {
 		d.mu.Unlock()

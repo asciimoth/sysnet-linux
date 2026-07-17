@@ -11,6 +11,7 @@ import (
 	"strconv"
 
 	"github.com/asciimoth/gonnect"
+	gdns "github.com/asciimoth/gonnect/dns"
 )
 
 func requireDNSNetworks(
@@ -39,6 +40,14 @@ func upstreamDNSDial(network gonnect.Network) gonnect.Dial {
 		}
 		return network.Dial(ctx, dialNetwork, addr)
 	}
+}
+
+// Upstream server URLs are IP literals, so bootstrap DNS is intentionally nil.
+func newUpstreamDNSClient(
+	network gonnect.Network,
+	servers ...string,
+) *gdns.Client {
+	return gdns.NewClient(upstreamDNSDial(network), nil, nil, servers...)
 }
 
 func resolveDialAddr(

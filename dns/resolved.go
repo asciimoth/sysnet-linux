@@ -758,11 +758,7 @@ func (r *Resolved) setUpstreamConfig(cfg resolvedUpstreamConfig) error {
 	)
 	clients := make(map[string]gdns.Interface, len(cfg.routes))
 	for _, route := range cfg.routes {
-		clients[route.name] = gdns.NewClient(
-			upstreamDNSDial(r.dialNetwork),
-			nil,
-			route.urls...,
-		)
+		clients[route.name] = newUpstreamDNSClient(r.dialNetwork, route.urls...)
 	}
 	routeFunc := resolvedRouteFunc(cfg.routes)
 
