@@ -248,6 +248,9 @@ func runResolved() error {
 	if err := checkResolvedDefaultTunLifecycle(system, pmarkCtl); err != nil {
 		return err
 	}
+	if err := checkResolvedDefaultTunDNSWarnings(system); err != nil {
+		return err
+	}
 	if err := checkResolvedDefaultTunRebuildDNSMutation(system); err != nil {
 		return err
 	}
@@ -1553,6 +1556,216 @@ func checkResolvedDefaultTunLifecycle(
 	}
 	if err := waitForResolvedLinkDNSNot(rebuiltName, dnsIP); err != nil {
 		return err
+	}
+	return nil
+}
+
+func checkResolvedDefaultTunDNSWarnings(system *linux.System) error {
+	dt, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs: []string{dnsIP + "/32"},
+		DnsIP:    dnsIP,
+		MTU:      1400,
+	})
+	if err != nil {
+		return fmt.Errorf("build resolved DNS warnings DefaultTun: %w", err)
+	}
+	defer func() { _ = dt.Close() }()
+
+	tunName, err := dt.Name()
+	if err != nil {
+		return fmt.Errorf("resolved DNS warnings DefaultTun name: %w", err)
+	}
+	tunIfidx, err := linkIndex(tunName)
+	if err != nil {
+		return fmt.Errorf("resolved DNS warnings DefaultTun ifindex: %w", err)
+	}
+	if err := waitForResolvedLinkDNS(tunName, dnsIP); err != nil {
+		return err
+	}
+	answer := netip.MustParseAddr("203.0.113.210")
+	dt.SetDns(newStaticDNS(answer))
+	if err := flushResolvedCaches(); err != nil {
+		return err
+	}
+	if err := expectDefaultTunWarnings(
+		system,
+		dt,
+		nil,
+		"resolved DNS warnings initial",
+	); err != nil {
+		return err
+	}
+
+	physIfidx, err := linkIndex(physLinkName)
+	if err != nil {
+		return fmt.Errorf("resolved DNS warnings physical ifindex: %w", err)
+	}
+	safeIfidx, err := linkIndex(safeLinkName)
+	if err != nil {
+		return fmt.Errorf("resolved DNS warnings safe ifindex: %w", err)
+	}
+
+	physicalDNS, err := newRecordingDNSServer(
+		netip.MustParseAddr("198.51.100.2"),
+		netip.MustParseAddr("203.0.113.211"),
+	)
+	if err != nil {
+		return fmt.Errorf("start physical recording DNS: %w", err)
+	}
+	defer func() { _ = physicalDNS.Close() }()
+	if err := configureResolvedLinkDNS(
+		physIfidx,
+		physicalDNS.addr,
+		nil,
+		true,
+	); err != nil {
+		return fmt.Errorf("configure physical resolved DNS: %w", err)
+	}
+	defer func() { _ = revertResolvedLink(physIfidx) }()
+	if err := flushResolvedCaches(); err != nil {
+		return err
+	}
+	publicName := uniqueDNSName("physical-default-route")
+	if err := expectDefaultTunWarnings(
+		system,
+		dt,
+		nil,
+		"resolved physical default-route warnings",
+	); err != nil {
+		return err
+	}
+	if err := expectDNSAAtName(
+		"resolved physical default-route query",
+		"127.0.0.53",
+		publicName,
+		answer,
+	); err != nil {
+		return err
+	}
+	if err := physicalDNS.expectNoQuery(
+		publicName,
+		"resolved physical default-route leak",
+	); err != nil {
+		return err
+	}
+	if err := revertResolvedLink(physIfidx); err != nil {
+		return fmt.Errorf("revert physical resolved DNS: %w", err)
+	}
+
+	specificDNS, err := newRecordingDNSServer(
+		netip.MustParseAddr("172.28.0.1"),
+		netip.MustParseAddr("203.0.113.212"),
+	)
+	if err != nil {
+		return fmt.Errorf("start specific-domain recording DNS: %w", err)
+	}
+	defer func() { _ = specificDNS.Close() }()
+	if err := configureResolvedLinkDNS(
+		safeIfidx,
+		specificDNS.addr,
+		[]string{"corp.example"},
+		false,
+	); err != nil {
+		return fmt.Errorf("configure specific-domain resolved DNS: %w", err)
+	}
+	defer func() { _ = revertResolvedLink(safeIfidx) }()
+	if err := flushResolvedCaches(); err != nil {
+		return err
+	}
+	publicName = uniqueDNSName("specific-domain")
+	if err := expectDefaultTunWarnings(
+		system,
+		dt,
+		nil,
+		"resolved specific-domain warnings",
+	); err != nil {
+		return err
+	}
+	if err := expectDNSAAtName(
+		"resolved specific-domain public query",
+		"127.0.0.53",
+		publicName,
+		answer,
+	); err != nil {
+		return err
+	}
+	if err := specificDNS.expectNoQuery(
+		publicName,
+		"resolved specific-domain public leak",
+	); err != nil {
+		return err
+	}
+	if err := revertResolvedLink(safeIfidx); err != nil {
+		return fmt.Errorf("revert specific-domain resolved DNS: %w", err)
+	}
+	if err := specificDNS.Close(); err != nil {
+		return fmt.Errorf("close specific-domain recording DNS: %w", err)
+	}
+
+	rootDNS, err := newRecordingDNSServer(
+		netip.MustParseAddr("172.28.0.1"),
+		netip.MustParseAddr("203.0.113.213"),
+	)
+	if err != nil {
+		return fmt.Errorf("start root-route recording DNS: %w", err)
+	}
+	defer func() { _ = rootDNS.Close() }()
+	if err := configureResolvedLinkDNS(
+		safeIfidx,
+		rootDNS.addr,
+		[]string{"."},
+		false,
+	); err != nil {
+		return fmt.Errorf("configure root-route resolved DNS: %w", err)
+	}
+	defer func() { _ = revertResolvedLink(safeIfidx) }()
+	if err := flushResolvedCaches(); err != nil {
+		return err
+	}
+	publicName = uniqueDNSName("root-route")
+	if err := waitForDefaultTunWarnings(
+		system,
+		dt,
+		[]sysnet.Warning{sysnet.WarningDefaultTunDNSRouteNotExclusive},
+		"resolved root-route warnings",
+	); err != nil {
+		return err
+	}
+	if err := expectDNSSuccessAtName(
+		"resolved root-route public query",
+		"127.0.0.53",
+		publicName,
+	); err != nil {
+		return err
+	}
+	if err := rootDNS.waitForQuery(
+		publicName,
+		"resolved root-route leak observation",
+	); err != nil {
+		return err
+	}
+	if err := revertResolvedLink(safeIfidx); err != nil {
+		return fmt.Errorf("revert root-route resolved DNS: %w", err)
+	}
+
+	if err := setResolvedLinkDomains(tunIfidx, nil); err != nil {
+		return fmt.Errorf("remove managed resolved root route: %w", err)
+	}
+	if err := expectDefaultTunWarnings(
+		system,
+		dt,
+		[]sysnet.Warning{sysnet.WarningDefaultTunDNSRouteNotExclusive},
+		"resolved managed root route removed warnings",
+	); err != nil {
+		return err
+	}
+	if err := configureResolvedLinkDNS(
+		tunIfidx,
+		netip.MustParseAddr(dnsIP),
+		[]string{"."},
+		true,
+	); err != nil {
+		return fmt.Errorf("restore managed resolved DNS route: %w", err)
 	}
 	return nil
 }
@@ -3534,6 +3747,10 @@ func queryDefaultTunDNS() (*gdns.Message, error) {
 }
 
 func queryDefaultTunDNSAt(server string) (*gdns.Message, error) {
+	return queryDNSAtName(server, "sysnet-e2e.test.")
+}
+
+func queryDNSAtName(server, name string) (*gdns.Message, error) {
 	network := gonnect.NativeConfig{}.Build()
 	client := gdns.NewClient(
 		network.Dial,
@@ -3549,11 +3766,58 @@ func queryDefaultTunDNSAt(server string) (*gdns.Message, error) {
 		Opcode:           gdns.OpcodeQuery,
 		RecursionDesired: true,
 		Questions: []gdns.Question{{
-			Name:  "sysnet-e2e.test.",
+			Name:  name,
 			Type:  gdns.TypeA,
 			Class: gdns.ClassIN,
 		}},
 	})
+}
+
+func expectDNSAAtName(name, server, queryName string, want netip.Addr) error {
+	resp, err := queryDNSAtName(server, queryName)
+	if err != nil {
+		return fmt.Errorf("%s: query %s failed: %w", name, queryName, err)
+	}
+	if resp.RCode != gdns.RCodeSuccess {
+		return fmt.Errorf("%s: RCode = %d, want success", name, resp.RCode)
+	}
+	for _, rr := range resp.Answers {
+		if rr.Type != gdns.TypeA || len(rr.Data) != net.IPv4len {
+			continue
+		}
+		got := netip.AddrFrom4([4]byte(rr.Data))
+		if got == want {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"%s: answers = %+v, want A %s for %s",
+		name,
+		resp.Answers,
+		want,
+		queryName,
+	)
+}
+
+func expectDNSSuccessAtName(name, server, queryName string) error {
+	resp, err := queryDNSAtName(server, queryName)
+	if err != nil {
+		return fmt.Errorf("%s: query %s failed: %w", name, queryName, err)
+	}
+	if resp.RCode != gdns.RCodeSuccess {
+		return fmt.Errorf("%s: RCode = %d, want success", name, resp.RCode)
+	}
+	return nil
+}
+
+func uniqueDNSName(label string) string {
+	clean := strings.NewReplacer("_", "-", ".", "-").Replace(label)
+	return fmt.Sprintf(
+		"%s-%d-%d.sysnet-e2e.test.",
+		clean,
+		os.Getpid(),
+		time.Now().UnixNano(),
+	)
 }
 
 func expectRoute(name, dst string, mark uint32, contains string) error {
@@ -3739,6 +4003,152 @@ func waitForResolvedLinkDNSNot(ifname, server string) error {
 		}
 		return nil
 	})
+}
+
+func configureResolvedLinkDNS(
+	ifidx int,
+	server netip.Addr,
+	routeOnlyDomains []string,
+	defaultRoute bool,
+) error {
+	if err := setResolvedLinkDNS(ifidx, server); err != nil {
+		return err
+	}
+	if err := setResolvedLinkDefaultRoute(ifidx, defaultRoute); err != nil {
+		return err
+	}
+	return setResolvedLinkDomains(ifidx, routeOnlyDomains)
+}
+
+func setResolvedLinkDNS(ifidx int, server netip.Addr) error {
+	if !server.Is4() {
+		return fmt.Errorf(
+			"resolved e2e only supports IPv4 DNS servers: %s",
+			server,
+		)
+	}
+	a4 := server.As4()
+	args := []string{
+		"--system",
+		"call",
+		"org.freedesktop.resolve1",
+		"/org/freedesktop/resolve1",
+		"org.freedesktop.resolve1.Manager",
+		"SetLinkDNS",
+		"ia(iay)",
+		strconv.Itoa(ifidx),
+		"1",
+		strconv.Itoa(unix.AF_INET),
+		"4",
+	}
+	for _, octet := range a4 {
+		args = append(args, strconv.Itoa(int(octet)))
+	}
+	if _, err := commandOutput("busctl", args...); err != nil {
+		return fmt.Errorf("SetLinkDNS(%d, %s): %w", ifidx, server, err)
+	}
+	return nil
+}
+
+func setResolvedLinkDomains(ifidx int, routeOnlyDomains []string) error {
+	args := []string{
+		"--system",
+		"call",
+		"org.freedesktop.resolve1",
+		"/org/freedesktop/resolve1",
+		"org.freedesktop.resolve1.Manager",
+		"SetLinkDomains",
+		"ia(sb)",
+		strconv.Itoa(ifidx),
+		strconv.Itoa(len(routeOnlyDomains)),
+	}
+	for _, domain := range routeOnlyDomains {
+		args = append(args, domain, "true")
+	}
+	if _, err := commandOutput("busctl", args...); err != nil {
+		return fmt.Errorf(
+			"SetLinkDomains(%d, %v): %w",
+			ifidx,
+			routeOnlyDomains,
+			err,
+		)
+	}
+	return nil
+}
+
+func setResolvedLinkDefaultRoute(ifidx int, value bool) error {
+	raw := "false"
+	if value {
+		raw = "true"
+	}
+	if _, err := commandOutput(
+		"busctl",
+		"--system",
+		"call",
+		"org.freedesktop.resolve1",
+		"/org/freedesktop/resolve1",
+		"org.freedesktop.resolve1.Manager",
+		"SetLinkDefaultRoute",
+		"ib",
+		strconv.Itoa(ifidx),
+		raw,
+	); err != nil {
+		return fmt.Errorf("SetLinkDefaultRoute(%d, %v): %w", ifidx, value, err)
+	}
+	return nil
+}
+
+func revertResolvedLink(ifidx int) error {
+	if _, err := commandOutput(
+		"busctl",
+		"--system",
+		"call",
+		"org.freedesktop.resolve1",
+		"/org/freedesktop/resolve1",
+		"org.freedesktop.resolve1.Manager",
+		"RevertLink",
+		"i",
+		strconv.Itoa(ifidx),
+	); err != nil {
+		return fmt.Errorf("RevertLink(%d): %w", ifidx, err)
+	}
+	return nil
+}
+
+func waitForDefaultTunWarnings(
+	system *linux.System,
+	dt sysnet.DefaultTun,
+	want []sysnet.Warning,
+	name string,
+) error {
+	return waitFor(func() error {
+		return expectDefaultTunWarnings(system, dt, want, name)
+	})
+}
+
+func expectDefaultTunWarnings(
+	system *linux.System,
+	dt sysnet.DefaultTun,
+	want []sysnet.Warning,
+	name string,
+) error {
+	got := system.DefaultTunWarnings(dt)
+	if !sameWarnings(got, want) {
+		return fmt.Errorf("%s: warnings = %v, want %v", name, got, want)
+	}
+	return nil
+}
+
+func sameWarnings(a, b []sysnet.Warning) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func flushResolvedCaches() error {
@@ -4310,4 +4720,127 @@ func (s *staticDNS) run() {
 			return
 		}
 	}
+}
+
+type recordingDNSServer struct {
+	conn   net.PacketConn
+	addr   netip.Addr
+	answer netip.Addr
+
+	mu      sync.Mutex
+	queries map[string]int
+}
+
+func newRecordingDNSServer(
+	addr netip.Addr,
+	answer netip.Addr,
+) (*recordingDNSServer, error) {
+	var lc net.ListenConfig
+	conn, err := lc.ListenPacket(
+		context.Background(),
+		"udp4",
+		net.JoinHostPort(addr.String(), "53"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	s := &recordingDNSServer{
+		conn:    conn,
+		addr:    addr,
+		answer:  answer,
+		queries: make(map[string]int),
+	}
+	go s.run()
+	return s, nil
+}
+
+func (s *recordingDNSServer) Close() error {
+	return s.conn.Close()
+}
+
+func (s *recordingDNSServer) run() {
+	buf := make([]byte, 1500)
+	for {
+		n, peer, err := s.conn.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		req, err := gdns.Unpack(buf[:n])
+		if err != nil {
+			continue
+		}
+		for _, q := range req.Questions {
+			s.record(q.Name)
+		}
+		resp := &gdns.Message{
+			ID:                 req.ID,
+			Response:           true,
+			Opcode:             req.Opcode,
+			RCode:              gdns.RCodeSuccess,
+			RecursionDesired:   req.RecursionDesired,
+			RecursionAvailable: true,
+			Questions: append(
+				[]gdns.Question(nil),
+				req.Questions...),
+		}
+		for _, q := range req.Questions {
+			if q.Type == gdns.TypeA && q.Class == gdns.ClassIN {
+				a4 := s.answer.As4()
+				resp.Answers = append(resp.Answers, gdns.Resource{
+					Name:  q.Name,
+					Type:  gdns.TypeA,
+					Class: gdns.ClassIN,
+					TTL:   1,
+					Data:  a4[:],
+				})
+			}
+		}
+		pkt, err := gdns.Pack(resp)
+		if err != nil {
+			continue
+		}
+		_, _ = s.conn.WriteTo(pkt, peer)
+	}
+}
+
+func (s *recordingDNSServer) record(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.queries[normalizeE2EDNSName(name)]++
+}
+
+func (s *recordingDNSServer) queryCount(name string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.queries[normalizeE2EDNSName(name)]
+}
+
+func (s *recordingDNSServer) waitForQuery(name, label string) error {
+	return waitFor(func() error {
+		if count := s.queryCount(name); count > 0 {
+			return nil
+		}
+		return fmt.Errorf("%s: recording DNS did not receive %s", label, name)
+	})
+}
+
+func (s *recordingDNSServer) expectNoQuery(name, label string) error {
+	time.Sleep(300 * time.Millisecond)
+	if count := s.queryCount(name); count != 0 {
+		return fmt.Errorf(
+			"%s: recording DNS received %d query for %s, want 0",
+			label,
+			count,
+			name,
+		)
+	}
+	return nil
+}
+
+func normalizeE2EDNSName(name string) string {
+	name = strings.TrimSpace(strings.ToLower(name))
+	if name == "" || strings.HasSuffix(name, ".") {
+		return name
+	}
+	return name + "."
 }

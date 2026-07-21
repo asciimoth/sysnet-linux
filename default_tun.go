@@ -18,6 +18,7 @@ import (
 	pmark "github.com/asciimoth/p-mark"
 	"github.com/asciimoth/p-mark/fwmark"
 	linuxconnmark "github.com/asciimoth/sysnet-linux/connmark"
+	linuxdns "github.com/asciimoth/sysnet-linux/dns"
 	"github.com/asciimoth/sysnet-linux/killswitch"
 	"github.com/asciimoth/sysnet-linux/routing"
 	gtunconfig "github.com/asciimoth/sysnet-linux/tun"
@@ -476,6 +477,41 @@ func (s *System) clearDefaultTunDNSInterface() error {
 		return nil
 	}
 	return provider.SetInterfaceIndex(0)
+}
+
+// DefaultTunWarnings returns read-only runtime warnings for an active
+// DefaultTun created by this System.
+func (s *System) DefaultTunWarnings(t sysnet.DefaultTun) []sysnet.Warning {
+	d, ok := t.(*defaultTun)
+	if !ok || d == nil || d.defaultTunState == nil {
+		return nil
+	}
+
+	s.mu.Lock()
+	active := !s.closed && s.defaultTun == d.defaultTunState
+	provider, resolved := s.dnsProvider.(*linuxdns.Resolved)
+	s.mu.Unlock()
+	if !active || !resolved {
+		return nil
+	}
+
+	d.mu.Lock()
+	wrapperActive := d.generation == d.defaultTunState.generation &&
+		d.server != nil
+	nativeTun := d.tun
+	dnsIP := d.dnsIP
+	d.mu.Unlock()
+	if !wrapperActive {
+		return nil
+	}
+
+	ifidx, err := s.tunIndex(nativeTun)
+	if err != nil || ifidx <= 0 || int64(ifidx) > int64(1<<31-1) {
+		return nil
+	}
+	ifidx32 := int32(ifidx) //nolint:gosec // ifidx is bounds-checked above.
+	warnings := provider.DefaultTunDNSRouteWarnings(ifidx32, dnsIP)
+	return append([]sysnet.Warning(nil), warnings...)
 }
 
 func (d *defaultTun) SetDns(resolver gdns.Interface) {

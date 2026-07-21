@@ -613,6 +613,15 @@ func (s *System) ownedAnyTun(t gtun.Tun) bool {
 	return s.defaultTun != nil && s.defaultTun.tun == t
 }
 
+// TunWarnings returns read-only runtime warnings for a regular TUN created by
+// this System. sysnet-linux does not currently report regular TUN warnings.
+func (s *System) TunWarnings(t gtun.Tun) []sysnet.Warning {
+	if !s.ownedRegularTun(t) {
+		return nil
+	}
+	return nil
+}
+
 func (s *System) SetTunMTU(t gtun.Tun, mtu int) error {
 	if !s.ownedAnyTun(t) {
 		return sysnet.ErrUnknownTun

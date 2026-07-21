@@ -13,6 +13,7 @@ import (
 	"time"
 
 	gdns "github.com/asciimoth/gonnect/dns"
+	"github.com/asciimoth/gonnect/sysnet"
 	"github.com/godbus/dbus/v5"
 	"golang.org/x/sys/unix"
 )
@@ -151,6 +152,151 @@ func TestResolvedAllowsNoInterfaceAtConstructionAndSetLater(t *testing.T) {
 		t.Fatalf("SetDNS after SetInterfaceIndex: %v", err)
 	}
 	assertManagedDNSOn(t, bus, 8, managed)
+}
+
+func TestResolvedDefaultTunDNSRouteWarnings(t *testing.T) {
+	managedDNS := netip.MustParseAddr("100.64.0.1")
+	managedServer := netip.AddrPortFrom(managedDNS, 53)
+	otherServer := netip.MustParseAddrPort("192.0.2.53:53")
+	warning := []sysnet.Warning{
+		sysnet.WarningDefaultTunDNSRouteNotExclusive,
+	}
+
+	tests := []struct {
+		name     string
+		snapshot resolvedRouteSnapshot
+		want     []sysnet.Warning
+	}{
+		{
+			name: "only managed default tun root route",
+			snapshot: resolvedRouteSnapshot{
+				ManagedIfIndex: 7,
+				ManagedDNS:     managedDNS,
+				ManagedLink: resolvedLinkDNSRoute{
+					IfIndex: 7,
+					Servers: []netip.AddrPort{managedServer},
+					Domains: []string{"."},
+				},
+			},
+		},
+		{
+			name: "global root route with non-managed DNS",
+			snapshot: resolvedRouteSnapshot{
+				ManagedIfIndex: 7,
+				ManagedDNS:     managedDNS,
+				ManagedLink: resolvedLinkDNSRoute{
+					IfIndex: 7,
+					Servers: []netip.AddrPort{managedServer},
+					Domains: []string{"."},
+				},
+				Global: resolvedDNSRoute{
+					Servers: []netip.AddrPort{otherServer},
+					Domains: []string{"."},
+				},
+			},
+			want: warning,
+		},
+		{
+			name: "other link root route with non-managed DNS",
+			snapshot: resolvedRouteSnapshot{
+				ManagedIfIndex: 7,
+				ManagedDNS:     managedDNS,
+				ManagedLink: resolvedLinkDNSRoute{
+					IfIndex: 7,
+					Servers: []netip.AddrPort{managedServer},
+					Domains: []string{"."},
+				},
+				Links: []resolvedLinkDNSRoute{{
+					IfIndex: 8,
+					Servers: []netip.AddrPort{otherServer},
+					Domains: []string{"."},
+				}},
+			},
+			want: warning,
+		},
+		{
+			name: "default route only physical link",
+			snapshot: resolvedRouteSnapshot{
+				ManagedIfIndex: 7,
+				ManagedDNS:     managedDNS,
+				ManagedLink: resolvedLinkDNSRoute{
+					IfIndex: 7,
+					Servers: []netip.AddrPort{managedServer},
+					Domains: []string{"."},
+				},
+				Links: []resolvedLinkDNSRoute{{
+					IfIndex: 8,
+					Servers: []netip.AddrPort{otherServer},
+				}},
+			},
+		},
+		{
+			name: "specific domain routes",
+			snapshot: resolvedRouteSnapshot{
+				ManagedIfIndex: 7,
+				ManagedDNS:     managedDNS,
+				ManagedLink: resolvedLinkDNSRoute{
+					IfIndex: 7,
+					Servers: []netip.AddrPort{managedServer},
+					Domains: []string{"."},
+				},
+				Links: []resolvedLinkDNSRoute{{
+					IfIndex: 8,
+					Servers: []netip.AddrPort{otherServer},
+					Domains: []string{"corp.example."},
+				}},
+			},
+		},
+		{
+			name: "missing managed link root route",
+			snapshot: resolvedRouteSnapshot{
+				ManagedIfIndex: 7,
+				ManagedDNS:     managedDNS,
+				ManagedLink: resolvedLinkDNSRoute{
+					IfIndex: 7,
+					Servers: []netip.AddrPort{managedServer},
+				},
+			},
+			want: warning,
+		},
+		{
+			name: "missing managed DNS server",
+			snapshot: resolvedRouteSnapshot{
+				ManagedIfIndex: 7,
+				ManagedDNS:     managedDNS,
+				ManagedLink: resolvedLinkDNSRoute{
+					IfIndex: 7,
+					Servers: []netip.AddrPort{otherServer},
+					Domains: []string{"."},
+				},
+			},
+			want: warning,
+		},
+		{
+			name: "global DNS without global root route",
+			snapshot: resolvedRouteSnapshot{
+				ManagedIfIndex: 7,
+				ManagedDNS:     managedDNS,
+				ManagedLink: resolvedLinkDNSRoute{
+					IfIndex: 7,
+					Servers: []netip.AddrPort{managedServer},
+					Domains: []string{"."},
+				},
+				Global: resolvedDNSRoute{
+					Servers: []netip.AddrPort{otherServer},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolvedDefaultTunDNSRouteWarnings(tt.snapshot)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("warnings = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }
 
 func TestResolvedSetInterfaceIndexReappliesActiveDNS(t *testing.T) {

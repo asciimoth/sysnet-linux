@@ -14,6 +14,7 @@ import (
 
 	"github.com/asciimoth/gonnect"
 	gdns "github.com/asciimoth/gonnect/dns"
+	"github.com/asciimoth/gonnect/sysnet"
 	"github.com/godbus/dbus/v5"
 	"golang.org/x/sys/unix"
 )
@@ -406,18 +407,6 @@ func (r *Resolved) applyDNS(server netip.Addr) error {
 
 	err = r.mgr.CallWithContext(
 		ctx,
-		dbusResolvedInterface+".SetLinkDNS",
-		0,
-		ifidx,
-		[]resolvedLinkNameserver{resolvedNameserver(server)},
-	).Store()
-	if err != nil {
-		return fmt.Errorf("resolved: SetLinkDNS: %w", err)
-	}
-	r.env.Logf("resolved: SetLinkDNS applied")
-
-	err = r.mgr.CallWithContext(
-		ctx,
 		dbusResolvedInterface+".SetLinkDomains",
 		0,
 		ifidx,
@@ -449,6 +438,18 @@ func (r *Resolved) applyDNS(server netip.Addr) error {
 	if defaultRouteSupported {
 		r.env.Logf("resolved: SetLinkDefaultRoute applied")
 	}
+
+	err = r.mgr.CallWithContext(
+		ctx,
+		dbusResolvedInterface+".SetLinkDNS",
+		0,
+		ifidx,
+		[]resolvedLinkNameserver{resolvedNameserver(server)},
+	).Store()
+	if err != nil {
+		return fmt.Errorf("resolved: SetLinkDNS: %w", err)
+	}
+	r.env.Logf("resolved: SetLinkDNS applied")
 
 	if err := r.mgr.CallWithContext(
 		ctx,
@@ -1277,6 +1278,13 @@ func (r *Resolved) linkDNSServers() ([]netip.AddrPort, error) {
 	if err != nil {
 		return nil, err
 	}
+	return r.linkDNSServersFor(ctx, link)
+}
+
+func (r *Resolved) linkDNSServersFor(
+	ctx context.Context,
+	link dbus.BusObject,
+) ([]netip.AddrPort, error) {
 	var v dbus.Variant
 	if err := link.CallWithContext(
 		ctx,
@@ -1307,6 +1315,13 @@ func (r *Resolved) linkObject(ctx context.Context) (dbus.BusObject, error) {
 	if err != nil {
 		return nil, err
 	}
+	return r.linkObjectFor(ctx, ifidx)
+}
+
+func (r *Resolved) linkObjectFor(
+	ctx context.Context,
+	ifidx int32,
+) (dbus.BusObject, error) {
 	var path dbus.ObjectPath
 	if err := r.mgr.CallWithContext(
 		ctx,
@@ -1383,6 +1398,176 @@ func (r *Resolved) linkConfigNeedsApply(
 	return !ok || !defaultRoute, nil
 }
 
+type resolvedRouteSnapshot struct {
+	ManagedIfIndex int32
+	ManagedDNS     netip.Addr
+	ManagedLink    resolvedLinkDNSRoute
+	Links          []resolvedLinkDNSRoute
+	Global         resolvedDNSRoute
+}
+
+type resolvedLinkDNSRoute struct {
+	IfIndex int32
+	Servers []netip.AddrPort
+	Domains []string
+}
+
+type resolvedDNSRoute struct {
+	Servers []netip.AddrPort
+	Domains []string
+}
+
+// DefaultTunDNSRouteWarnings returns warnings for resolved state that can route
+// ordinary public DNS lookups outside the managed DefaultTun DNS server.
+func (r *Resolved) DefaultTunDNSRouteWarnings(
+	ifidx int32,
+	dnsIP netip.Addr,
+) []sysnet.Warning {
+	snapshot, err := r.defaultTunDNSRouteSnapshot(ifidx, dnsIP)
+	if err != nil {
+		return nil
+	}
+	return resolvedDefaultTunDNSRouteWarnings(snapshot)
+}
+
+func (r *Resolved) defaultTunDNSRouteSnapshot(
+	ifidx int32,
+	dnsIP netip.Addr,
+) (resolvedRouteSnapshot, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), DbusTimeout)
+	defer cancel()
+
+	link, err := r.linkObjectFor(ctx, ifidx)
+	if err != nil {
+		return resolvedRouteSnapshot{}, err
+	}
+	linkServers, err := r.linkDNSServersFor(ctx, link)
+	if err != nil {
+		return resolvedRouteSnapshot{}, err
+	}
+	linkDomains, err := r.linkDomainsFor(ctx, link)
+	if err != nil {
+		return resolvedRouteSnapshot{}, err
+	}
+	managerServers, err := r.managerDNSServers()
+	if err != nil {
+		return resolvedRouteSnapshot{}, err
+	}
+	managerDomains, err := r.managerDomains()
+	if err != nil {
+		return resolvedRouteSnapshot{}, err
+	}
+
+	snapshot := resolvedRouteSnapshot{
+		ManagedIfIndex: ifidx,
+		ManagedDNS:     dnsIP,
+		ManagedLink: resolvedLinkDNSRoute{
+			IfIndex: ifidx,
+			Servers: linkServers,
+			Domains: linkDNSRouteDomains(linkDomains),
+		},
+		Global: resolvedDNSRoute{
+			Servers: managerServers[0],
+			Domains: globalDNSRouteDomains(managerDomains[0]),
+		},
+	}
+	for linkIfidx, servers := range managerServers {
+		if linkIfidx == 0 || linkIfidx == ifidx {
+			continue
+		}
+		snapshot.Links = append(snapshot.Links, resolvedLinkDNSRoute{
+			IfIndex: linkIfidx,
+			Servers: servers,
+			Domains: globalDNSRouteDomains(managerDomains[linkIfidx]),
+		})
+	}
+	return snapshot, nil
+}
+
+func resolvedDefaultTunDNSRouteWarnings(
+	snapshot resolvedRouteSnapshot,
+) []sysnet.Warning {
+	if !snapshot.ManagedDNS.IsValid() || snapshot.ManagedIfIndex <= 0 {
+		return nil
+	}
+	if !hasRootDNSRoute(snapshot.ManagedLink.Domains) ||
+		!onlyManagedDNSServer(
+			snapshot.ManagedLink.Servers,
+			snapshot.ManagedDNS,
+		) {
+		return []sysnet.Warning{
+			sysnet.WarningDefaultTunDNSRouteNotExclusive,
+		}
+	}
+	if hasRootDNSRoute(snapshot.Global.Domains) &&
+		hasNonManagedDNSServer(
+			snapshot.Global.Servers,
+			snapshot.ManagedDNS,
+		) {
+		return []sysnet.Warning{
+			sysnet.WarningDefaultTunDNSRouteNotExclusive,
+		}
+	}
+	for _, link := range snapshot.Links {
+		if hasRootDNSRoute(link.Domains) &&
+			hasNonManagedDNSServer(link.Servers, snapshot.ManagedDNS) {
+			return []sysnet.Warning{
+				sysnet.WarningDefaultTunDNSRouteNotExclusive,
+			}
+		}
+	}
+	return nil
+}
+
+func linkDNSRouteDomains(domains []resolvedLinkDomain) []string {
+	out := make([]string, 0, len(domains))
+	for _, domain := range domains {
+		if domain.RoutingOnly {
+			out = append(out, normalizeResolvedDomain(domain.Domain))
+		}
+	}
+	return dedupeStrings(out)
+}
+
+func globalDNSRouteDomains(domains []resolvedGlobalDomain) []string {
+	out := make([]string, 0, len(domains))
+	for _, domain := range domains {
+		if domain.RoutingOnly {
+			out = append(out, normalizeResolvedDomain(domain.Domain))
+		}
+	}
+	return dedupeStrings(out)
+}
+
+func hasRootDNSRoute(domains []string) bool {
+	for _, domain := range domains {
+		if domain == "." {
+			return true
+		}
+	}
+	return false
+}
+
+func onlyManagedDNSServer(
+	servers []netip.AddrPort,
+	managedDNS netip.Addr,
+) bool {
+	servers = dedupeServers(servers)
+	return len(servers) == 1 && servers[0].Addr() == managedDNS
+}
+
+func hasNonManagedDNSServer(
+	servers []netip.AddrPort,
+	managedDNS netip.Addr,
+) bool {
+	for _, server := range dedupeServers(servers) {
+		if server.Addr() != managedDNS {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *Resolved) linkDomains() ([]resolvedLinkDomain, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DbusTimeout)
 	defer cancel()
@@ -1391,7 +1576,13 @@ func (r *Resolved) linkDomains() ([]resolvedLinkDomain, error) {
 	if err != nil {
 		return nil, err
 	}
+	return r.linkDomainsFor(ctx, link)
+}
 
+func (r *Resolved) linkDomainsFor(
+	ctx context.Context,
+	link dbus.BusObject,
+) ([]resolvedLinkDomain, error) {
 	var v dbus.Variant
 	if err := link.CallWithContext(
 		ctx,
