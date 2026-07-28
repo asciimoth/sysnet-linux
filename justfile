@@ -1,3 +1,21 @@
+typos:
+  typos
+
+check: tidy typos fmt lint vet test-total
+
+vet:
+	go vet ./...
+
+tidy:
+	go mod tidy
+
+lint:
+  golangci-lint run ./...
+
+fmt:
+  golangci-lint fmt ./...
+
+
 test:
   go test ./... -race -count=10
 
