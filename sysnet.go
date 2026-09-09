@@ -358,12 +358,9 @@ func NewSystem(config Config) (*System, error) {
 	s.localNet = s.buildMarkedNetwork()
 	if config.DNSProvider != nil {
 		s.outDNS = config.DNSProvider
-		if n, ok := s.outNet.(*gonnect.NativeNetwork); ok {
-			n.SetResolver(gdns.NewResolver(config.DNSProvider))
-		}
-		if n, ok := s.localNet.(*gonnect.NativeNetwork); ok {
-			n.SetResolver(gdns.NewResolver(config.DNSProvider))
-		}
+		resolver := gdns.NewResolver(config.DNSProvider)
+		s.outNet = gonnect.NewNetworkWithResolver(s.outNet, resolver)
+		s.localNet = gonnect.NewNetworkWithResolver(s.localNet, resolver)
 	}
 	return s, nil
 }

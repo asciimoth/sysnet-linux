@@ -115,6 +115,11 @@ func run() error {
 	if err := checkAutoNewDirectSystem(); err != nil {
 		return err
 	}
+	outNetDNS, restoreDNS, err := prepareDirectOutNetDNS()
+	if err != nil {
+		return err
+	}
+	defer restoreDNS()
 
 	pmarkCtl := &recordingPmark{}
 	system, err := newSystem(pmarkCtl)
@@ -128,6 +133,9 @@ func run() error {
 	}()
 
 	if err := checkFeaturesAndRules(system); err != nil {
+		return err
+	}
+	if err := checkOutNetDNSAfterDefaultTun(system, outNetDNS); err != nil {
 		return err
 	}
 	if err := checkInvalidRules(system); err != nil {
@@ -285,6 +293,11 @@ func runResolved() error {
 	if err := checkAutoNewResolvedSystem(); err != nil {
 		return err
 	}
+	outNetDNS, restoreDNS, err := prepareResolvedOutNetDNS()
+	if err != nil {
+		return err
+	}
+	defer restoreDNS()
 
 	pmarkCtl := &recordingPmark{}
 	system, err := newResolvedSystem(pmarkCtl)
@@ -300,6 +313,10 @@ func runResolved() error {
 	if err := checkFeaturesAndRules(system); err != nil {
 		return err
 	}
+	if err := checkOutNetDNSAfterDefaultTun(system, outNetDNS); err != nil {
+		return err
+	}
+	restoreDNS()
 	if err := checkRegularTun(system); err != nil {
 		return err
 	}
@@ -368,6 +385,114 @@ func newResolvedSystem(pmarkCtl linux.PmarkController) (*linux.System, error) {
 		return nil, fmt.Errorf("create resolved System: %w", err)
 	}
 	return system, nil
+}
+
+func prepareDirectOutNetDNS() (
+	*recordingDNSServer,
+	func(),
+	error,
+) {
+	original, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		return nil, func() {}, fmt.Errorf(
+			"read resolv.conf for OutNet DNS test: %w",
+			err,
+		)
+	}
+	server, err := newRecordingDNSServer(
+		netip.MustParseAddr("198.51.100.2"),
+		netip.MustParseAddr(rpfHTTPIP),
+	)
+	if err != nil {
+		return nil, func() {}, fmt.Errorf(
+			"start direct OutNet DNS upstream: %w",
+			err,
+		)
+	}
+	if err := os.WriteFile(
+		"/etc/resolv.conf",
+		[]byte("nameserver "+server.addr.String()+"\n"),
+		0o644,
+	); err != nil {
+		_ = server.Close()
+		return nil, func() {}, fmt.Errorf(
+			"configure direct OutNet DNS upstream: %w",
+			err,
+		)
+	}
+	var once sync.Once
+	restore := func() {
+		once.Do(func() {
+			if err := os.WriteFile(
+				"/etc/resolv.conf",
+				original,
+				0o644,
+			); err != nil {
+				log.Printf("restore resolv.conf after OutNet DNS test: %v", err)
+			}
+			if err := server.Close(); err != nil {
+				log.Printf("close direct OutNet DNS upstream: %v", err)
+			}
+		})
+	}
+	return server, restore, nil
+}
+
+func prepareResolvedOutNetDNS() (
+	*recordingDNSServer,
+	func(),
+	error,
+) {
+	server, err := newRecordingDNSServer(
+		netip.MustParseAddr("198.51.100.2"),
+		netip.MustParseAddr(rpfHTTPIP),
+	)
+	if err != nil {
+		return nil, func() {}, fmt.Errorf(
+			"start resolved OutNet DNS upstream: %w",
+			err,
+		)
+	}
+	ifidx, err := linkIndex(physLinkName)
+	if err != nil {
+		_ = server.Close()
+		return nil, func() {}, fmt.Errorf(
+			"get resolved OutNet DNS interface: %w",
+			err,
+		)
+	}
+	if err := configureResolvedLinkDNS(
+		ifidx,
+		server.addr,
+		nil,
+		true,
+	); err != nil {
+		_ = server.Close()
+		return nil, func() {}, fmt.Errorf(
+			"configure resolved OutNet DNS upstream: %w",
+			err,
+		)
+	}
+	if err := flushResolvedCaches(); err != nil {
+		_ = revertResolvedLink(ifidx)
+		_ = server.Close()
+		return nil, func() {}, err
+	}
+	var once sync.Once
+	restore := func() {
+		once.Do(func() {
+			if err := revertResolvedLink(ifidx); err != nil {
+				log.Printf("revert resolved OutNet DNS upstream: %v", err)
+			}
+			if err := flushResolvedCaches(); err != nil {
+				log.Printf("flush resolved OutNet DNS cache: %v", err)
+			}
+			if err := server.Close(); err != nil {
+				log.Printf("close resolved OutNet DNS upstream: %v", err)
+			}
+		})
+	}
+	return server, restore, nil
 }
 
 func checkAutoNewDirectSystem() error {
@@ -991,6 +1116,66 @@ func checkDefaultTunFallbackDNS(system *linux.System) error {
 		return fmt.Errorf("close fallback DNS DefaultTun: %w", err)
 	}
 	if err := waitForResolvconfNot(server); err != nil {
+		return err
+	}
+	return nil
+}
+
+func checkOutNetDNSAfterDefaultTun(
+	system *linux.System,
+	originalDNS *recordingDNSServer,
+) error {
+	targets, stopPeer, err := startRPFilterPeer()
+	if err != nil {
+		return fmt.Errorf("start OutNet DNS target: %w", err)
+	}
+	defer stopPeer()
+
+	dt, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs: []string{dnsIP + "/32"},
+		DnsIP:    dnsIP,
+		MTU:      1400,
+	})
+	if err != nil {
+		return fmt.Errorf("build OutNet DNS DefaultTun: %w", err)
+	}
+	defer func() { _ = dt.Close() }()
+
+	managedDNS := newStaticDNSWithRCode(gdns.RCodeServerFailure)
+	defer func() { _ = managedDNS.Close() }()
+	dt.SetDns(managedDNS)
+
+	_, port, err := net.SplitHostPort(targets.HTTP)
+	if err != nil {
+		return fmt.Errorf("parse OutNet DNS target: %w", err)
+	}
+	name := uniqueDNSName("outnet-dial")
+	target := net.JoinHostPort(strings.TrimSuffix(name, "."), port)
+	if err := markedHTTPGet(
+		system,
+		target,
+		"OutNet hostname after DefaultTun DNS takeover",
+	); err != nil {
+		return err
+	}
+	if err := originalDNS.waitForQuery(
+		name,
+		"OutNet original DNS upstream",
+	); err != nil {
+		return err
+	}
+	if err := managedDNS.expectNoQuery(
+		name,
+		"OutNet managed DNS loop",
+	); err != nil {
+		return err
+	}
+	if err := expectRoute(
+		"OutNet hostname app-bypass route",
+		rpfHTTPIP,
+		routing.DefaultAppBypassMark,
+		"dev "+rpfLinkName,
+	); err != nil {
 		return err
 	}
 	return nil
@@ -4723,13 +4908,27 @@ type staticDNS struct {
 	ch     chan gdns.Request
 	closed chan struct{}
 	answer netip.Addr
+	rcode  uint8
+
+	mu      sync.Mutex
+	queries map[string]int
 }
 
 func newStaticDNS(answer netip.Addr) *staticDNS {
+	return newStaticDNSResponse(answer, gdns.RCodeSuccess)
+}
+
+func newStaticDNSWithRCode(rcode uint8) *staticDNS {
+	return newStaticDNSResponse(netip.Addr{}, rcode)
+}
+
+func newStaticDNSResponse(answer netip.Addr, rcode uint8) *staticDNS {
 	s := &staticDNS{
-		ch:     make(chan gdns.Request),
-		closed: make(chan struct{}),
-		answer: answer,
+		ch:      make(chan gdns.Request),
+		closed:  make(chan struct{}),
+		answer:  answer,
+		rcode:   rcode,
+		queries: make(map[string]int),
 	}
 	go s.run()
 	return s
@@ -4754,7 +4953,7 @@ func (s *staticDNS) run() {
 				ID:                 req.Message.ID,
 				Response:           true,
 				Opcode:             req.Message.Opcode,
-				RCode:              gdns.RCodeSuccess,
+				RCode:              s.rcode,
 				RecursionDesired:   req.Message.RecursionDesired,
 				RecursionAvailable: true,
 				Questions: append(
@@ -4762,7 +4961,9 @@ func (s *staticDNS) run() {
 					req.Message.Questions...),
 			}
 			for _, q := range req.Message.Questions {
-				if q.Type == gdns.TypeA && q.Class == gdns.ClassIN {
+				s.record(q.Name)
+				if s.rcode == gdns.RCodeSuccess && q.Type == gdns.TypeA &&
+					q.Class == gdns.ClassIN {
 					a4 := s.answer.As4()
 					resp.Answers = append(resp.Answers, gdns.Resource{
 						Name:  q.Name,
@@ -4778,6 +4979,31 @@ func (s *staticDNS) run() {
 			return
 		}
 	}
+}
+
+func (s *staticDNS) record(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.queries[normalizeE2EDNSName(name)]++
+}
+
+func (s *staticDNS) queryCount(name string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.queries[normalizeE2EDNSName(name)]
+}
+
+func (s *staticDNS) expectNoQuery(name, label string) error {
+	time.Sleep(300 * time.Millisecond)
+	if count := s.queryCount(name); count != 0 {
+		return fmt.Errorf(
+			"%s: managed DNS received %d query for %s, want 0",
+			label,
+			count,
+			name,
+		)
+	}
+	return nil
 }
 
 type recordingDNSServer struct {
