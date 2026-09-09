@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -406,36 +407,122 @@ func TestSystemOutNetIPLiteralDoesNotUseDNSProvider(t *testing.T) {
 }
 
 func TestSystemOutNetResolverErrorDoesNotUseNativeFallback(t *testing.T) {
-	listener := listenResolverTestTCP(t, "127.0.0.1:0")
-	provider := newResolverTestDNSProvider()
-	system := newResolverTestSystem(t, provider)
+	tests := []struct {
+		name    string
+		host    string
+		setup   func(*resolverTestDNSProvider)
+		timeout bool
+	}{
+		{
+			name: "NXDOMAIN",
+			host: "native-fallback-nxdomain.invalid",
+		},
+		{
+			name: "SERVFAIL",
+			host: "native-fallback-servfail.invalid",
+			setup: func(provider *resolverTestDNSProvider) {
+				provider.setRCode(
+					"native-fallback-servfail.invalid",
+					gdns.RCodeServerFailure,
+				)
+			},
+		},
+		{
+			name: "timeout",
+			host: "native-fallback-timeout.invalid",
+			setup: func(provider *resolverTestDNSProvider) {
+				provider.blockHost("native-fallback-timeout.invalid")
+			},
+			timeout: true,
+		},
+	}
 
-	conn, err := system.OutNet().Dial(
-		resolverTestContext(t),
-		"tcp4",
-		net.JoinHostPort(
-			"localhost",
-			netPortString(resolverTestTCPPort(t, listener)),
-		),
-	)
-	if conn != nil {
-		_ = conn.Close()
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			listener := listenResolverTestTCP(t, "127.0.0.1:0")
+			hostsFile := filepath.Join(t.TempDir(), "hosts")
+			if err := os.WriteFile(hostsFile, nil, 0o600); err != nil {
+				t.Fatalf("write hosts file: %v", err)
+			}
+			provider := newResolverTestDNSProvider()
+			if test.setup != nil {
+				test.setup(provider)
+			}
+			system := newResolverTestSystemWithHostsFile(
+				t,
+				provider,
+				hostsFile,
+			)
+
+			ctx := resolverTestContext(t)
+			if test.timeout {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(
+					context.Background(),
+					50*time.Millisecond,
+				)
+				defer cancel()
+			}
+			conn, err := system.OutNet().Dial(
+				ctx,
+				"tcp4",
+				net.JoinHostPort(
+					test.host,
+					netPortString(resolverTestTCPPort(t, listener)),
+				),
+			)
+			if conn != nil {
+				_ = conn.Close()
+			}
+			if err == nil {
+				t.Fatal("Dial succeeded after the DNS provider failed")
+			}
+			if test.timeout {
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf(
+						"Dial error = %v, want context deadline exceeded",
+						err,
+					)
+				}
+			} else {
+				var dnsErr *net.DNSError
+				if !strings.Contains(err.Error(), "no such host") ||
+					!errors.As(err, &dnsErr) || !dnsErr.IsNotFound {
+					t.Fatalf("Dial error = %v, want a not-found DNS error", err)
+				}
+			}
+
+			questions := provider.takeQuestions()
+			if len(questions) == 0 {
+				t.Fatal("DNS provider received no questions")
+			}
+			for _, question := range questions {
+				if question.Name != resolverTestDNSName(test.host)+"." {
+					t.Fatalf(
+						"DNS question name = %q, want %q",
+						question.Name,
+						test.host+".",
+					)
+				}
+			}
+
+			deadline := time.Now().Add(25 * time.Millisecond)
+			if err := listener.SetDeadline(deadline); err != nil {
+				t.Fatalf("set TCP listener deadline: %v", err)
+			}
+			unexpected, acceptErr := listener.Accept()
+			if unexpected != nil {
+				_ = unexpected.Close()
+				t.Fatal(
+					"the marked native network received a connection attempt",
+				)
+			}
+			var netErr net.Error
+			if !errors.As(acceptErr, &netErr) || !netErr.Timeout() {
+				t.Fatalf("Accept error = %v, want timeout", acceptErr)
+			}
+		})
 	}
-	if err == nil {
-		t.Fatal("Dial succeeded through the native localhost fallback")
-	}
-	var dnsErr *net.DNSError
-	if !strings.Contains(err.Error(), "no such host") ||
-		!errors.As(err, &dnsErr) || !dnsErr.IsNotFound {
-		t.Fatalf("Dial error = %v, want a not-found DNS error", err)
-	}
-	assertResolverTestQuestions(
-		t,
-		provider.takeQuestions(),
-		"localhost",
-		gdns.TypeA,
-		gdns.TypeAAAA,
-	)
 }
 
 func TestSystemOutNetDNSCancellationStopsDial(t *testing.T) {
@@ -482,8 +569,19 @@ func newResolverTestSystem(
 	t *testing.T,
 	provider linuxdns.DNSProvider,
 ) *linux.System {
+	return newResolverTestSystemWithHostsFile(t, provider, "")
+}
+
+func newResolverTestSystemWithHostsFile(
+	t *testing.T,
+	provider linuxdns.DNSProvider,
+	hostsFile string,
+) *linux.System {
 	t.Helper()
-	system, err := linux.NewSystem(linux.Config{DNSProvider: provider})
+	system, err := linux.NewSystem(linux.Config{
+		DNSProvider: provider,
+		HostsFile:   hostsFile,
+	})
 	if err != nil {
 		t.Fatalf("NewSystem: %v", err)
 	}
@@ -630,6 +728,7 @@ type resolverTestDNSProvider struct {
 	mu        sync.Mutex
 	hosts     map[string][]netip.Addr
 	blocked   map[string]bool
+	rcodes    map[string]uint8
 	questions []gdns.Question
 	setDNS    []netip.Addr
 }
@@ -640,6 +739,7 @@ func newResolverTestDNSProvider() *resolverTestDNSProvider {
 		done:     make(chan struct{}),
 		hosts:    make(map[string][]netip.Addr),
 		blocked:  make(map[string]bool),
+		rcodes:   make(map[string]uint8),
 	}
 	go provider.run()
 	return provider
@@ -676,6 +776,12 @@ func (p *resolverTestDNSProvider) blockHost(host string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.blocked[resolverTestDNSName(host)] = true
+}
+
+func (p *resolverTestDNSProvider) setRCode(host string, rcode uint8) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.rcodes[resolverTestDNSName(host)] = rcode
 }
 
 func (p *resolverTestDNSProvider) takeQuestions() []gdns.Question {
@@ -720,6 +826,10 @@ func (p *resolverTestDNSProvider) respond(request gdns.Request) {
 		name := resolverTestDNSName(question.Name)
 		if p.blocked[name] {
 			blocked = true
+			continue
+		}
+		if rcode, found := p.rcodes[name]; found {
+			response.RCode = rcode
 			continue
 		}
 		addresses, found := p.hosts[name]

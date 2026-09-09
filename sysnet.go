@@ -169,7 +169,12 @@ type Config struct {
 	Features  FeatureConfig
 	Allocator *linuxsubnet.CombinedAllocator
 
-	DNSProvider    dns.DNSProvider
+	DNSProvider dns.DNSProvider
+
+	// HostsFile is the local hosts database read before DNSProvider. System
+	// reads it for each lookup. An empty value uses /etc/hosts.
+	HostsFile string
+
 	RoutingManager RoutingManager
 	Connmark       ConnmarkManager
 	Pmark          PmarkController
@@ -358,7 +363,10 @@ func NewSystem(config Config) (*System, error) {
 	s.localNet = s.buildMarkedNetwork()
 	if config.DNSProvider != nil {
 		s.outDNS = config.DNSProvider
-		resolver := gdns.NewResolver(config.DNSProvider)
+		resolver := newLocalThenDNSResolver(
+			config.HostsFile,
+			gdns.NewResolver(config.DNSProvider),
+		)
 		s.outNet = gonnect.NewNetworkWithResolver(s.outNet, resolver)
 		s.localNet = gonnect.NewNetworkWithResolver(s.localNet, resolver)
 	}
