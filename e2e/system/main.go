@@ -37,6 +37,7 @@ import (
 	linux "github.com/asciimoth/sysnet-linux"
 	"github.com/asciimoth/sysnet-linux/dns"
 	"github.com/asciimoth/sysnet-linux/routing"
+	linuxtun "github.com/asciimoth/sysnet-linux/tun"
 	"golang.org/x/sys/unix"
 )
 
@@ -103,6 +104,9 @@ func run() error {
 	if err := checkMatcherOnlySystem(); err != nil {
 		return err
 	}
+	if err := checkTunDefaultRoutes(); err != nil {
+		return err
+	}
 	if err := setupLinksAndMainRoutes(); err != nil {
 		return err
 	}
@@ -163,6 +167,60 @@ func run() error {
 		return err
 	}
 
+	return nil
+}
+
+func checkTunDefaultRoutes() error {
+	t, err := linuxtun.CreateDefaultTUN("sndefrt", 1400)
+	if err != nil {
+		return fmt.Errorf("create default-route test TUN: %w", err)
+	}
+	defer func() { _ = t.Close() }()
+	tunName, err := t.Name()
+	if err != nil {
+		return fmt.Errorf("get default-route test TUN name: %w", err)
+	}
+	if err := ip("link", "set", tunName, "up"); err != nil {
+		return fmt.Errorf("set default-route test TUN up: %w", err)
+	}
+
+	for _, prefix := range []string{"0.0.0.0/0", "::/0"} {
+		if err := linuxtun.SetTunRoutes(t, []string{prefix}); err != nil {
+			return fmt.Errorf("set TUN default route %s: %w", prefix, err)
+		}
+		if err := expectTunRoute(t, prefix, "SetTunRoutes"); err != nil {
+			return err
+		}
+		if err := linuxtun.SetTunRoutes(t, nil); err != nil {
+			return fmt.Errorf("clear TUN routes after SetTunRoutes: %w", err)
+		}
+
+		if err := linuxtun.AddTunRoute(t, prefix); err != nil {
+			return fmt.Errorf("add TUN default route %s: %w", prefix, err)
+		}
+		if err := expectTunRoute(t, prefix, "AddTunRoute"); err != nil {
+			return err
+		}
+		if err := linuxtun.SetTunRoutes(t, nil); err != nil {
+			return fmt.Errorf("clear TUN routes after AddTunRoute: %w", err)
+		}
+	}
+	return nil
+}
+
+func expectTunRoute(t gtun.Tun, prefix, operation string) error {
+	routes, err := linuxtun.GetTunRotue(t)
+	if err != nil {
+		return fmt.Errorf("get TUN routes after %s: %w", operation, err)
+	}
+	if !contains(routes, prefix) {
+		return fmt.Errorf(
+			"TUN routes after %s = %v, want %s",
+			operation,
+			routes,
+			prefix,
+		)
+	}
 	return nil
 }
 

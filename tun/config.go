@@ -313,9 +313,6 @@ func netlinkRouteFromPrefix(
 	if err != nil {
 		return nil, err
 	}
-	if prefix.Bits() == 0 {
-		dst = nil
-	}
 	return &netlink.Route{
 		LinkIndex: index,
 		Scope:     netlink.SCOPE_LINK,

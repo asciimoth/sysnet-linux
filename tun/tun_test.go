@@ -299,13 +299,29 @@ func TestNetlinkRouteFromPrefixMasksHostAddress(t *testing.T) {
 	}
 }
 
-func TestNetlinkRouteFromDefaultPrefixUsesNilDst(t *testing.T) {
-	got, err := netlinkRouteFromPrefix(3, netip.MustParsePrefix("0.0.0.0/0"))
-	if err != nil {
-		t.Fatalf("netlinkRouteFromPrefix error = %v", err)
-	}
-	if got.Dst != nil {
-		t.Fatalf("netlinkRouteFromPrefix Dst = %v, want nil", got.Dst)
+func TestNetlinkRouteFromDefaultPrefixUsesExplicitDst(t *testing.T) {
+	for _, prefix := range []string{"0.0.0.0/0", "::/0"} {
+		t.Run(prefix, func(t *testing.T) {
+			got, err := netlinkRouteFromPrefix(
+				3,
+				netip.MustParsePrefix(prefix),
+			)
+			if err != nil {
+				t.Fatalf("netlinkRouteFromPrefix error = %v", err)
+			}
+			if got.Dst == nil {
+				t.Fatal(
+					"netlinkRouteFromPrefix Dst = nil, want explicit prefix",
+				)
+			}
+			if got.Dst.String() != prefix {
+				t.Fatalf(
+					"netlinkRouteFromPrefix Dst = %v, want %s",
+					got.Dst,
+					prefix,
+				)
+			}
+		})
 	}
 }
 
