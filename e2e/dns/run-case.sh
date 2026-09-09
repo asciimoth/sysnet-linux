@@ -147,6 +147,12 @@ start_systemd_resolved() {
 DNSStubListener=yes
 FallbackDNS=
 EOF
+	# Write the stub configuration before resolved starts. Otherwise, resolved
+	# can import Docker's initial DNS servers and search domains.
+	cat > /etc/resolv.conf <<'EOF'
+# This is /run/systemd/resolve/stub-resolv.conf managed by man:systemd-resolved(8).
+nameserver 127.0.0.53
+EOF
 	/lib/systemd/systemd-resolved &
 	cleanup_pids+=("$!")
 	local deadline=$((SECONDS + 20))
@@ -164,10 +170,6 @@ EOF
 		busctl --system call org.freedesktop.resolve1 /org/freedesktop/resolve1 org.freedesktop.resolve1.Manager SetLinkDefaultRoute "ib" "$upstream_ifidx" true || fail "failed to configure resolved default route"
 		busctl --system call org.freedesktop.resolve1 /org/freedesktop/resolve1 org.freedesktop.resolve1.Manager SetLinkDomains "ia(sb)" "$upstream_ifidx" 1 "." true || fail "failed to configure resolved route-only root domain"
 	fi
-	cat > /etc/resolv.conf <<'EOF'
-# This is /run/systemd/resolve/stub-resolv.conf managed by man:systemd-resolved(8).
-nameserver 127.0.0.53
-EOF
 }
 
 configure_resolved_link_dns() {
