@@ -471,13 +471,14 @@ func (s *System) featuresLocked() sysnet.Features {
 		s.packetListen != nil
 	defaultOK := s.features.DefaultTun && tunOK && routingOK && dnsOK
 	return sysnet.Features{
-		Tun:             tunOK,
-		DefaultTun:      defaultOK,
-		DynTun:          s.features.DynTun && tunOK,
-		DynDefaultTun:   s.features.DynDefaultTun && defaultOK,
-		TunNames:        s.features.TunNames && tunOK,
-		DefaultTunNames: false,
-		StrictMode:      s.features.StrictMode && routingOK,
+		Tun:                    tunOK,
+		DefaultTun:             defaultOK,
+		DynTun:                 s.features.DynTun && tunOK,
+		DynDefaultTun:          s.features.DynDefaultTun && defaultOK,
+		TunNames:               s.features.TunNames && tunOK,
+		DefaultTunNames:        false,
+		StrictMode:             s.features.StrictMode && routingOK,
+		DefaultTunSourceRoutes: defaultOK,
 	}
 }
 
@@ -805,6 +806,83 @@ func normalizeTunRoutes(routes []string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+func normalizeTunSourceRoutes(
+	tunAddrs []string,
+	routes []sysnet.TunSourceRoute,
+) ([]routing.SourceRoute, error) {
+	if routes == nil {
+		return nil, nil
+	}
+
+	assigned := make(map[netip.Addr]struct{}, len(tunAddrs))
+	for _, tunAddr := range tunAddrs {
+		prefix, err := netip.ParsePrefix(tunAddr)
+		if err != nil {
+			return nil, err
+		}
+		assigned[prefix.Addr()] = struct{}{}
+	}
+
+	normalized := make([]routing.SourceRoute, 0, len(routes))
+	seen := make(map[netip.Prefix]netip.Addr, len(routes))
+	for i, route := range routes {
+		if !route.Destination.IsValid() ||
+			route.Destination.Addr().Is4In6() {
+			return nil, fmt.Errorf(
+				"source route %d has an invalid destination prefix",
+				i,
+			)
+		}
+		if !validTunSourceRouteAddr(route.Source) {
+			return nil, fmt.Errorf(
+				"source route %d has an invalid source address",
+				i,
+			)
+		}
+		if route.Destination.Addr().Is4() != route.Source.Is4() {
+			return nil, fmt.Errorf(
+				"source route %d uses different address families",
+				i,
+			)
+		}
+		if _, ok := assigned[route.Source]; !ok {
+			return nil, fmt.Errorf(
+				"source route %d source %s is not assigned to the TUN",
+				i,
+				route.Source,
+			)
+		}
+
+		destination := route.Destination.Masked()
+		if source, ok := seen[destination]; ok {
+			if source != route.Source {
+				return nil, fmt.Errorf(
+					"source route destination %s has conflicting sources",
+					destination,
+				)
+			}
+			continue
+		}
+		seen[destination] = route.Source
+		normalized = append(normalized, routing.SourceRoute{
+			Destination: destination,
+			Source:      route.Source,
+		})
+	}
+
+	return normalized, nil
+}
+
+func validTunSourceRouteAddr(addr netip.Addr) bool {
+	return addr.IsValid() &&
+		!addr.Is4In6() &&
+		!addr.IsUnspecified() &&
+		!addr.IsMulticast() &&
+		!addr.IsLoopback() &&
+		addr.Zone() == "" &&
+		(addr.IsGlobalUnicast() || addr.IsLinkLocalUnicast())
 }
 
 func routeFamilies(addrs, routes []string) routing.FamilySet {

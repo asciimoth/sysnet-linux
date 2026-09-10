@@ -157,12 +157,21 @@ func routeFromNetlink(route netlink.Route) (Route, bool) {
 	} else {
 		normalized.Dst = familyDefaultPrefix(route.Family)
 	}
+	if !prefixMatchesFamily(normalized.Dst, route.Family) {
+		return Route{}, false
+	}
 	if len(route.Gw) > 0 {
 		addr, ok := addrFromIP(route.Gw)
 		if !ok {
 			return Route{}, false
 		}
 		normalized.Gateway = addr
+	}
+	if len(route.Src) > 0 {
+		addr, ok := addrFromIP(route.Src)
+		if ok && validPreferredSourceForFamily(addr, route.Family) {
+			normalized.PreferredSource = addr
+		}
 	}
 	for _, hop := range route.MultiPath {
 		if hop == nil || hop.NewDst != nil || hop.Encap != nil ||
@@ -187,6 +196,12 @@ func routeFromNetlink(route netlink.Route) (Route, bool) {
 }
 
 func routeToNetlink(route Route) (netlink.Route, error) {
+	if !prefixMatchesFamily(route.Dst, route.Family) {
+		return netlink.Route{}, fmt.Errorf(
+			"%w: route destination does not match family",
+			ErrInvalidConfig,
+		)
+	}
 	dst, err := ipNetFromPrefix(route.Dst)
 	if err != nil {
 		return netlink.Route{}, err
@@ -198,10 +213,14 @@ func routeToNetlink(route Route) (netlink.Route, error) {
 		)
 	}
 	out := netlink.Route{
-		Family:    route.Family,
-		Table:     route.Table,
-		Dst:       dst,
-		Gw:        netIPFromAddr(route.Gateway),
+		Family: route.Family,
+		Table:  route.Table,
+		Dst:    dst,
+		Gw:     netIPFromAddr(route.Gateway),
+		Src: netIPFromPreferredSource(
+			route.PreferredSource,
+			route.Family,
+		),
 		LinkIndex: route.LinkIndex,
 		Priority:  route.Priority,
 		Scope:     netlink.Scope(route.Scope),
@@ -216,6 +235,29 @@ func routeToNetlink(route Route) (netlink.Route, error) {
 		})
 	}
 	return out, nil
+}
+
+func prefixMatchesFamily(prefix netip.Prefix, family int) bool {
+	if !prefix.IsValid() || prefix.Addr().Is4In6() {
+		return false
+	}
+	return (family == unix.AF_INET && prefix.Addr().Is4()) ||
+		(family == unix.AF_INET6 && prefix.Addr().Is6())
+}
+
+func netIPFromPreferredSource(addr netip.Addr, family int) net.IP {
+	if !validPreferredSourceForFamily(addr, family) {
+		return nil
+	}
+	return netIPFromAddr(addr)
+}
+
+func validPreferredSourceForFamily(addr netip.Addr, family int) bool {
+	if !validPreferredSource(addr) {
+		return false
+	}
+	return (family == unix.AF_INET && addr.Is4()) ||
+		(family == unix.AF_INET6 && addr.Is6())
 }
 
 func ruleFromNetlink(rule netlink.Rule) Rule {
@@ -265,11 +307,15 @@ func prefixFromIPNet(network *net.IPNet) (netip.Prefix, bool) {
 	if bits == 32 {
 		addr = addr.Unmap()
 	}
-	return netip.PrefixFrom(addr, ones).Masked(), true
+	prefix := netip.PrefixFrom(addr, ones)
+	if !prefix.IsValid() || prefix.Addr().Is4In6() {
+		return netip.Prefix{}, false
+	}
+	return prefix.Masked(), true
 }
 
 func ipNetFromPrefix(prefix netip.Prefix) (*net.IPNet, error) {
-	if !prefix.IsValid() {
+	if !prefix.IsValid() || prefix.Addr().Is4In6() {
 		return nil, fmt.Errorf("%w: invalid route prefix", ErrInvalidConfig)
 	}
 	addr := netIPFromAddr(prefix.Addr())

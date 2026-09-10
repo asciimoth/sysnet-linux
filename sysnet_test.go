@@ -70,7 +70,8 @@ func TestNewAutoBuildsAvailableComponents(t *testing.T) {
 	}
 	features := s.Features()
 	if !features.Tun || !features.DefaultTun || !features.DynTun ||
-		!features.DynDefaultTun || !features.TunNames || !features.StrictMode {
+		!features.DynDefaultTun || !features.TunNames || !features.StrictMode ||
+		!features.DefaultTunSourceRoutes {
 		t.Fatalf("Features() = %+v, want native feature set", features)
 	}
 	rules := s.ListRules()
@@ -185,7 +186,8 @@ func TestNewAutoDegradesUnavailableComponents(t *testing.T) {
 
 	features := s.Features()
 	if features.Tun || features.DefaultTun || features.DynTun ||
-		features.DynDefaultTun || features.TunNames || features.StrictMode {
+		features.DynDefaultTun || features.TunNames || features.StrictMode ||
+		features.DefaultTunSourceRoutes {
 		t.Fatalf(
 			"Features() = %+v, want TUN/routing features disabled",
 			features,
@@ -252,7 +254,7 @@ func TestFeaturesAndRulesDegradeWithDependencies(t *testing.T) {
 
 	features := s.Features()
 	if !features.Tun || !features.DefaultTun || !features.DynTun ||
-		!features.StrictMode {
+		!features.StrictMode || !features.DefaultTunSourceRoutes {
 		t.Fatalf(
 			"Features() = %+v, want tun/default/dyn/strict support",
 			features,
@@ -1272,18 +1274,38 @@ func TestBuildDefaultTunFailedRebuildClosesActiveDefaultTun(t *testing.T) {
 	defer s.Close()
 
 	first, err := s.BuildDefaultTun(sysnet.DefaultTunOpts{
-		TunAddrs:  []string{"10.55.0.1/32"},
+		TunAddrs:  []string{"10.55.0.1/32", "100.64.0.2/32"},
 		TunRoutes: []string{"0.0.0.0/0"},
 		DnsIP:     "10.55.0.1",
+		SourceRoutes: []sysnet.TunSourceRoute{
+			{
+				Destination: netip.MustParsePrefix("0.0.0.0/0"),
+				Source:      netip.MustParseAddr("10.55.0.1"),
+			},
+			{
+				Destination: netip.MustParsePrefix("100.64.0.0/10"),
+				Source:      netip.MustParseAddr("100.64.0.2"),
+			},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	dnsProvider.setErr = errors.New("set dns failed")
 	_, err = s.BuildDefaultTun(sysnet.DefaultTunOpts{
-		TunAddrs:  []string{"10.55.0.2/32"},
+		TunAddrs:  []string{"10.55.0.2/32", "100.64.0.2/32"},
 		TunRoutes: []string{"0.0.0.0/0"},
 		DnsIP:     "10.55.0.2",
+		SourceRoutes: []sysnet.TunSourceRoute{
+			{
+				Destination: netip.MustParsePrefix("0.0.0.0/0"),
+				Source:      netip.MustParseAddr("100.64.0.2"),
+			},
+			{
+				Destination: netip.MustParsePrefix("100.64.0.0/10"),
+				Source:      netip.MustParseAddr("10.55.0.2"),
+			},
+		},
 	})
 	if !errors.Is(err, dnsProvider.setErr) {
 		t.Fatalf("BuildDefaultTun error = %v, want %v", err, dnsProvider.setErr)
@@ -1311,8 +1333,46 @@ func TestBuildDefaultTunFailedRebuildClosesActiveDefaultTun(t *testing.T) {
 	if routingManager.rollback == nil {
 		t.Fatal("failed rebuild did not rollback routing")
 	}
+	wantRollbackSourceRoutes := []routing.SourceRoute{
+		{
+			Destination: netip.MustParsePrefix("0.0.0.0/0"),
+			Source:      netip.MustParseAddr("100.64.0.2"),
+		},
+		{
+			Destination: netip.MustParsePrefix("100.64.0.0/10"),
+			Source:      netip.MustParseAddr("10.55.0.2"),
+		},
+	}
+	if len(routingManager.appliedConfigs) != 2 {
+		t.Fatalf(
+			"routing apply calls = %d, want 2",
+			len(routingManager.appliedConfigs),
+		)
+	}
+	if len(routingManager.rollbackConfigs) != 1 {
+		t.Fatalf(
+			"routing rollback calls = %d, want 1",
+			len(routingManager.rollbackConfigs),
+		)
+	}
+	if !slices.Equal(
+		routingManager.rollbackConfigs[0].SourceRoutes,
+		wantRollbackSourceRoutes,
+	) {
+		t.Fatalf(
+			"rollback source routes = %v, want %v",
+			routingManager.rollbackConfigs[0].SourceRoutes,
+			wantRollbackSourceRoutes,
+		)
+	}
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if len(routingManager.rollbackConfigs) != 1 {
+		t.Fatalf(
+			"rollback calls after stale Close = %d, want 1",
+			len(routingManager.rollbackConfigs),
+		)
 	}
 }
 
@@ -1448,25 +1508,47 @@ func (f *fakeInterfaceDNSProvider) SetInterfaceIndex(ifidx int) error {
 }
 
 type fakeRouting struct {
-	applied  *routing.Config
-	rollback *routing.Config
-	applyErr error
+	applied         *routing.Config
+	rollback        *routing.Config
+	appliedConfigs  []routing.Config
+	rollbackConfigs []routing.Config
+	applyErr        error
 }
 
 func (f *fakeRouting) Apply(config routing.Config) error {
-	c := config
+	c := cloneRoutingConfigForTest(config)
 	f.applied = &c
+	f.appliedConfigs = append(
+		f.appliedConfigs,
+		cloneRoutingConfigForTest(config),
+	)
 	return f.applyErr
 }
 func (f *fakeRouting) Refresh() error { return nil }
 func (f *fakeRouting) Rollback(config routing.Config) error {
-	c := config
+	c := cloneRoutingConfigForTest(config)
 	f.rollback = &c
+	f.rollbackConfigs = append(
+		f.rollbackConfigs,
+		cloneRoutingConfigForTest(config),
+	)
 	return nil
 }
 
 func (f *fakeRouting) Status() (routing.DesiredState, bool) { return routing.DesiredState{}, false }
 func (f *fakeRouting) Close() error                         { return nil }
+
+func cloneRoutingConfigForTest(config routing.Config) routing.Config {
+	cloned := config
+	if config.SourceRoutes != nil {
+		cloned.SourceRoutes = make(
+			[]routing.SourceRoute,
+			len(config.SourceRoutes),
+		)
+		copy(cloned.SourceRoutes, config.SourceRoutes)
+	}
+	return cloned
+}
 
 type fakeConnmark struct {
 	applied  []linuxconnmark.Config

@@ -92,6 +92,8 @@ var BothFamilies = FamilySet{IPv4: true, IPv6: true}
 // Config describes the routing state a Manager should enforce.
 type Config struct {
 	TUNIndex int
+	// SourceRoutes contains normalized preferred-source routes for the TUN.
+	SourceRoutes []SourceRoute
 
 	VPNTable  int
 	SafeTable int
@@ -217,7 +219,84 @@ func (c Config) validate() error {
 			ErrInvalidConfig,
 		)
 	}
+	seenSourceRoutes := make(map[netip.Prefix]netip.Addr, len(c.SourceRoutes))
+	for i, route := range c.SourceRoutes {
+		if !route.Destination.IsValid() ||
+			route.Destination.Addr().Is4In6() {
+			return fmt.Errorf(
+				"%w: source route %d has an invalid destination prefix",
+				ErrInvalidConfig,
+				i,
+			)
+		}
+		if route.Destination != route.Destination.Masked() {
+			return fmt.Errorf(
+				"%w: source route %d destination is not masked",
+				ErrInvalidConfig,
+				i,
+			)
+		}
+		if !validPreferredSource(route.Source) {
+			return fmt.Errorf(
+				"%w: source route %d has an invalid source address",
+				ErrInvalidConfig,
+				i,
+			)
+		}
+		if route.Destination.Addr().Is4() != route.Source.Is4() {
+			return fmt.Errorf(
+				"%w: source route %d uses different address families",
+				ErrInvalidConfig,
+				i,
+			)
+		}
+		family := unix.AF_INET6
+		if route.Source.Is4() {
+			family = unix.AF_INET
+		}
+		if !familyEnabled(c.Families, family) {
+			return fmt.Errorf(
+				"%w: source route %d uses a disabled address family",
+				ErrInvalidConfig,
+				i,
+			)
+		}
+		if source, ok := seenSourceRoutes[route.Destination]; ok {
+			if source != route.Source {
+				return fmt.Errorf(
+					"%w: source route destination %s has conflicting sources",
+					ErrInvalidConfig,
+					route.Destination,
+				)
+			}
+			return fmt.Errorf(
+				"%w: duplicate source route destination %s",
+				ErrInvalidConfig,
+				route.Destination,
+			)
+		}
+		seenSourceRoutes[route.Destination] = route.Source
+	}
 	return nil
+}
+
+func validPreferredSource(addr netip.Addr) bool {
+	return addr.IsValid() &&
+		!addr.Is4In6() &&
+		!addr.IsUnspecified() &&
+		!addr.IsMulticast() &&
+		!addr.IsLoopback() &&
+		addr.Zone() == "" &&
+		(addr.IsGlobalUnicast() || addr.IsLinkLocalUnicast())
+}
+
+func cloneConfig(config Config) Config {
+	cloned := config
+	if config.SourceRoutes != nil {
+		cloned.SourceRoutes = make([]SourceRoute, len(config.SourceRoutes))
+		copy(cloned.SourceRoutes, config.SourceRoutes)
+	}
+	return cloned
 }
 
 // ValidateConfig checks whether config can be compiled or applied.

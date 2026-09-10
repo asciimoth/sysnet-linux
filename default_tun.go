@@ -54,7 +54,11 @@ type dnsInterfaceIndexer interface {
 
 // VerifyDefaultTunOpts validates DefaultTun options without mutating host state.
 func (s *System) VerifyDefaultTunOpts(opts sysnet.DefaultTunOpts) error {
-	if !s.Features().DefaultTun {
+	features := s.Features()
+	if !features.DefaultTun {
+		return sysnet.ErrNotSupported
+	}
+	if len(opts.SourceRoutes) > 0 && !features.DefaultTunSourceRoutes {
 		return sysnet.ErrNotSupported
 	}
 	if len(opts.Exclude) > 0 && len(opts.Include) > 0 {
@@ -78,14 +82,21 @@ func (s *System) VerifyDefaultTunOpts(opts sysnet.DefaultTunOpts) error {
 			return err
 		}
 	}
-	if _, _, err := normalizeTunAddrs(
+	addrs, _, err := normalizeTunAddrs(
 		opts.TunAddrs,
 		s.defaultTunCIDR,
 		opts.DnsIP,
+	)
+	if err != nil {
+		return err
+	}
+	if _, err := normalizeTunSourceRoutes(
+		addrs,
+		opts.SourceRoutes,
 	); err != nil {
 		return err
 	}
-	_, err := normalizeTunRoutes(opts.TunRoutes)
+	_, err = normalizeTunRoutes(opts.TunRoutes)
 	return err
 }
 
@@ -108,6 +119,10 @@ func (s *System) BuildDefaultTun(
 		return nil, errors.New("default tun DNS IP is unavailable")
 	}
 	routes, err := normalizeTunRoutes(opts.TunRoutes)
+	if err != nil {
+		return nil, err
+	}
+	sourceRoutes, err := normalizeTunSourceRoutes(addrs, opts.SourceRoutes)
 	if err != nil {
 		return nil, err
 	}
@@ -259,6 +274,7 @@ func (s *System) BuildDefaultTun(
 	rc.UserMark = s.userMark
 	rc.UserMarkMask = s.userMarkMask
 	rc.Families = routeFamilies(addrs, routes)
+	rc.SourceRoutes = sourceRoutes
 	if len(opts.Include) > 0 {
 		rc.Mode = routing.ModeInclude
 	} else {
@@ -290,10 +306,18 @@ func (s *System) BuildDefaultTun(
 
 	state.mu.Lock()
 	generation := state.generation + 1
+	storedRC := rc
+	if rc.SourceRoutes != nil {
+		storedRC.SourceRoutes = make(
+			[]routing.SourceRoute,
+			len(rc.SourceRoutes),
+		)
+		copy(storedRC.SourceRoutes, rc.SourceRoutes)
+	}
 	state.server = server
 	state.dnsIP = dnsIP
 	state.ruleIDs = ruleIDs
-	state.routingConfig = &rc
+	state.routingConfig = &storedRC
 	state.pmarkChecker = pmarkCheckerInstalled
 	state.dnsIfidxSet = s.dnsProviderSupportsInterfaceIndex()
 	state.connmarkSet = connmarkSet
@@ -312,7 +336,15 @@ func (s *System) BuildDefaultTun(
 		s.callbacks.DefaultTunCreated(wrapper)
 	}
 	if s.callbacks.RoutingApplied != nil {
-		s.callbacks.RoutingApplied(rc)
+		callbackRC := rc
+		if rc.SourceRoutes != nil {
+			callbackRC.SourceRoutes = make(
+				[]routing.SourceRoute,
+				len(rc.SourceRoutes),
+			)
+			copy(callbackRC.SourceRoutes, rc.SourceRoutes)
+		}
+		s.callbacks.RoutingApplied(callbackRC)
 	}
 	if s.callbacks.DNSConfigured != nil {
 		s.callbacks.DNSConfigured(dnsIP)

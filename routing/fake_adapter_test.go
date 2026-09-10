@@ -70,7 +70,7 @@ func (f *fakeAdapter) ReplaceRoute(route Route) error {
 		return f.replaceRouteErr
 	}
 	f.routes = appendWithoutRoute(f.routes, route)
-	f.routes = append(f.routes, route)
+	f.routes = append(f.routes, cloneRoutes([]Route{route})[0])
 	return nil
 }
 
@@ -142,6 +142,7 @@ func sameRoute(a, b Route) bool {
 		a.Table != b.Table ||
 		a.Dst != b.Dst ||
 		a.Gateway != b.Gateway ||
+		a.PreferredSource != b.PreferredSource ||
 		a.LinkIndex != b.LinkIndex ||
 		a.Priority != b.Priority ||
 		a.Scope != b.Scope ||

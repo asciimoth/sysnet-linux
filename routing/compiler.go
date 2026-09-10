@@ -18,17 +18,41 @@ func CompileDesiredState(
 	if err := config.validate(); err != nil {
 		return DesiredState{}, err
 	}
+	config = cloneConfig(config)
 
 	state := DesiredState{Config: config}
 	for _, family := range familyConstants(config.Families) {
 		state.Rules = append(state.Rules, compileRules(config, family)...)
-		state.VPNRoutes = append(state.VPNRoutes, Route{
+		defaultRoute := Route{
 			Family:    family,
 			Table:     config.VPNTable,
 			Dst:       familyDefaultPrefix(family),
 			LinkIndex: config.TUNIndex,
 			Type:      RouteTypeUnicast,
-		})
+		}
+		var specific []SourceRoute
+		for _, sourceRoute := range config.SourceRoutes {
+			if sourceRouteFamily(sourceRoute) != family {
+				continue
+			}
+			if sourceRoute.Destination == defaultRoute.Dst {
+				defaultRoute.PreferredSource = sourceRoute.Source
+				continue
+			}
+			specific = append(specific, sourceRoute)
+		}
+		sortSourceRoutes(specific)
+		state.VPNRoutes = append(state.VPNRoutes, defaultRoute)
+		for _, sourceRoute := range specific {
+			state.VPNRoutes = append(state.VPNRoutes, Route{
+				Family:          family,
+				Table:           config.VPNTable,
+				Dst:             sourceRoute.Destination,
+				PreferredSource: sourceRoute.Source,
+				LinkIndex:       config.TUNIndex,
+				Type:            RouteTypeUnicast,
+			})
+		}
 	}
 
 	for _, route := range snapshot.MainRoutes {
@@ -45,6 +69,28 @@ func CompileDesiredState(
 	}
 	sortSafeRoutesForInstall(state.SafeRoutes)
 	return state, nil
+}
+
+func sourceRouteFamily(route SourceRoute) int {
+	if route.Destination.Addr().Is4() {
+		return unix.AF_INET
+	}
+	return unix.AF_INET6
+}
+
+func sortSourceRoutes(routes []SourceRoute) {
+	slices.SortFunc(routes, func(a, b SourceRoute) int {
+		if n := a.Destination.Addr().Compare(b.Destination.Addr()); n != 0 {
+			return n
+		}
+		if n := cmp.Compare(
+			a.Destination.Bits(),
+			b.Destination.Bits(),
+		); n != 0 {
+			return n
+		}
+		return a.Source.Compare(b.Source)
+	})
 }
 
 func safeTableRoute(route Route, table int) Route {

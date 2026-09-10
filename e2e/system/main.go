@@ -38,6 +38,7 @@ import (
 	"github.com/asciimoth/sysnet-linux/dns"
 	"github.com/asciimoth/sysnet-linux/routing"
 	linuxtun "github.com/asciimoth/sysnet-linux/tun"
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
@@ -154,6 +155,9 @@ func run() error {
 		return err
 	}
 	if err := checkDefaultTunMainRouteBypass(system); err != nil {
+		return err
+	}
+	if err := checkDefaultTunSourceRoutes(system); err != nil {
 		return err
 	}
 	if err := checkDefaultTunRPFilter(system); err != nil {
@@ -802,9 +806,10 @@ func checkMatcherOnlySystem() error {
 
 func checkFeaturesAndRules(system *linux.System) error {
 	features := system.Features()
-	if !features.Tun || !features.DefaultTun || !features.StrictMode {
+	if !features.Tun || !features.DefaultTun || !features.StrictMode ||
+		!features.DefaultTunSourceRoutes {
 		return fmt.Errorf(
-			"features = %+v, want TUN, DefaultTun, StrictMode",
+			"features = %+v, want TUN, DefaultTun, StrictMode, source routes",
 			features,
 		)
 	}
@@ -1439,6 +1444,335 @@ func checkDefaultTunMainRouteBypass(system *linux.System) error {
 		"dev "+physLinkName,
 	); err != nil {
 		return err
+	}
+	return nil
+}
+
+func checkDefaultTunSourceRoutes(system *linux.System) error {
+	const (
+		v4DefaultSource  = "10.68.0.2"
+		v4SpecificSource = "100.64.0.2"
+		v6DefaultSource  = "fd66::2"
+		v6SpecificSource = "fd64::2"
+	)
+	addrs := []string{
+		v4DefaultSource + "/32",
+		v4SpecificSource + "/32",
+		v6DefaultSource + "/128",
+		v6SpecificSource + "/128",
+	}
+	policy := []sysnet.TunSourceRoute{
+		{
+			Destination: netip.MustParsePrefix("0.0.0.0/0"),
+			Source:      netip.MustParseAddr(v4DefaultSource),
+		},
+		{
+			Destination: netip.MustParsePrefix("100.64.0.0/10"),
+			Source:      netip.MustParseAddr(v4SpecificSource),
+		},
+		{
+			Destination: netip.MustParsePrefix("::/0"),
+			Source:      netip.MustParseAddr(v6DefaultSource),
+		},
+		{
+			Destination: netip.MustParsePrefix("fd64::/16"),
+			Source:      netip.MustParseAddr(v6SpecificSource),
+		},
+	}
+
+	dt, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs:     addrs,
+		SourceRoutes: policy,
+		DnsIP:        v4DefaultSource,
+		MTU:          1400,
+	})
+	if err != nil {
+		return fmt.Errorf("build source-route DefaultTun: %w", err)
+	}
+	defer func() { _ = dt.Close() }()
+	tunName, err := dt.Name()
+	if err != nil {
+		return fmt.Errorf("source-route DefaultTun name: %w", err)
+	}
+	if err := expectNoMainRoutesThroughTun(tunName); err != nil {
+		return err
+	}
+	if err := expectSourceRoute(
+		"IPv4 default preferred source",
+		"-4",
+		"8.8.8.8",
+		tunName,
+		v4DefaultSource,
+	); err != nil {
+		return err
+	}
+	if err := expectSourceRoute(
+		"IPv4 specific preferred source",
+		"-4",
+		"100.100.0.1",
+		tunName,
+		v4SpecificSource,
+	); err != nil {
+		return err
+	}
+	if err := expectSourceRoute(
+		"IPv6 default preferred source",
+		"-6",
+		"2606:4700:4700::1111",
+		tunName,
+		v6DefaultSource,
+	); err != nil {
+		return err
+	}
+	if err := expectSourceRoute(
+		"IPv6 specific preferred source",
+		"-6",
+		"fd64:1234::1",
+		tunName,
+		v6SpecificSource,
+	); err != nil {
+		return err
+	}
+	if err := expectRouteFamily(
+		"IPv4 source-route marked transport bypass",
+		"-4",
+		"100.100.0.1",
+		routing.DefaultAppBypassMark,
+		"dev "+physLinkName,
+	); err != nil {
+		return err
+	}
+	if err := expectRouteFamily(
+		"IPv6 source-route marked transport bypass",
+		"-6",
+		"fd64:1234::1",
+		routing.DefaultAppBypassMark,
+		"dev "+physLinkName,
+	); err != nil {
+		return err
+	}
+
+	reversedAddrs := append([]string(nil), addrs...)
+	for left, right := 0, len(reversedAddrs)-1; left < right; left, right = left+1, right-1 {
+		reversedAddrs[left], reversedAddrs[right] = reversedAddrs[right], reversedAddrs[left]
+	}
+	rebuilt, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs:     reversedAddrs,
+		SourceRoutes: policy,
+		DnsIP:        v4DefaultSource,
+		MTU:          1400,
+	})
+	if err != nil {
+		return fmt.Errorf("rebuild reversed source-route DefaultTun: %w", err)
+	}
+	defer func() { _ = rebuilt.Close() }()
+	if err := expectSourceRoute(
+		"reversed IPv4 default preferred source",
+		"-4",
+		"8.8.8.8",
+		tunName,
+		v4DefaultSource,
+	); err != nil {
+		return err
+	}
+	if err := expectSourceRoute(
+		"reversed IPv4 specific preferred source",
+		"-4",
+		"100.100.0.1",
+		tunName,
+		v4SpecificSource,
+	); err != nil {
+		return err
+	}
+	if err := expectSourceRoute(
+		"reversed IPv6 default preferred source",
+		"-6",
+		"2606:4700:4700::1111",
+		tunName,
+		v6DefaultSource,
+	); err != nil {
+		return err
+	}
+	if err := expectSourceRoute(
+		"reversed IPv6 specific preferred source",
+		"-6",
+		"fd64:1234::1",
+		tunName,
+		v6SpecificSource,
+	); err != nil {
+		return err
+	}
+
+	changedPolicy := []sysnet.TunSourceRoute{
+		{
+			Destination: netip.MustParsePrefix("0.0.0.0/0"),
+			Source:      netip.MustParseAddr(v4SpecificSource),
+		},
+		{
+			Destination: netip.MustParsePrefix("100.64.0.0/10"),
+			Source:      netip.MustParseAddr(v4DefaultSource),
+		},
+		{
+			Destination: netip.MustParsePrefix("::/0"),
+			Source:      netip.MustParseAddr(v6SpecificSource),
+		},
+		{
+			Destination: netip.MustParsePrefix("fd64::/16"),
+			Source:      netip.MustParseAddr(v6DefaultSource),
+		},
+	}
+	changed, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs:     addrs,
+		SourceRoutes: changedPolicy,
+		DnsIP:        v4DefaultSource,
+		MTU:          1400,
+	})
+	if err != nil {
+		return fmt.Errorf("change source-route policy: %w", err)
+	}
+	defer func() { _ = changed.Close() }()
+	if err := expectSourceRoute(
+		"changed IPv4 default preferred source",
+		"-4",
+		"8.8.8.8",
+		tunName,
+		v4SpecificSource,
+	); err != nil {
+		return err
+	}
+	if err := expectSourceRoute(
+		"changed IPv4 specific preferred source",
+		"-4",
+		"100.100.0.1",
+		tunName,
+		v4DefaultSource,
+	); err != nil {
+		return err
+	}
+	if err := expectSourceRoute(
+		"changed IPv6 default preferred source",
+		"-6",
+		"2606:4700:4700::1111",
+		tunName,
+		v6SpecificSource,
+	); err != nil {
+		return err
+	}
+	if err := expectSourceRoute(
+		"changed IPv6 specific preferred source",
+		"-6",
+		"fd64:1234::1",
+		tunName,
+		v6DefaultSource,
+	); err != nil {
+		return err
+	}
+
+	withoutSpecific, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs: addrs,
+		SourceRoutes: []sysnet.TunSourceRoute{
+			changedPolicy[0],
+			changedPolicy[2],
+		},
+		DnsIP: v4DefaultSource,
+		MTU:   1400,
+	})
+	if err != nil {
+		return fmt.Errorf("remove specific source routes: %w", err)
+	}
+	if err := expectSourceRoute(
+		"removed IPv4 specific route uses default source",
+		"-4",
+		"100.100.0.1",
+		tunName,
+		v4SpecificSource,
+	); err != nil {
+		return err
+	}
+	if err := expectSourceRoute(
+		"removed IPv6 specific route uses default source",
+		"-6",
+		"fd64:1234::1",
+		tunName,
+		v6SpecificSource,
+	); err != nil {
+		return err
+	}
+	if err := withoutSpecific.Close(); err != nil {
+		return fmt.Errorf("close source-route DefaultTun: %w", err)
+	}
+	return expectDefaultRoutingStateRemoved()
+}
+
+func expectSourceRoute(
+	name, family, dst, tunName, source string,
+) error {
+	output, err := routeGet(family, dst, 0)
+	if err != nil {
+		return fmt.Errorf(
+			"%s: route get failed with output %q: %w",
+			name,
+			output,
+			err,
+		)
+	}
+	for _, want := range []string{"dev " + tunName, "src " + source} {
+		if !strings.Contains(output, want) {
+			return fmt.Errorf(
+				"%s: route %q does not contain %q",
+				name,
+				output,
+				want,
+			)
+		}
+	}
+	return nil
+}
+
+func expectDefaultRoutingStateRemoved() error {
+	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+		for _, table := range []int{
+			routing.DefaultVPNTable,
+			routing.DefaultSafeTable,
+		} {
+			routes, err := netlink.RouteListFiltered(
+				family,
+				&netlink.Route{Table: table},
+				netlink.RT_FILTER_TABLE,
+			)
+			if err != nil {
+				return fmt.Errorf(
+					"list table %d family %d after DefaultTun close: %w",
+					table,
+					family,
+					err,
+				)
+			}
+			if len(routes) != 0 {
+				return fmt.Errorf(
+					"DefaultTun close left %d route(s) in table %d family %d",
+					len(routes),
+					table,
+					family,
+				)
+			}
+		}
+	}
+	for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
+		rules, err := netlink.RuleList(family)
+		if err != nil {
+			return fmt.Errorf("list rules after DefaultTun close: %w", err)
+		}
+		for _, rule := range rules {
+			if rule.Priority >= routing.DefaultPriorityBase &&
+				rule.Priority < routing.DefaultPriorityBase+routing.DefaultPrioritySpan {
+				return fmt.Errorf(
+					"DefaultTun close left owned rule priority %d family %d",
+					rule.Priority,
+					family,
+				)
+			}
+		}
 	}
 	return nil
 }

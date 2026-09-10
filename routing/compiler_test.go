@@ -146,6 +146,198 @@ func TestCompileDesiredStateRoutes(t *testing.T) {
 	}
 }
 
+func TestCompileDesiredStateSourceRoutes(t *testing.T) {
+	cfg := compilerTestConfig()
+	cfg.Families = BothFamilies
+	cfg.SourceRoutes = []SourceRoute{
+		{
+			Destination: netip.MustParsePrefix("100.64.0.0/10"),
+			Source:      netip.MustParseAddr("100.64.0.2"),
+		},
+		{
+			Destination: netip.MustParsePrefix("fd00:64::/48"),
+			Source:      netip.MustParseAddr("fd00::2"),
+		},
+		{
+			Destination: netip.MustParsePrefix("0.0.0.0/0"),
+			Source:      netip.MustParseAddr("10.20.0.2"),
+		},
+		{
+			Destination: netip.MustParsePrefix("::/0"),
+			Source:      netip.MustParseAddr("2001:db8::2"),
+		},
+	}
+
+	got, err := CompileDesiredState(cfg, Snapshot{})
+	if err != nil {
+		t.Fatalf("CompileDesiredState() error = %v", err)
+	}
+	want := []Route{
+		{
+			Family:          unix.AF_INET,
+			Table:           cfg.VPNTable,
+			Dst:             netip.MustParsePrefix("0.0.0.0/0"),
+			PreferredSource: netip.MustParseAddr("10.20.0.2"),
+			LinkIndex:       cfg.TUNIndex,
+			Type:            RouteTypeUnicast,
+		},
+		{
+			Family:          unix.AF_INET,
+			Table:           cfg.VPNTable,
+			Dst:             netip.MustParsePrefix("100.64.0.0/10"),
+			PreferredSource: netip.MustParseAddr("100.64.0.2"),
+			LinkIndex:       cfg.TUNIndex,
+			Type:            RouteTypeUnicast,
+		},
+		{
+			Family:          unix.AF_INET6,
+			Table:           cfg.VPNTable,
+			Dst:             netip.MustParsePrefix("::/0"),
+			PreferredSource: netip.MustParseAddr("2001:db8::2"),
+			LinkIndex:       cfg.TUNIndex,
+			Type:            RouteTypeUnicast,
+		},
+		{
+			Family:          unix.AF_INET6,
+			Table:           cfg.VPNTable,
+			Dst:             netip.MustParsePrefix("fd00:64::/48"),
+			PreferredSource: netip.MustParseAddr("fd00::2"),
+			LinkIndex:       cfg.TUNIndex,
+			Type:            RouteTypeUnicast,
+		},
+	}
+	if !reflect.DeepEqual(got.VPNRoutes, want) {
+		t.Fatalf("VPNRoutes = %#v, want %#v", got.VPNRoutes, want)
+	}
+}
+
+func TestCompileDesiredStateCopiesSourceRouteConfig(t *testing.T) {
+	cfg := compilerTestConfig()
+	wantSource := netip.MustParseAddr("10.20.0.2")
+	cfg.SourceRoutes = []SourceRoute{{
+		Destination: netip.MustParsePrefix("0.0.0.0/0"),
+		Source:      wantSource,
+	}}
+
+	got, err := CompileDesiredState(cfg, Snapshot{})
+	if err != nil {
+		t.Fatalf("CompileDesiredState() error = %v", err)
+	}
+	cfg.SourceRoutes[0].Source = netip.MustParseAddr("10.20.0.3")
+	if got.Config.SourceRoutes[0].Source != wantSource {
+		t.Fatalf(
+			"desired config source = %v, want %v",
+			got.Config.SourceRoutes[0].Source,
+			wantSource,
+		)
+	}
+}
+
+func TestCompileDesiredStateNestedSourceRoutesAreDeterministic(t *testing.T) {
+	cfg := compilerTestConfig()
+	cfg.Families = BothFamilies
+	cfg.SourceRoutes = []SourceRoute{
+		{
+			Destination: netip.MustParsePrefix("10.20.30.0/24"),
+			Source:      netip.MustParseAddr("192.0.2.24"),
+		},
+		{
+			Destination: netip.MustParsePrefix("2001:db8:10:20::/64"),
+			Source:      netip.MustParseAddr("2001:db8::64"),
+		},
+		{
+			Destination: netip.MustParsePrefix("10.20.30.40/32"),
+			Source:      netip.MustParseAddr("192.0.2.32"),
+		},
+		{
+			Destination: netip.MustParsePrefix("2001:db8:10:20::40/128"),
+			Source:      netip.MustParseAddr("2001:db8::128"),
+		},
+		{
+			Destination: netip.MustParsePrefix("0.0.0.0/0"),
+			Source:      netip.MustParseAddr("192.0.2.1"),
+		},
+		{
+			Destination: netip.MustParsePrefix("10.0.0.0/8"),
+			Source:      netip.MustParseAddr("192.0.2.8"),
+		},
+		{
+			Destination: netip.MustParsePrefix("2001:db8::/32"),
+			Source:      netip.MustParseAddr("2001:db8::32"),
+		},
+		{
+			Destination: netip.MustParsePrefix("10.20.0.0/16"),
+			Source:      netip.MustParseAddr("192.0.2.16"),
+		},
+		{
+			Destination: netip.MustParsePrefix("::/0"),
+			Source:      netip.MustParseAddr("2001:db8::1"),
+		},
+		{
+			Destination: netip.MustParsePrefix("2001:db8:10::/48"),
+			Source:      netip.MustParseAddr("2001:db8::48"),
+		},
+	}
+
+	first, err := CompileDesiredState(cfg, Snapshot{})
+	if err != nil {
+		t.Fatalf("CompileDesiredState() error = %v", err)
+	}
+	for left, right := 0, len(cfg.SourceRoutes)-1; left < right; left, right = left+1, right-1 {
+		cfg.SourceRoutes[left], cfg.SourceRoutes[right] =
+			cfg.SourceRoutes[right], cfg.SourceRoutes[left]
+	}
+	second, err := CompileDesiredState(cfg, Snapshot{})
+	if err != nil {
+		t.Fatalf("CompileDesiredState(reversed) error = %v", err)
+	}
+	if !reflect.DeepEqual(first.VPNRoutes, second.VPNRoutes) {
+		t.Fatalf(
+			"route order depends on source policy order:\nfirst = %#v\nsecond = %#v",
+			first.VPNRoutes,
+			second.VPNRoutes,
+		)
+	}
+
+	wantDestinations := []netip.Prefix{
+		netip.MustParsePrefix("0.0.0.0/0"),
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("10.20.0.0/16"),
+		netip.MustParsePrefix("10.20.30.0/24"),
+		netip.MustParsePrefix("10.20.30.40/32"),
+		netip.MustParsePrefix("::/0"),
+		netip.MustParsePrefix("2001:db8::/32"),
+		netip.MustParsePrefix("2001:db8:10::/48"),
+		netip.MustParsePrefix("2001:db8:10:20::/64"),
+		netip.MustParsePrefix("2001:db8:10:20::40/128"),
+	}
+	if len(first.VPNRoutes) != len(wantDestinations) {
+		t.Fatalf(
+			"VPNRoutes len = %d, want %d",
+			len(first.VPNRoutes),
+			len(wantDestinations),
+		)
+	}
+	for i, want := range wantDestinations {
+		if first.VPNRoutes[i].Dst != want {
+			t.Fatalf(
+				"VPNRoutes[%d].Dst = %s, want %s",
+				i,
+				first.VPNRoutes[i].Dst,
+				want,
+			)
+		}
+		if first.VPNRoutes[i].LinkIndex != cfg.TUNIndex {
+			t.Fatalf(
+				"VPNRoutes[%d].LinkIndex = %d, want %d",
+				i,
+				first.VPNRoutes[i].LinkIndex,
+				cfg.TUNIndex,
+			)
+		}
+	}
+}
+
 func TestCompileDesiredStateClearsCopiedSafeRouteStateFlags(t *testing.T) {
 	cfg := compilerTestConfig()
 	cfg.Strictness = NonStrict

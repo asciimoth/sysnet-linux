@@ -40,16 +40,23 @@ type Nexthop struct {
 
 // Route is the package's normalized route model.
 type Route struct {
-	Family    int
-	Table     int
-	Dst       netip.Prefix
-	Gateway   netip.Addr
-	LinkIndex int
-	Priority  int
-	Scope     int
-	Flags     int
-	Type      RouteType
-	Multipath []Nexthop
+	Family          int
+	Table           int
+	Dst             netip.Prefix
+	Gateway         netip.Addr
+	PreferredSource netip.Addr
+	LinkIndex       int
+	Priority        int
+	Scope           int
+	Flags           int
+	Type            RouteType
+	Multipath       []Nexthop
+}
+
+// SourceRoute selects a preferred TUN source address for a destination.
+type SourceRoute struct {
+	Destination netip.Prefix
+	Source      netip.Addr
 }
 
 // Snapshot contains the direct host routing view copied from main.

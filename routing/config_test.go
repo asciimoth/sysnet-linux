@@ -3,6 +3,7 @@ package routing
 
 import (
 	"errors"
+	"net/netip"
 	"testing"
 )
 
@@ -61,6 +62,56 @@ func TestValidateConfigRejectsInvalidValues(t *testing.T) {
 				cfg.Families = FamilySet{}
 			},
 		},
+		{
+			name: "invalid preferred source",
+			update: func(cfg *Config) {
+				cfg.SourceRoutes = []SourceRoute{{
+					Destination: netip.MustParsePrefix("0.0.0.0/0"),
+				}}
+			},
+		},
+		{
+			name: "unmasked source destination",
+			update: func(cfg *Config) {
+				cfg.SourceRoutes = []SourceRoute{{
+					Destination: netip.MustParsePrefix("192.0.2.1/24"),
+					Source:      netip.MustParseAddr("10.20.0.2"),
+				}}
+			},
+		},
+		{
+			name: "mixed source route families",
+			update: func(cfg *Config) {
+				cfg.SourceRoutes = []SourceRoute{{
+					Destination: netip.MustParsePrefix("0.0.0.0/0"),
+					Source:      netip.MustParseAddr("2001:db8::2"),
+				}}
+			},
+		},
+		{
+			name: "IPv4-mapped source",
+			update: func(cfg *Config) {
+				cfg.Families = BothFamilies
+				cfg.SourceRoutes = []SourceRoute{{
+					Destination: netip.MustParsePrefix("::/0"),
+					Source: netip.MustParseAddr(
+						"::ffff:192.0.2.2",
+					),
+				}}
+			},
+		},
+		{
+			name: "IPv4-mapped destination",
+			update: func(cfg *Config) {
+				cfg.Families = BothFamilies
+				cfg.SourceRoutes = []SourceRoute{{
+					Destination: netip.MustParsePrefix(
+						"::ffff:192.0.2.0/120",
+					),
+					Source: netip.MustParseAddr("2001:db8::2"),
+				}}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -86,6 +137,117 @@ func TestValidateConfigAcceptsSeparateMaskedMarks(t *testing.T) {
 	cfg.UserMarkMask = 0xf00
 
 	if err := ValidateConfig(cfg); err != nil {
+		t.Fatalf("ValidateConfig() error = %v", err)
+	}
+}
+
+func TestValidateConfigRejectsNonNormalizedSourceRoutePolicy(t *testing.T) {
+	v4Default := netip.MustParsePrefix("0.0.0.0/0")
+	v4Source := netip.MustParseAddr("10.20.0.2")
+	tests := []struct {
+		name   string
+		routes []SourceRoute
+	}{
+		{
+			name: "invalid destination",
+			routes: []SourceRoute{{
+				Source: v4Source,
+			}},
+		},
+		{
+			name: "unspecified source",
+			routes: []SourceRoute{{
+				Destination: v4Default,
+				Source:      netip.IPv4Unspecified(),
+			}},
+		},
+		{
+			name: "multicast source",
+			routes: []SourceRoute{{
+				Destination: v4Default,
+				Source:      netip.MustParseAddr("224.0.0.1"),
+			}},
+		},
+		{
+			name: "broadcast source",
+			routes: []SourceRoute{{
+				Destination: v4Default,
+				Source:      netip.MustParseAddr("255.255.255.255"),
+			}},
+		},
+		{
+			name: "loopback source",
+			routes: []SourceRoute{{
+				Destination: v4Default,
+				Source:      netip.MustParseAddr("127.0.0.2"),
+			}},
+		},
+		{
+			name: "zoned source",
+			routes: []SourceRoute{{
+				Destination: netip.MustParsePrefix("::/0"),
+				Source:      netip.MustParseAddr("fe80::2%tun0"),
+			}},
+		},
+		{
+			name: "disabled family",
+			routes: []SourceRoute{{
+				Destination: netip.MustParsePrefix("2001:db8::/32"),
+				Source:      netip.MustParseAddr("2001:db8::2"),
+			}},
+		},
+		{
+			name: "exact duplicate",
+			routes: []SourceRoute{
+				{Destination: v4Default, Source: v4Source},
+				{Destination: v4Default, Source: v4Source},
+			},
+		},
+		{
+			name: "conflicting duplicate",
+			routes: []SourceRoute{
+				{Destination: v4Default, Source: v4Source},
+				{
+					Destination: v4Default,
+					Source:      netip.MustParseAddr("100.64.0.2"),
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := configForTest()
+			config.SourceRoutes = test.routes
+			if err := ValidateConfig(
+				config,
+			); !errors.Is(
+				err,
+				ErrInvalidConfig,
+			) {
+				t.Fatalf(
+					"ValidateConfig() error = %v, want ErrInvalidConfig",
+					err,
+				)
+			}
+		})
+	}
+}
+
+func TestValidateConfigAcceptsLinkLocalPreferredSources(t *testing.T) {
+	config := configForTest()
+	config.Families = BothFamilies
+	config.SourceRoutes = []SourceRoute{
+		{
+			Destination: netip.MustParsePrefix("198.51.100.0/24"),
+			Source:      netip.MustParseAddr("169.254.10.2"),
+		},
+		{
+			Destination: netip.MustParsePrefix("2001:db8::/32"),
+			Source:      netip.MustParseAddr("fe80::2"),
+		},
+	}
+	if err := ValidateConfig(config); err != nil {
 		t.Fatalf("ValidateConfig() error = %v", err)
 	}
 }
