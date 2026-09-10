@@ -638,6 +638,130 @@ func TestBuildDefaultTunUsesConfiguredBaseName(t *testing.T) {
 	}
 }
 
+func TestBuildDefaultTunKeepsExplicitRoutesOutOfMain(t *testing.T) {
+	tests := []struct {
+		name         string
+		addrs        []string
+		routes       []string
+		wantFamilies routing.FamilySet
+	}{
+		{
+			name:         "IPv4 default route",
+			addrs:        []string{"10.55.0.1/32"},
+			routes:       []string{"0.0.0.0/0"},
+			wantFamilies: routing.FamilySet{IPv4: true},
+		},
+		{
+			name:         "IPv6 default route",
+			addrs:        []string{"fd55::1/128"},
+			routes:       []string{"::/0"},
+			wantFamilies: routing.BothFamilies,
+		},
+		{
+			name:  "dual stack default routes",
+			addrs: []string{"10.55.0.1/32"},
+			routes: []string{
+				"0.0.0.0/0",
+				"::/0",
+			},
+			wantFamilies: routing.BothFamilies,
+		},
+		{
+			name:  "more-specific routes",
+			addrs: []string{"10.55.0.1/32"},
+			routes: []string{
+				"198.51.100.7/24",
+				"2001:db8:55::7/64",
+			},
+			wantFamilies: routing.BothFamilies,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			factory := &fakeTUNFactory{}
+			tunConfig := &fakeTunConfig{}
+			routingManager := &fakeRouting{}
+			s, err := NewSystem(Config{
+				Features: FeatureConfig{
+					Tun:        true,
+					DefaultTun: true,
+					DNSControl: true,
+					Routing:    true,
+				},
+				DNSProvider:    newFakeDNSProvider(),
+				RoutingManager: routingManager,
+				TUNFactory:     factory,
+				TunConfig:      tunConfig,
+				PacketListen:   (&fakePacketListen{}).listen,
+				TUNIndex: func(gtun.Tun) (int, error) {
+					return 99, nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+
+			dnsIP := test.addrs[0]
+			if prefix, err := netip.ParsePrefix(dnsIP); err == nil {
+				dnsIP = prefix.Addr().String()
+			}
+			dt, err := s.BuildDefaultTun(sysnet.DefaultTunOpts{
+				TunAddrs:  test.addrs,
+				TunRoutes: test.routes,
+				DnsIP:     dnsIP,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := tunConfig.routes[factory.created[0]]; len(got) != 0 {
+				t.Fatalf(
+					"main-table TUN routes = %v, want none",
+					got,
+				)
+			}
+			if routingManager.applied == nil ||
+				routingManager.applied.Families != test.wantFamilies {
+				t.Fatalf(
+					"routing families = %+v, want %+v",
+					routingManager.applied,
+					test.wantFamilies,
+				)
+			}
+			if err := dt.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestBuildTunStillInstallsExplicitRoutesInMain(t *testing.T) {
+	factory := &fakeTUNFactory{}
+	tunConfig := &fakeTunConfig{}
+	s, err := NewSystem(Config{
+		Features:   FeatureConfig{Tun: true},
+		TUNFactory: factory,
+		TunConfig:  tunConfig,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	routes := []string{"0.0.0.0/0", "2001:db8:55::/64"}
+	tun, err := s.BuildTun(sysnet.TunOpts{TunRoutes: routes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tunConfig.routes[factory.created[0]]; !slices.Equal(got, routes) {
+		t.Fatalf("regular TUN routes = %v, want %v", got, routes)
+	}
+	if err := tun.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBuildDefaultTunAppliesSideEffectsAndCloseRollsBack(t *testing.T) {
 	dnsProvider := newFakeDNSProvider()
 	routingManager := &fakeRouting{}

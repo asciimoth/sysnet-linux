@@ -194,7 +194,12 @@ func (s *System) BuildDefaultTun(
 	if err := s.tunConfig.SetTunAddrs(state.tun, addrs); err != nil {
 		return fail(err)
 	}
-	if err := s.tunConfig.SetTunRoutes(state.tun, routes); err != nil {
+	// The routing manager owns DefaultTun routes in its dedicated VPN table.
+	// Keep the main table free of routes through this TUN. The application
+	// bypass rule looks up main, so any matching route through the TUN can send
+	// a VPN transport back into its own tunnel. An empty replacement also
+	// removes connected main-table routes that SetTunAddrs can create.
+	if err := s.tunConfig.SetTunRoutes(state.tun, nil); err != nil {
 		return fail(err)
 	}
 	if tunRecreated && server != nil && oldDNSIP == dnsIP {

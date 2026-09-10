@@ -153,6 +153,9 @@ func run() error {
 	if err := checkDefaultTunLifecycle(system, pmarkCtl); err != nil {
 		return err
 	}
+	if err := checkDefaultTunMainRouteBypass(system); err != nil {
+		return err
+	}
 	if err := checkDefaultTunRPFilter(system); err != nil {
 		return err
 	}
@@ -1326,6 +1329,148 @@ func checkDefaultTunLifecycle(
 		"dev "+physLinkName,
 	); err != nil {
 		return err
+	}
+	return nil
+}
+
+func checkDefaultTunMainRouteBypass(system *linux.System) error {
+	targets, stopPeer, err := startRPFilterPeer()
+	if err != nil {
+		return fmt.Errorf("start main-route bypass peer: %w", err)
+	}
+	defer stopPeer()
+
+	dt, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs: []string{dnsIP + "/24", "fd66::1/64"},
+		TunRoutes: []string{
+			"0.0.0.0/0",
+			rpfHTTPIP + "/32",
+			"::/0",
+			"2001:4860:4860::8888/128",
+		},
+		DnsIP: dnsIP,
+		MTU:   1400,
+	})
+	if err != nil {
+		return fmt.Errorf("build explicit-route DefaultTun: %w", err)
+	}
+	defer func() { _ = dt.Close() }()
+
+	tunName, err := dt.Name()
+	if err != nil {
+		return fmt.Errorf("explicit-route DefaultTun name: %w", err)
+	}
+	if err := expectNoMainRoutesThroughTun(tunName); err != nil {
+		return err
+	}
+	if err := expectRouteFamily(
+		"explicit-route IPv4 unmarked route",
+		"-4",
+		rpfHTTPIP,
+		0,
+		"dev "+tunName,
+	); err != nil {
+		return err
+	}
+	if err := expectRouteFamily(
+		"explicit-route IPv4 app-bypass route",
+		"-4",
+		rpfHTTPIP,
+		routing.DefaultAppBypassMark,
+		"dev "+rpfLinkName,
+	); err != nil {
+		return err
+	}
+	if err := expectRouteFamily(
+		"explicit-route IPv6 unmarked route",
+		"-6",
+		"2606:4700:4700::1111",
+		0,
+		"dev "+tunName,
+	); err != nil {
+		return err
+	}
+	for _, dst := range []string{
+		"2001:4860:4860::8888",
+		"2606:4700:4700::1111",
+	} {
+		if err := expectRouteFamily(
+			"explicit-route IPv6 app-bypass route",
+			"-6",
+			dst,
+			routing.DefaultAppBypassMark,
+			"dev "+physLinkName,
+		); err != nil {
+			return err
+		}
+	}
+	if err := markedHTTPGet(
+		system,
+		targets.HTTP,
+		"explicit-route OutNet HTTP",
+	); err != nil {
+		return err
+	}
+	if err := markedUDPEcho(
+		system,
+		targets.UDP,
+		"explicit-route OutNet UDP",
+	); err != nil {
+		return err
+	}
+
+	if err := dt.Close(); err != nil {
+		return fmt.Errorf("close explicit-route DefaultTun: %w", err)
+	}
+	if err := expectRouteFamily(
+		"closed explicit-route IPv4 physical default",
+		"-4",
+		"203.0.113.10",
+		0,
+		"dev "+physLinkName,
+	); err != nil {
+		return err
+	}
+	if err := expectRouteFamily(
+		"closed explicit-route IPv6 physical default",
+		"-6",
+		"2606:4700:4700::1111",
+		0,
+		"dev "+physLinkName,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+func expectNoMainRoutesThroughTun(tunName string) error {
+	for _, family := range []string{"-4", "-6"} {
+		output, err := commandOutput(
+			"ip",
+			family,
+			"route",
+			"show",
+			"table",
+			"main",
+			"dev",
+			tunName,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"list %s main routes through %s: %w",
+				family,
+				tunName,
+				err,
+			)
+		}
+		if output != "" {
+			return fmt.Errorf(
+				"%s main routes through %s = %q, want none",
+				family,
+				tunName,
+				output,
+			)
+		}
 	}
 	return nil
 }
@@ -3818,6 +3963,8 @@ func setupLinksAndMainRoutes() error {
 	cleanupLinks()
 	for ip("route", "del", "default") == nil {
 	}
+	for ip("-6", "route", "del", "default") == nil {
+	}
 	if err := ip(
 		"link",
 		"add",
@@ -3842,7 +3989,30 @@ func setupLinksAndMainRoutes() error {
 		{"addr", "add", "198.51.100.2/24", "dev", physLinkName},
 		{"addr", "add", "198.51.100.1/24", "dev", peerLinkName},
 		{"addr", "add", "172.28.0.1/16", "dev", safeLinkName},
+		{"-6", "addr", "add", "2001:db8:100::2/64", "dev", physLinkName},
 		{"route", "add", "default", "via", "198.51.100.1", "dev", physLinkName},
+		{
+			"-6",
+			"route",
+			"add",
+			"default",
+			"via",
+			"2001:db8:100::1",
+			"dev",
+			physLinkName,
+			"onlink",
+		},
+		{
+			"-6",
+			"route",
+			"add",
+			"2001:4860:4860::/48",
+			"via",
+			"2001:db8:100::1",
+			"dev",
+			physLinkName,
+			"onlink",
+		},
 		{
 			"route",
 			"add",
@@ -4064,7 +4234,15 @@ func uniqueDNSName(label string) string {
 }
 
 func expectRoute(name, dst string, mark uint32, contains string) error {
-	output, err := routeGet("-4", dst, mark)
+	return expectRouteFamily(name, "-4", dst, mark, contains)
+}
+
+func expectRouteFamily(
+	name, family, dst string,
+	mark uint32,
+	contains string,
+) error {
+	output, err := routeGet(family, dst, mark)
 	if err != nil {
 		return fmt.Errorf(
 			"%s: route get failed with output %q: %w",
