@@ -315,8 +315,8 @@ func TestBuildDefaultTunSourceRoutesReplaceAndClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first == second {
-		t.Fatal("rebuild returned the same generation wrapper")
+	if first != second {
+		t.Fatal("rebuild replaced the stable default tun wrapper")
 	}
 	wantSecond := []routing.SourceRoute{{
 		Destination: netip.MustParsePrefix("0.0.0.0/0"),

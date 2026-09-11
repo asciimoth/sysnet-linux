@@ -148,6 +148,9 @@ func run() error {
 	if err := checkRegularTun(system); err != nil {
 		return err
 	}
+	if err := checkDefaultTunDynamicUpdates(system); err != nil {
+		return err
+	}
 	if err := checkDefaultTunFallbackDNS(system); err != nil {
 		return err
 	}
@@ -325,6 +328,9 @@ func runResolved() error {
 	}
 	restoreDNS()
 	if err := checkRegularTun(system); err != nil {
+		return err
+	}
+	if err := checkDefaultTunDynamicUpdates(system); err != nil {
 		return err
 	}
 	if err := checkResolvedDefaultTunLifecycle(system, pmarkCtl); err != nil {
@@ -1062,6 +1068,243 @@ func checkRegularTun(system *linux.System) error {
 	return nil
 }
 
+func checkDefaultTunDynamicUpdates(system *linux.System) error {
+	dt, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs:  []string{dnsIP + "/32"},
+		TunRoutes: []string{"0.0.0.0/0"},
+		DnsIP:     dnsIP,
+		MTU:       1280,
+	})
+	if err != nil {
+		return fmt.Errorf("build dynamic DefaultTun: %w", err)
+	}
+	defer func() { _ = dt.Close() }()
+	source, err := defaultTunSource(dt)
+	if err != nil {
+		return err
+	}
+	sourceGeneration := source.SourceGeneration()
+	tunName, err := dt.Name()
+	if err != nil {
+		return fmt.Errorf("dynamic DefaultTun name: %w", err)
+	}
+
+	for _, mtu := range []int{1280, 1420, 1428, 1500, 9000} {
+		if err := system.SetTunMTU(dt, mtu); err != nil {
+			return fmt.Errorf("set dynamic DefaultTun MTU %d: %w", mtu, err)
+		}
+		gotMTU, err := dt.MTU()
+		if err != nil {
+			return fmt.Errorf("get dynamic DefaultTun MTU %d: %w", mtu, err)
+		}
+		if gotMTU != mtu {
+			return fmt.Errorf(
+				"dynamic DefaultTun MTU = %d, want %d",
+				gotMTU,
+				mtu,
+			)
+		}
+		iface, err := net.InterfaceByName(tunName)
+		if err != nil {
+			return fmt.Errorf("lookup dynamic DefaultTun: %w", err)
+		}
+		if iface.MTU != mtu {
+			return fmt.Errorf("dynamic link MTU = %d, want %d", iface.MTU, mtu)
+		}
+	}
+
+	wantAddrs := []string{
+		dnsIP + "/32",
+		"10.66.0.3/32",
+		"fd66::1/128",
+	}
+	if err := system.SetTunAddrs(dt, []string{
+		"127.0.0.2/8",
+		dnsIP + "/32",
+		dnsIP + "/32",
+		"10.66.0.3/32",
+		"fd66::1/128",
+	}); err != nil {
+		return fmt.Errorf("set dynamic DefaultTun addresses: %w", err)
+	}
+	if err := system.AddTunAddr(dt, "10.66.0.3/32"); err != nil {
+		return fmt.Errorf("add duplicate dynamic DefaultTun address: %w", err)
+	}
+	if err := system.AddTunAddr(dt, "fd66::2/128"); err != nil {
+		return fmt.Errorf("add IPv6 dynamic DefaultTun address: %w", err)
+	}
+	wantAddrs = append(wantAddrs, "fd66::2/128")
+	addrs, err := system.GetTunAddrs(dt)
+	if err != nil {
+		return fmt.Errorf("get dynamic DefaultTun addresses: %w", err)
+	}
+	for _, want := range wantAddrs {
+		if !contains(addrs, want) {
+			return fmt.Errorf(
+				"dynamic DefaultTun addresses = %v, want %s",
+				addrs,
+				want,
+			)
+		}
+	}
+	if contains(addrs, "127.0.0.2/8") ||
+		countString(addrs, "10.66.0.3/32") != 1 {
+		return fmt.Errorf(
+			"dynamic DefaultTun address normalization failed: %v",
+			addrs,
+		)
+	}
+	beforeRejectedUpdate := append([]string(nil), addrs...)
+	if err := system.SetTunAddrs(dt, []string{
+		"10.77.0.1/32",
+		"fd77::1/128",
+	}); !errors.Is(err, sysnet.ErrNotSupported) {
+		return fmt.Errorf(
+			"DNS-removing SetTunAddrs error = %v, want ErrNotSupported",
+			err,
+		)
+	}
+	addrs, err = system.GetTunAddrs(dt)
+	if err != nil {
+		return fmt.Errorf("get addresses after rejected update: %w", err)
+	}
+	if !sameStrings(addrs, beforeRejectedUpdate) {
+		return fmt.Errorf(
+			"rejected address update changed state from %v to %v",
+			beforeRejectedUpdate,
+			addrs,
+		)
+	}
+
+	wantRoutes := []string{"0.0.0.0/0", "::/0"}
+	if err := system.SetTunRoutes(dt, []string{
+		"127.0.0.0/8",
+		"0.0.0.0/0",
+		"::/0",
+		"::/0",
+	}); err != nil {
+		return fmt.Errorf("set dynamic DefaultTun routes: %w", err)
+	}
+	if err := system.AddTunRoute(dt, "198.51.100.7/24"); err != nil {
+		return fmt.Errorf("add dynamic DefaultTun route: %w", err)
+	}
+	wantRoutes = append(wantRoutes, "198.51.100.7/24")
+	routes, err := system.GetTunRotue(dt)
+	if err != nil {
+		return fmt.Errorf("get dynamic DefaultTun route intent: %w", err)
+	}
+	if !sameStrings(routes, wantRoutes) {
+		return fmt.Errorf(
+			"dynamic route intent = %v, want %v",
+			routes,
+			wantRoutes,
+		)
+	}
+	if err := expectNoMainRoutesThroughTun(tunName); err != nil {
+		return err
+	}
+	if err := expectRouteFamily(
+		"dynamic IPv4 VPN-table route",
+		"-4",
+		"9.9.9.9",
+		0,
+		"dev "+tunName,
+	); err != nil {
+		return err
+	}
+	if err := expectRouteFamily(
+		"dynamic IPv6 VPN-table route",
+		"-6",
+		"2606:4700:4700::1111",
+		0,
+		"dev "+tunName,
+	); err != nil {
+		return err
+	}
+
+	rebuilt, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs:  wantAddrs,
+		TunRoutes: wantRoutes,
+		DnsIP:     dnsIP,
+		MTU:       9000,
+	})
+	if err != nil {
+		return fmt.Errorf("rebuild dynamic-equivalent DefaultTun: %w", err)
+	}
+	if rebuilt != dt {
+		return errors.New(
+			"dynamic-equivalent rebuild replaced the public wrapper",
+		)
+	}
+	if got := source.SourceGeneration(); got != sourceGeneration {
+		return fmt.Errorf(
+			"configuration rebuild source generation = %d, want %d",
+			got,
+			sourceGeneration,
+		)
+	}
+	if err := expectNoMainRoutesThroughTun(tunName); err != nil {
+		return err
+	}
+	if err := dt.Close(); err != nil {
+		return fmt.Errorf("close dynamic DefaultTun: %w", err)
+	}
+	if err := system.SetTunMTU(dt, 1500); !errors.Is(
+		err,
+		sysnet.ErrUnknownTun,
+	) {
+		return fmt.Errorf(
+			"closed DefaultTun update = %v, want ErrUnknownTun",
+			err,
+		)
+	}
+	if _, err := dt.Read(nil, nil, 0); !errors.Is(err, os.ErrClosed) {
+		return fmt.Errorf("closed DefaultTun read = %v, want os.ErrClosed", err)
+	}
+
+	newLifetime, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs: []string{dnsIP + "/32"},
+		DnsIP:    dnsIP,
+		MTU:      1420,
+	})
+	if err != nil {
+		return fmt.Errorf("build new DefaultTun lifetime: %w", err)
+	}
+	defer func() { _ = newLifetime.Close() }()
+	if newLifetime == dt {
+		return errors.New("new DefaultTun lifetime reused the closed wrapper")
+	}
+	newSource, err := defaultTunSource(newLifetime)
+	if err != nil {
+		return err
+	}
+	if newSource.SourceGeneration() <= sourceGeneration {
+		return fmt.Errorf(
+			"new lifetime source generation = %d, want greater than %d",
+			newSource.SourceGeneration(),
+			sourceGeneration,
+		)
+	}
+	if err := dt.Close(); err != nil {
+		return fmt.Errorf("close inactive DefaultTun wrapper: %w", err)
+	}
+	if _, err := newLifetime.Name(); err != nil {
+		return fmt.Errorf("inactive wrapper closed new lifetime: %w", err)
+	}
+	if err := newLifetime.Close(); err != nil {
+		return fmt.Errorf("close new DefaultTun lifetime: %w", err)
+	}
+	return nil
+}
+
+func defaultTunSource(dt sysnet.DefaultTun) (linux.DefaultTunSource, error) {
+	source, ok := dt.(linux.DefaultTunSource)
+	if !ok {
+		return nil, errors.New("DefaultTun does not expose a source generation")
+	}
+	return source, nil
+}
+
 func checkDefaultTunFallbackDNS(system *linux.System) error {
 	dt, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{
 		TunAddrs: []string{"127.0.0.1/8"},
@@ -1204,6 +1447,11 @@ func checkDefaultTunLifecycle(
 		return fmt.Errorf("build exclude DefaultTun: %w", err)
 	}
 	defer func() { _ = dt.Close() }()
+	source, err := defaultTunSource(dt)
+	if err != nil {
+		return err
+	}
+	sourceGeneration := source.SourceGeneration()
 
 	tunName, err := dt.Name()
 	if err != nil {
@@ -1273,16 +1521,17 @@ func checkDefaultTunLifecycle(
 			tunName,
 		)
 	}
-	if err := dt.Close(); err != nil {
-		return fmt.Errorf("close stale DefaultTun wrapper: %w", err)
+	if rebuilt != dt {
+		return errors.New(
+			"configuration rebuild replaced the public DefaultTun",
+		)
 	}
-	if err := expectRoute(
-		"stale close leaves include route active",
-		"9.9.9.9",
-		userMark,
-		"dev "+tunName,
-	); err != nil {
-		return err
+	if got := source.SourceGeneration(); got != sourceGeneration {
+		return fmt.Errorf(
+			"configuration rebuild source generation = %d, want %d",
+			got,
+			sourceGeneration,
+		)
 	}
 	if _, err := system.SetTunName(rebuilt, "unused0"); !errors.Is(
 		err,
@@ -1295,14 +1544,7 @@ func checkDefaultTunLifecycle(
 	}
 
 	dt.SetDns(newStaticDNS(answerB))
-	if err := expectDNSRCode(
-		"old DefaultTun wrapper after rebuild",
-		gdns.RCodeServerFailure,
-	); err != nil {
-		return err
-	}
-	rebuilt.SetDns(newStaticDNS(answerB))
-	if err := expectDNSA("rebuilt DefaultTun DNS", answerB); err != nil {
+	if err := expectDNSA("stable rebuilt DefaultTun DNS", answerB); err != nil {
 		return err
 	}
 	if err := expectRoute(
@@ -1939,6 +2181,11 @@ func checkDefaultTunRebuildDNSMutation(system *linux.System) error {
 		return fmt.Errorf("build DNS mutation DefaultTun: %w", err)
 	}
 	defer func() { _ = dt.Close() }()
+	source, err := defaultTunSource(dt)
+	if err != nil {
+		return err
+	}
+	sourceGeneration := source.SourceGeneration()
 
 	tunName, err := dt.Name()
 	if err != nil {
@@ -1977,6 +2224,16 @@ func checkDefaultTunRebuildDNSMutation(system *linux.System) error {
 			tunName,
 		)
 	}
+	if rebuilt != dt {
+		return errors.New("DNS rebuild replaced the public DefaultTun")
+	}
+	if got := source.SourceGeneration(); got != sourceGeneration {
+		return fmt.Errorf(
+			"DNS rebuild source generation = %d, want %d",
+			got,
+			sourceGeneration,
+		)
+	}
 	if err := waitForResolvconf(rebuiltDNSIP); err != nil {
 		return err
 	}
@@ -1996,12 +2253,6 @@ func checkDefaultTunRebuildDNSMutation(system *linux.System) error {
 			dnsIP,
 		)
 	}
-	if err := dt.Close(); err != nil {
-		return fmt.Errorf(
-			"close stale DNS mutation DefaultTun wrapper: %w",
-			err,
-		)
-	}
 	if err := expectDNSRCodeAt(
 		"DNS mutation rebuilt starts detached",
 		rebuiltDNSIP,
@@ -2009,11 +2260,12 @@ func checkDefaultTunRebuildDNSMutation(system *linux.System) error {
 	); err != nil {
 		return err
 	}
-	dt.SetDns(newStaticDNS(netip.MustParseAddr("203.0.113.102")))
-	if err := expectDNSRCodeAt(
-		"DNS mutation old wrapper after rebuild",
+	stableAnswer := netip.MustParseAddr("203.0.113.102")
+	dt.SetDns(newStaticDNS(stableAnswer))
+	if err := expectDNSAAt(
+		"DNS mutation stable wrapper after rebuild",
 		rebuiltDNSIP,
-		gdns.RCodeServerFailure,
+		stableAnswer,
 	); err != nil {
 		return err
 	}
@@ -2053,6 +2305,12 @@ func checkDefaultTunUnderlyingLinkRecreate(system *linux.System) error {
 		return fmt.Errorf("build link recreate DefaultTun: %w", err)
 	}
 	defer func() { _ = dt.Close() }()
+	source, err := defaultTunSource(dt)
+	if err != nil {
+		return err
+	}
+	sourceGeneration := source.SourceGeneration()
+	oldEvents := dt.Events()
 
 	oldName, err := dt.Name()
 	if err != nil {
@@ -2112,6 +2370,22 @@ func checkDefaultTunUnderlyingLinkRecreate(system *linux.System) error {
 			oldIndex,
 		)
 	}
+	if rebuilt != dt {
+		return errors.New("native replacement changed the public DefaultTun")
+	}
+	if got := source.SourceGeneration(); got != sourceGeneration+1 {
+		return fmt.Errorf(
+			"replacement source generation = %d, want %d",
+			got,
+			sourceGeneration+1,
+		)
+	}
+	if err := waitForTunEventsClosed(oldEvents); err != nil {
+		return fmt.Errorf("replacement event source: %w", err)
+	}
+	if dt.Events() == oldEvents {
+		return errors.New("native replacement kept the old event source")
+	}
 	if err := waitForResolvconf(dnsIP); err != nil {
 		return err
 	}
@@ -2140,10 +2414,11 @@ func checkDefaultTunUnderlyingLinkRecreate(system *linux.System) error {
 	); err != nil {
 		return err
 	}
-	dt.SetDns(newStaticDNS(netip.MustParseAddr("203.0.113.132")))
-	if err := expectDNSRCode(
-		"deleted-link stale wrapper after rebuild",
-		gdns.RCodeServerFailure,
+	stableAnswer := netip.MustParseAddr("203.0.113.132")
+	dt.SetDns(newStaticDNS(stableAnswer))
+	if err := expectDNSA(
+		"deleted-link stable wrapper after rebuild",
+		stableAnswer,
 	); err != nil {
 		return err
 	}
@@ -2179,6 +2454,11 @@ func checkResolvedDefaultTunLifecycle(
 		return fmt.Errorf("build resolved exclude DefaultTun: %w", err)
 	}
 	defer func() { _ = dt.Close() }()
+	source, err := defaultTunSource(dt)
+	if err != nil {
+		return err
+	}
+	sourceGeneration := source.SourceGeneration()
 
 	tunName, err := dt.Name()
 	if err != nil {
@@ -2248,6 +2528,18 @@ func checkResolvedDefaultTunLifecycle(
 			tunName,
 		)
 	}
+	if rebuilt != dt {
+		return errors.New(
+			"resolved configuration rebuild replaced the public DefaultTun",
+		)
+	}
+	if got := source.SourceGeneration(); got != sourceGeneration {
+		return fmt.Errorf(
+			"resolved rebuild source generation = %d, want %d",
+			got,
+			sourceGeneration,
+		)
+	}
 	if err := waitForResolvedLinkDNS(rebuiltName, dnsIP); err != nil {
 		return err
 	}
@@ -2255,19 +2547,8 @@ func checkResolvedDefaultTunLifecycle(
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
-	if err := expectDNSRCodeAt(
-		"resolved old DefaultTun wrapper after rebuild",
-		"127.0.0.53",
-		gdns.RCodeServerFailure,
-	); err != nil {
-		return err
-	}
-	rebuilt.SetDns(newStaticDNS(answerB))
-	if err := flushResolvedCaches(); err != nil {
-		return err
-	}
 	if err := expectDNSAAt(
-		"resolved rebuilt DefaultTun DNS",
+		"resolved stable rebuilt DefaultTun DNS",
 		"127.0.0.53",
 		answerB,
 	); err != nil {
@@ -2504,6 +2785,11 @@ func checkResolvedDefaultTunRebuildDNSMutation(system *linux.System) error {
 		return fmt.Errorf("build resolved DNS mutation DefaultTun: %w", err)
 	}
 	defer func() { _ = dt.Close() }()
+	source, err := defaultTunSource(dt)
+	if err != nil {
+		return err
+	}
+	sourceGeneration := source.SourceGeneration()
 
 	tunName, err := dt.Name()
 	if err != nil {
@@ -2549,6 +2835,18 @@ func checkResolvedDefaultTunRebuildDNSMutation(system *linux.System) error {
 			tunName,
 		)
 	}
+	if rebuilt != dt {
+		return errors.New(
+			"resolved DNS rebuild replaced the public DefaultTun",
+		)
+	}
+	if got := source.SourceGeneration(); got != sourceGeneration {
+		return fmt.Errorf(
+			"resolved DNS rebuild source generation = %d, want %d",
+			got,
+			sourceGeneration,
+		)
+	}
 	if err := waitForResolvedLinkDNS(rebuiltName, rebuiltDNSIP); err != nil {
 		return err
 	}
@@ -2568,12 +2866,6 @@ func checkResolvedDefaultTunRebuildDNSMutation(system *linux.System) error {
 			dnsIP,
 		)
 	}
-	if err := dt.Close(); err != nil {
-		return fmt.Errorf(
-			"close stale resolved DNS mutation DefaultTun wrapper: %w",
-			err,
-		)
-	}
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
@@ -2584,14 +2876,15 @@ func checkResolvedDefaultTunRebuildDNSMutation(system *linux.System) error {
 	); err != nil {
 		return err
 	}
-	dt.SetDns(newStaticDNS(netip.MustParseAddr("203.0.113.202")))
+	stableAnswer := netip.MustParseAddr("203.0.113.202")
+	dt.SetDns(newStaticDNS(stableAnswer))
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
-	if err := expectDNSRCodeAt(
-		"resolved DNS mutation old wrapper after rebuild",
+	if err := expectDNSAAt(
+		"resolved DNS mutation stable wrapper after rebuild",
 		"127.0.0.53",
-		gdns.RCodeServerFailure,
+		stableAnswer,
 	); err != nil {
 		return err
 	}
@@ -2640,6 +2933,12 @@ func checkResolvedDefaultTunUnderlyingLinkRecreate(system *linux.System) error {
 		return fmt.Errorf("build resolved link recreate DefaultTun: %w", err)
 	}
 	defer func() { _ = dt.Close() }()
+	source, err := defaultTunSource(dt)
+	if err != nil {
+		return err
+	}
+	sourceGeneration := source.SourceGeneration()
+	oldEvents := dt.Events()
 
 	oldName, err := dt.Name()
 	if err != nil {
@@ -2719,6 +3018,24 @@ func checkResolvedDefaultTunUnderlyingLinkRecreate(system *linux.System) error {
 			oldIndex,
 		)
 	}
+	if rebuilt != dt {
+		return errors.New(
+			"resolved native replacement changed the public DefaultTun",
+		)
+	}
+	if got := source.SourceGeneration(); got != sourceGeneration+1 {
+		return fmt.Errorf(
+			"resolved replacement source generation = %d, want %d",
+			got,
+			sourceGeneration+1,
+		)
+	}
+	if err := waitForTunEventsClosed(oldEvents); err != nil {
+		return fmt.Errorf("resolved replacement event source: %w", err)
+	}
+	if dt.Events() == oldEvents {
+		return errors.New("resolved replacement kept the old event source")
+	}
 	if err := waitForResolvedLinkDNS(newName, dnsIP); err != nil {
 		return err
 	}
@@ -2751,14 +3068,15 @@ func checkResolvedDefaultTunUnderlyingLinkRecreate(system *linux.System) error {
 	); err != nil {
 		return err
 	}
-	dt.SetDns(newStaticDNS(netip.MustParseAddr("203.0.113.232")))
+	stableAnswer := netip.MustParseAddr("203.0.113.232")
+	dt.SetDns(newStaticDNS(stableAnswer))
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
-	if err := expectDNSRCodeAt(
-		"resolved deleted-link stale wrapper after rebuild",
+	if err := expectDNSAAt(
+		"resolved deleted-link stable wrapper after rebuild",
 		"127.0.0.53",
-		gdns.RCodeServerFailure,
+		stableAnswer,
 	); err != nil {
 		return err
 	}
@@ -5188,6 +5506,23 @@ func readOutgoingIPPacket(dt sysnet.DefaultTun) ([]byte, error) {
 	return packet, nil
 }
 
+func waitForTunEventsClosed(events <-chan gtun.Event) error {
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case _, open := <-events:
+			if !open {
+				return nil
+			}
+		case <-timer.C:
+			return errors.New(
+				"timed out waiting for the event channel to close",
+			)
+		}
+	}
+}
+
 func acceptedLocalNetFlow(
 	system *linux.System,
 ) (sockowner.FlowTuple, func(), error) {
@@ -5365,6 +5700,33 @@ func contains(values []string, value string) bool {
 		}
 	}
 	return false
+}
+
+func countString(values []string, value string) int {
+	count := 0
+	for _, candidate := range values {
+		if candidate == value {
+			count++
+		}
+	}
+	return count
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, value := range a {
+		counts[value]++
+	}
+	for _, value := range b {
+		counts[value]--
+		if counts[value] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func tunAddrsContainIP(addrs []string, ip string) bool {

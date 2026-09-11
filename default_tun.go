@@ -27,11 +27,15 @@ import (
 type defaultTunState struct {
 	mu sync.Mutex
 
-	system     *System
-	tun        gtun.Tun
-	server     *gdns.Server
-	dnsIP      netip.Addr
-	generation uint64
+	system           *System
+	public           *defaultTun
+	tun              gtun.Tun
+	server           *gdns.Server
+	dnsIP            netip.Addr
+	generation       uint64
+	sourceGeneration uint64
+	addrs            []string
+	routes           []string
 
 	routingConfig *routing.Config
 	ruleIDs       []uint64
@@ -43,10 +47,24 @@ type defaultTunState struct {
 
 type defaultTun struct {
 	*defaultTunState
-	generation uint64
 }
 
 var _ sysnet.DefaultTun = (*defaultTun)(nil)
+
+// DefaultTunSource is the Linux default-TUN extension that identifies the
+// current native packet source. BuildDefaultTun returns an object that
+// implements this interface.
+//
+// The public object is stable while one default TUN is active. Its source
+// generation changes only when the native TUN is replaced. An I/O call that
+// was already using the old source can return an error that matches
+// os.ErrClosed. A caller can compare SourceGeneration before it retries.
+type DefaultTunSource interface {
+	sysnet.DefaultTun
+	SourceGeneration() uint64
+}
+
+var _ DefaultTunSource = (*defaultTun)(nil)
 
 type dnsInterfaceIndexer interface {
 	SetInterfaceIndex(int) error
@@ -127,7 +145,23 @@ func (s *System) BuildDefaultTun(
 		return nil, err
 	}
 
+	s.defaultTunMu.Lock()
+	locked := true
+	callClosedCallback := false
+	defer func() {
+		if locked {
+			s.defaultTunMu.Unlock()
+		}
+		if callClosedCallback && s.callbacks.DefaultTunClosed != nil {
+			s.callbacks.DefaultTunClosed()
+		}
+	}()
+
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, net.ErrClosed
+	}
 	tunRulesSupported := s.tunRulesSupportedLocked()
 	state := s.defaultTun
 	rebuilding := state != nil
@@ -138,15 +172,24 @@ func (s *System) BuildDefaultTun(
 			s.mu.Unlock()
 			return nil, err
 		}
-		state = &defaultTunState{system: s, tun: t}
+		s.defaultTunSourceGeneration++
+		state = &defaultTunState{
+			system:           s,
+			tun:              t,
+			sourceGeneration: s.defaultTunSourceGeneration,
+		}
+		state.public = &defaultTun{defaultTunState: state}
 		s.defaultTun = state
 	}
 	s.mu.Unlock()
 
+	nativeTun := stateTun(state)
+	var oldNativeTun gtun.Tun
 	tunRecreated := false
 	if rebuilding {
 		var err error
-		tunRecreated, err = s.ensureDefaultTunLink(state, mtu)
+		nativeTun, oldNativeTun, tunRecreated, err =
+			s.prepareDefaultTunLink(state, mtu)
 		if err != nil {
 			return nil, err
 		}
@@ -167,8 +210,11 @@ func (s *System) BuildDefaultTun(
 		ruleIDs               []uint64
 		appliedRC             *routing.Config
 	)
-	fail := func(cause error) (sysnet.DefaultTun, error) {
+	fail := func(cause error) error {
 		err := cause
+		if tunRecreated && nativeTun != nil {
+			err = errors.Join(err, nativeTun.Close())
+		}
 		for _, id := range ruleIDs {
 			s.unregisterRule(id)
 		}
@@ -196,31 +242,29 @@ func (s *System) BuildDefaultTun(
 		s.mu.Unlock()
 		if active {
 			err = errors.Join(err, state.closeActive())
-			if s.callbacks.DefaultTunClosed != nil {
-				s.callbacks.DefaultTunClosed()
-			}
+			callClosedCallback = true
 		}
-		return nil, err
+		return err
 	}
 
-	if err := s.tunConfig.SetTunMTU(state.tun, opts.MTU); err != nil {
-		return fail(err)
+	if err := s.tunConfig.SetTunMTU(nativeTun, opts.MTU); err != nil {
+		return nil, fail(err)
 	}
-	if err := s.tunConfig.SetTunAddrs(state.tun, addrs); err != nil {
-		return fail(err)
+	if err := s.tunConfig.SetTunAddrs(nativeTun, addrs); err != nil {
+		return nil, fail(err)
 	}
 	// The routing manager owns DefaultTun routes in its dedicated VPN table.
 	// Keep the main table free of routes through this TUN. The application
 	// bypass rule looks up main, so any matching route through the TUN can send
 	// a VPN transport back into its own tunnel. An empty replacement also
 	// removes connected main-table routes that SetTunAddrs can create.
-	if err := s.tunConfig.SetTunRoutes(state.tun, nil); err != nil {
-		return fail(err)
+	if err := s.tunConfig.SetTunRoutes(nativeTun, nil); err != nil {
+		return nil, fail(err)
 	}
 	if tunRecreated && server != nil && oldDNSIP == dnsIP {
 		server.Detach()
 		if err := server.Close(); err != nil {
-			return fail(err)
+			return nil, fail(err)
 		}
 		if oldServer == server {
 			oldServer = nil
@@ -234,7 +278,7 @@ func (s *System) BuildDefaultTun(
 			net.JoinHostPort(dnsIP.String(), "53"),
 		)
 		if err != nil {
-			return fail(err)
+			return nil, fail(err)
 		}
 		server = gdns.NewServer(conn, nil, nil)
 		serverReplaced = true
@@ -247,25 +291,25 @@ func (s *System) BuildDefaultTun(
 		var err error
 		ruleIDs, check, err = s.defaultTunChecker(opts)
 		if err != nil {
-			return fail(err)
+			return nil, fail(err)
 		}
 	}
 	if check != nil {
 		if _, err := s.pmark.SetChecker(check); err != nil {
-			return fail(err)
+			return nil, fail(err)
 		}
 		pmarkCheckerInstalled = true
 		if err := s.pmark.ForceProcessTraversal(); err != nil {
-			return fail(err)
+			return nil, fail(err)
 		}
 	}
 
-	index, err := s.tunIndex(state.tun)
+	index, err := s.tunIndex(nativeTun)
 	if err != nil {
-		return fail(err)
+		return nil, fail(err)
 	}
 	if err := s.setDefaultTunDNSInterface(state, index); err != nil {
-		return fail(err)
+		return nil, fail(err)
 	}
 	rc := routing.DefaultConfig()
 	rc.TUNIndex = index
@@ -289,23 +333,34 @@ func (s *System) BuildDefaultTun(
 		if errors.Is(err, routing.ErrApplyFailedGuardActive) {
 			err = errors.Join(err, s.routingManager.Rollback(rc))
 		}
-		return fail(err)
+		return nil, fail(err)
 	}
 	appliedRC = &rc
 	if ok, err := s.applyConnmark(); err != nil {
-		return fail(err)
+		return nil, fail(err)
 	} else {
 		connmarkSet = ok
 	}
 	if err := s.dnsProvider.SetDNS(dnsIP); err != nil {
-		return fail(err)
+		return nil, fail(err)
 	}
 	if err := s.updateKillswitch(state, rc.Mode); err != nil {
-		return fail(err)
+		return nil, fail(err)
 	}
 
+	var sourceGeneration uint64
+	if tunRecreated {
+		s.mu.Lock()
+		s.defaultTunSourceGeneration++
+		sourceGeneration = s.defaultTunSourceGeneration
+		s.mu.Unlock()
+	}
 	state.mu.Lock()
 	generation := state.generation + 1
+	if tunRecreated {
+		state.sourceGeneration = sourceGeneration
+		state.tun = nativeTun
+	}
 	storedRC := rc
 	if rc.SourceRoutes != nil {
 		storedRC.SourceRoutes = make(
@@ -322,7 +377,13 @@ func (s *System) BuildDefaultTun(
 	state.dnsIfidxSet = s.dnsProviderSupportsInterfaceIndex()
 	state.connmarkSet = connmarkSet
 	state.generation = generation
+	state.addrs = append([]string(nil), addrs...)
+	state.routes = append([]string(nil), routes...)
+	wrapper := state.public
 	state.mu.Unlock()
+	if tunRecreated && oldNativeTun != nil {
+		_ = oldNativeTun.Close()
+	}
 	for _, id := range oldRuleIDs {
 		s.unregisterRule(id)
 	}
@@ -331,7 +392,8 @@ func (s *System) BuildDefaultTun(
 		_ = oldServer.Close()
 	}
 
-	wrapper := &defaultTun{defaultTunState: state, generation: generation}
+	locked = false
+	s.defaultTunMu.Unlock()
 	if s.callbacks.DefaultTunCreated != nil {
 		s.callbacks.DefaultTunCreated(wrapper)
 	}
@@ -355,32 +417,47 @@ func (s *System) BuildDefaultTun(
 	return wrapper, nil
 }
 
-func (s *System) ensureDefaultTunLink(
+func (s *System) prepareDefaultTunLink(
 	state *defaultTunState,
 	mtu int,
-) (bool, error) {
+) (gtun.Tun, gtun.Tun, bool, error) {
 	state.mu.Lock()
 	t := state.tun
 	state.mu.Unlock()
 
 	if _, err := s.tunIndex(t); err == nil {
-		return false, nil
+		return t, nil, false, nil
 	}
 
 	replacement, err := s.tunFactory.CreateTUN(s.defaultTunBaseName(), mtu)
 	if err != nil {
-		return false, err
+		return nil, nil, false, err
 	}
+	if err := validateDefaultTunReplacement(t, replacement); err != nil {
+		return nil, nil, false, errors.Join(err, replacement.Close())
+	}
+	return replacement, t, true, nil
+}
 
+func validateDefaultTunReplacement(old, replacement gtun.Tun) error {
+	if old == nil || replacement == nil {
+		return errors.New("default tun replacement source is unavailable")
+	}
+	if old.IsNative() != replacement.IsNative() ||
+		old.MWO() != replacement.MWO() ||
+		old.MRO() != replacement.MRO() ||
+		old.BatchSize() != replacement.BatchSize() {
+		return errors.New(
+			"default tun replacement has incompatible I/O metadata",
+		)
+	}
+	return nil
+}
+
+func stateTun(state *defaultTunState) gtun.Tun {
 	state.mu.Lock()
-	old := state.tun
-	state.tun = replacement
-	state.mu.Unlock()
-
-	if old != nil {
-		_ = old.Close()
-	}
-	return true, nil
+	defer state.mu.Unlock()
+	return state.tun
 }
 
 func (s *System) defaultTunChecker(
@@ -533,8 +610,7 @@ func (s *System) DefaultTunWarnings(t sysnet.DefaultTun) []sysnet.Warning {
 	}
 
 	d.mu.Lock()
-	wrapperActive := d.generation == d.defaultTunState.generation &&
-		d.server != nil
+	wrapperActive := d.server != nil
 	nativeTun := d.tun
 	dnsIP := d.dnsIP
 	d.mu.Unlock()
@@ -552,9 +628,17 @@ func (s *System) DefaultTunWarnings(t sysnet.DefaultTun) []sysnet.Warning {
 }
 
 func (d *defaultTun) SetDns(resolver gdns.Interface) {
+	d.system.defaultTunMu.Lock()
+	defer d.system.defaultTunMu.Unlock()
+	d.system.mu.Lock()
+	active := !d.system.closed && d.system.defaultTun == d.defaultTunState
+	d.system.mu.Unlock()
+	if !active {
+		return
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.generation != d.defaultTunState.generation || d.server == nil {
+	if d.server == nil {
 		return
 	}
 	if resolver == nil {
@@ -565,17 +649,19 @@ func (d *defaultTun) SetDns(resolver gdns.Interface) {
 }
 
 func (d *defaultTun) Close() error {
+	d.system.defaultTunMu.Lock()
 	d.system.mu.Lock()
-	active := d.system.defaultTun == d.defaultTunState &&
-		d.generation == d.defaultTunState.generation
+	active := d.system.defaultTun == d.defaultTunState
 	if active {
 		d.system.defaultTun = nil
 	}
 	d.system.mu.Unlock()
 	if !active {
+		d.system.defaultTunMu.Unlock()
 		return nil
 	}
 	err := d.closeActive()
+	d.system.defaultTunMu.Unlock()
 	if d.system.callbacks.DefaultTunClosed != nil {
 		d.system.callbacks.DefaultTunClosed()
 	}
@@ -596,6 +682,8 @@ func (d *defaultTunState) closeActive() error {
 	d.dnsIfidxSet = false
 	connmarkSet := d.connmarkSet
 	d.connmarkSet = false
+	tun := d.tun
+	d.tun = nil
 	d.unregisterRulesLocked()
 	d.mu.Unlock()
 
@@ -623,7 +711,9 @@ func (d *defaultTunState) closeActive() error {
 		_, e := d.system.pmark.SetChecker(nil)
 		err = errors.Join(err, e)
 	}
-	err = errors.Join(err, d.tun.Close())
+	if tun != nil {
+		err = errors.Join(err, tun.Close())
+	}
 	return err
 }
 
@@ -640,17 +730,90 @@ func (s *System) unregisterRule(id uint64) {
 	}
 }
 
-func (d *defaultTun) File() *os.File { return d.tun.File() }
-func (d *defaultTun) IsNative() bool { return d.tun.IsNative() }
+// SourceGeneration returns the identity generation of the current native TUN.
+// The value changes only when the native source changes.
+func (d *defaultTun) SourceGeneration() uint64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.sourceGeneration
+}
+
+func (d *defaultTun) nativeTun() gtun.Tun {
+	d.system.mu.Lock()
+	defer d.system.mu.Unlock()
+	if d.system.closed || d.system.defaultTun != d.defaultTunState {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.tun
+}
+
+func (d *defaultTun) File() *os.File {
+	if t := d.nativeTun(); t != nil {
+		return t.File()
+	}
+	return nil
+}
+
+func (d *defaultTun) IsNative() bool {
+	if t := d.nativeTun(); t != nil {
+		return t.IsNative()
+	}
+	return false
+}
+
 func (d *defaultTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
-	return d.tun.Read(bufs, sizes, offset)
+	if t := d.nativeTun(); t != nil {
+		return t.Read(bufs, sizes, offset)
+	}
+	return 0, os.ErrClosed
 }
 func (d *defaultTun) Write(bufs [][]byte, offset int) (int, error) {
-	return d.tun.Write(bufs, offset)
+	if t := d.nativeTun(); t != nil {
+		return t.Write(bufs, offset)
+	}
+	return 0, os.ErrClosed
 }
-func (d *defaultTun) MWO() int                  { return d.tun.MWO() }
-func (d *defaultTun) MRO() int                  { return d.tun.MRO() }
-func (d *defaultTun) MTU() (int, error)         { return d.tun.MTU() }
-func (d *defaultTun) Name() (string, error)     { return d.tun.Name() }
-func (d *defaultTun) Events() <-chan gtun.Event { return d.tun.Events() }
-func (d *defaultTun) BatchSize() int            { return d.tun.BatchSize() }
+func (d *defaultTun) MWO() int {
+	if t := d.nativeTun(); t != nil {
+		return t.MWO()
+	}
+	return 0
+}
+func (d *defaultTun) MRO() int {
+	if t := d.nativeTun(); t != nil {
+		return t.MRO()
+	}
+	return 0
+}
+func (d *defaultTun) MTU() (int, error) {
+	if t := d.nativeTun(); t != nil {
+		return t.MTU()
+	}
+	return 0, os.ErrClosed
+}
+func (d *defaultTun) Name() (string, error) {
+	if t := d.nativeTun(); t != nil {
+		return t.Name()
+	}
+	return "", os.ErrClosed
+}
+func (d *defaultTun) Events() <-chan gtun.Event {
+	if t := d.nativeTun(); t != nil {
+		return t.Events()
+	}
+	return closedDefaultTunEvents
+}
+func (d *defaultTun) BatchSize() int {
+	if t := d.nativeTun(); t != nil {
+		return max(1, t.BatchSize())
+	}
+	return 1
+}
+
+var closedDefaultTunEvents = func() <-chan gtun.Event {
+	events := make(chan gtun.Event)
+	close(events)
+	return events
+}()

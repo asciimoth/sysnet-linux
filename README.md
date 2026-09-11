@@ -88,6 +88,44 @@ Set `SystemConfig.Pmark.PinPath` to enable process-based include and exclude rul
 
 Use `NewSystem` when the application must supply its own DNS provider, routing manager, TUN factory, process marker, killswitch client, or other low-level component. This constructor is also useful for deterministic tests.
 
+### Default TUN identity and dynamic updates
+
+`BuildDefaultTun` returns one stable public object while the default TUN is
+active. A rebuild returns the same object. A configuration-only rebuild keeps
+the same native source. If Linux removes the native link, the next rebuild
+creates a source and changes its source generation.
+
+Use the Linux extension to observe this change:
+
+```go
+source := defaultTun.(linux.DefaultTunSource)
+generation := source.SourceGeneration()
+```
+
+The generation changes only when the native TUN changes. Replacement closes
+the old native TUN. A `Read` or `Write` that is in progress on that source can
+return an error that matches `os.ErrClosed`. A new call uses the new source.
+An in-progress `Write` can also return a partial packet count from the old
+source. Process that count before you retry the unwritten packets. Replacement
+is rejected if it would change `IsNative`, `MWO`, `MRO`, or `BatchSize`, because
+these values must stay stable for the lifetime of the public object.
+An `Events` channel is for the source that was current when `Events` was
+called. The old channel closes during replacement. Call `Events` again after
+the source generation changes.
+
+The dynamic MTU, address, and route methods accept this public object. Address
+updates keep the main routing table free of routes through the default TUN.
+Route updates change the routing manager's dedicated VPN-table policy; they do
+not add routes to the main table. `GetTunRotue` returns this route intent for a
+default TUN. An address update that would change the active DNS address is not
+supported and returns an error that matches `sysnet.ErrNotSupported`; use
+`BuildDefaultTun` for that change.
+
+After `Close`, the object is inactive. Its I/O methods return an error that
+matches `os.ErrClosed`, and system update methods return
+`sysnet.ErrUnknownTun`. A later build creates a new stable public object and a
+new source generation.
+
 ## How it fits into a cross-platform VPN
 
 Application code can depend on `gonnect/sysnet.System` instead of Linux-specific networking APIs. Select the platform implementation at the application boundary:

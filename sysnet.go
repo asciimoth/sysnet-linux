@@ -10,6 +10,8 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"reflect"
+	"slices"
 	"sync"
 	"syscall"
 
@@ -208,8 +210,9 @@ type Config struct {
 
 // System composes the Linux DNS, TUN, routing, p-mark, and killswitch helpers.
 type System struct {
-	mu     sync.Mutex
-	closed bool
+	mu           sync.Mutex
+	defaultTunMu sync.Mutex
+	closed       bool
 
 	features FeatureConfig
 
@@ -250,6 +253,8 @@ type System struct {
 
 	tuns       map[gtun.Tun]*tunState
 	defaultTun *defaultTunState
+
+	defaultTunSourceGeneration uint64
 }
 
 type tunState struct {
@@ -414,9 +419,11 @@ func (s *System) buildMarkedNetwork() gonnect.Network {
 
 // Close releases every object owned by System.
 func (s *System) Close() error {
+	s.defaultTunMu.Lock()
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+		s.defaultTunMu.Unlock()
 		return nil
 	}
 	s.closed = true
@@ -436,6 +443,7 @@ func (s *System) Close() error {
 	for _, tun := range tuns {
 		err = errors.Join(err, tun.Close())
 	}
+	s.defaultTunMu.Unlock()
 	if s.dnsProvider != nil {
 		err = errors.Join(err, s.dnsProvider.Close())
 	}
@@ -604,19 +612,69 @@ func (s *System) defaultTunBaseName() string {
 }
 
 func (s *System) ownedRegularTun(t gtun.Tun) bool {
+	if t == nil {
+		return false
+	}
+	typeOfTun := reflect.TypeOf(t)
+	if typeOfTun == nil || !typeOfTun.Comparable() {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, ok := s.tuns[t]
 	return ok
 }
 
-func (s *System) ownedAnyTun(t gtun.Tun) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.tuns[t]; ok {
-		return true
+type resolvedTun struct {
+	tun       gtun.Tun
+	state     *defaultTunState
+	isDefault bool
+}
+
+// resolveTunLocked resolves a public TUN handle to the native object that the
+// configurator must use. The caller must hold defaultTunMu. The returned
+// release function keeps ownership and default-TUN replacement stable for the
+// complete operation.
+func (s *System) resolveTunLocked(
+	t gtun.Tun,
+) (resolvedTun, func(), error) {
+	if t == nil {
+		return resolvedTun{}, nil, sysnet.ErrUnknownTun
 	}
-	return s.defaultTun != nil && s.defaultTun.tun == t
+
+	s.mu.Lock()
+	if d, ok := t.(*defaultTun); ok {
+		if d == nil || d.defaultTunState == nil ||
+			d.system != s || s.closed || s.defaultTun != d.defaultTunState {
+			s.mu.Unlock()
+			return resolvedTun{}, nil, sysnet.ErrUnknownTun
+		}
+		d.mu.Lock()
+		if d.tun == nil {
+			d.mu.Unlock()
+			s.mu.Unlock()
+			return resolvedTun{}, nil, sysnet.ErrUnknownTun
+		}
+		resolved := resolvedTun{
+			tun:       d.tun,
+			state:     d.defaultTunState,
+			isDefault: true,
+		}
+		s.mu.Unlock()
+		return resolved, d.mu.Unlock, nil
+	}
+
+	typeOfTun := reflect.TypeOf(t)
+	if typeOfTun == nil || !typeOfTun.Comparable() {
+		s.mu.Unlock()
+		return resolvedTun{}, nil, sysnet.ErrUnknownTun
+	}
+	if _, ok := s.tuns[t]; !ok {
+		s.mu.Unlock()
+		return resolvedTun{}, nil, sysnet.ErrUnknownTun
+	}
+	s.mu.Unlock()
+	return resolvedTun{tun: t}, func() {}, nil
 }
 
 // TunWarnings returns read-only runtime warnings for a regular TUN created by
@@ -629,27 +687,52 @@ func (s *System) TunWarnings(t gtun.Tun) []sysnet.Warning {
 }
 
 func (s *System) SetTunMTU(t gtun.Tun, mtu int) error {
-	if !s.ownedAnyTun(t) {
-		return sysnet.ErrUnknownTun
+	s.defaultTunMu.Lock()
+	defer s.defaultTunMu.Unlock()
+	resolved, release, err := s.resolveTunLocked(t)
+	if err != nil {
+		return err
 	}
-	return s.tunConfig.SetTunMTU(t, mtu)
+	defer release()
+	if !resolved.isDefault {
+		return s.tunConfig.SetTunMTU(resolved.tun, mtu)
+	}
+	oldMTU, err := resolved.tun.MTU()
+	if err != nil {
+		return err
+	}
+	if err := s.tunConfig.SetTunMTU(resolved.tun, mtu); err != nil {
+		return errors.Join(err, s.tunConfig.SetTunMTU(resolved.tun, oldMTU))
+	}
+	return nil
 }
 
 func (s *System) SetTunAddrs(t gtun.Tun, addrs []string) error {
-	if !s.ownedAnyTun(t) {
-		return sysnet.ErrUnknownTun
+	s.defaultTunMu.Lock()
+	defer s.defaultTunMu.Unlock()
+	resolved, release, err := s.resolveTunLocked(t)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if resolved.isDefault {
+		return s.setDefaultTunAddrsLocked(resolved, addrs)
 	}
 	normalized, _, err := normalizeTunAddrs(addrs, "", "")
 	if err != nil {
 		return err
 	}
-	return s.tunConfig.SetTunAddrs(t, normalized)
+	return s.tunConfig.SetTunAddrs(resolved.tun, normalized)
 }
 
 func (s *System) AddTunAddr(t gtun.Tun, addr string) error {
-	if !s.ownedAnyTun(t) {
-		return sysnet.ErrUnknownTun
+	s.defaultTunMu.Lock()
+	defer s.defaultTunMu.Unlock()
+	resolved, release, err := s.resolveTunLocked(t)
+	if err != nil {
+		return err
 	}
+	defer release()
 	normalized, _, err := normalizeTunAddrs([]string{addr}, "", "")
 	if err != nil {
 		return err
@@ -657,31 +740,49 @@ func (s *System) AddTunAddr(t gtun.Tun, addr string) error {
 	if len(normalized) == 0 {
 		return nil
 	}
-	return s.tunConfig.AddTunAddr(t, normalized[0])
+	if resolved.isDefault {
+		return s.addDefaultTunAddrLocked(resolved, normalized[0])
+	}
+	return s.tunConfig.AddTunAddr(resolved.tun, normalized[0])
 }
 
 func (s *System) GetTunAddrs(t gtun.Tun) ([]string, error) {
-	if !s.ownedAnyTun(t) {
-		return nil, sysnet.ErrUnknownTun
+	s.defaultTunMu.Lock()
+	defer s.defaultTunMu.Unlock()
+	resolved, release, err := s.resolveTunLocked(t)
+	if err != nil {
+		return nil, err
 	}
-	return s.tunConfig.GetTunAddrs(t)
+	defer release()
+	return s.tunConfig.GetTunAddrs(resolved.tun)
 }
 
 func (s *System) SetTunRoutes(t gtun.Tun, routes []string) error {
-	if !s.ownedAnyTun(t) {
-		return sysnet.ErrUnknownTun
+	s.defaultTunMu.Lock()
+	defer s.defaultTunMu.Unlock()
+	resolved, release, err := s.resolveTunLocked(t)
+	if err != nil {
+		return err
 	}
+	defer release()
 	normalized, err := normalizeTunRoutes(routes)
 	if err != nil {
 		return err
 	}
-	return s.tunConfig.SetTunRoutes(t, normalized)
+	if resolved.isDefault {
+		return s.setDefaultTunRoutesLocked(resolved, normalized)
+	}
+	return s.tunConfig.SetTunRoutes(resolved.tun, normalized)
 }
 
 func (s *System) AddTunRoute(t gtun.Tun, route string) error {
-	if !s.ownedAnyTun(t) {
-		return sysnet.ErrUnknownTun
+	s.defaultTunMu.Lock()
+	defer s.defaultTunMu.Unlock()
+	resolved, release, err := s.resolveTunLocked(t)
+	if err != nil {
+		return err
 	}
+	defer release()
 	normalized, err := normalizeTunRoutes([]string{route})
 	if err != nil {
 		return err
@@ -689,14 +790,235 @@ func (s *System) AddTunRoute(t gtun.Tun, route string) error {
 	if len(normalized) == 0 {
 		return nil
 	}
-	return s.tunConfig.AddTunRoute(t, normalized[0])
+	if resolved.isDefault {
+		routes := append([]string(nil), resolved.state.routes...)
+		routes = append(routes, normalized[0])
+		routes, err = normalizeTunRoutes(routes)
+		if err != nil {
+			return err
+		}
+		return s.setDefaultTunRoutesLocked(resolved, routes)
+	}
+	return s.tunConfig.AddTunRoute(resolved.tun, normalized[0])
 }
 
 func (s *System) GetTunRotue(t gtun.Tun) ([]string, error) {
-	if !s.ownedAnyTun(t) {
-		return nil, sysnet.ErrUnknownTun
+	s.defaultTunMu.Lock()
+	defer s.defaultTunMu.Unlock()
+	resolved, release, err := s.resolveTunLocked(t)
+	if err != nil {
+		return nil, err
 	}
-	return s.tunConfig.GetTunRotue(t)
+	defer release()
+	if resolved.isDefault {
+		return append([]string(nil), resolved.state.routes...), nil
+	}
+	return s.tunConfig.GetTunRotue(resolved.tun)
+}
+
+func (s *System) setDefaultTunAddrsLocked(
+	resolved resolvedTun,
+	addrs []string,
+) error {
+	normalized, dnsIP, err := normalizeTunAddrs(
+		addrs,
+		s.defaultTunCIDR,
+		resolved.state.dnsIP.String(),
+	)
+	if err != nil {
+		return err
+	}
+	if dnsIP != resolved.state.dnsIP {
+		return fmt.Errorf(
+			"default tun address update would change the DNS address: %w",
+			sysnet.ErrNotSupported,
+		)
+	}
+	return s.updateDefaultTunAddrsLocked(resolved, normalized, "")
+}
+
+func (s *System) addDefaultTunAddrLocked(
+	resolved resolvedTun,
+	addr string,
+) error {
+	if slices.Contains(resolved.state.addrs, addr) {
+		return nil
+	}
+	addrs := append([]string(nil), resolved.state.addrs...)
+	addrs = append(addrs, addr)
+	normalized, dnsIP, err := normalizeTunAddrs(
+		addrs,
+		s.defaultTunCIDR,
+		resolved.state.dnsIP.String(),
+	)
+	if err != nil {
+		return err
+	}
+	if dnsIP != resolved.state.dnsIP {
+		return fmt.Errorf(
+			"default tun address update would change the DNS address: %w",
+			sysnet.ErrNotSupported,
+		)
+	}
+	return s.updateDefaultTunAddrsLocked(resolved, normalized, addr)
+}
+
+func (s *System) updateDefaultTunAddrsLocked(
+	resolved resolvedTun,
+	addrs []string,
+	addedAddr string,
+) error {
+	state := resolved.state
+	if state.routingConfig == nil {
+		return sysnet.ErrUnknownTun
+	}
+	if err := validateDefaultTunSourceAddrs(
+		addrs,
+		state.routingConfig.SourceRoutes,
+	); err != nil {
+		return err
+	}
+
+	oldAddrs, err := s.tunConfig.GetTunAddrs(resolved.tun)
+	if err != nil {
+		return err
+	}
+	oldMainRoutes, err := s.tunConfig.GetTunRotue(resolved.tun)
+	if err != nil {
+		return err
+	}
+	oldRC := cloneDefaultTunRoutingConfig(*state.routingConfig)
+	newRC := cloneDefaultTunRoutingConfig(oldRC)
+	newRC.Families = routeFamilies(addrs, state.routes)
+
+	if addedAddr == "" {
+		err = s.tunConfig.SetTunAddrs(resolved.tun, addrs)
+	} else {
+		err = s.tunConfig.AddTunAddr(resolved.tun, addedAddr)
+	}
+	if err != nil {
+		return errors.Join(
+			err,
+			s.restoreDefaultTunLinkLocked(
+				resolved.tun,
+				oldAddrs,
+				oldMainRoutes,
+			),
+		)
+	}
+	if err := s.tunConfig.SetTunRoutes(resolved.tun, nil); err != nil {
+		return errors.Join(
+			err,
+			s.restoreDefaultTunLinkLocked(
+				resolved.tun,
+				oldAddrs,
+				oldMainRoutes,
+			),
+		)
+	}
+	if err := s.routingManager.Apply(newRC); err != nil {
+		return errors.Join(
+			err,
+			s.restoreDefaultTunLinkLocked(
+				resolved.tun,
+				oldAddrs,
+				oldMainRoutes,
+			),
+			s.restoreDefaultTunRoutingLocked(oldRC, newRC),
+		)
+	}
+
+	state.addrs = append([]string(nil), addrs...)
+	state.routingConfig = &newRC
+	return nil
+}
+
+func (s *System) setDefaultTunRoutesLocked(
+	resolved resolvedTun,
+	routes []string,
+) error {
+	state := resolved.state
+	if state.routingConfig == nil {
+		return sysnet.ErrUnknownTun
+	}
+	oldMainRoutes, err := s.tunConfig.GetTunRotue(resolved.tun)
+	if err != nil {
+		return err
+	}
+	oldRC := cloneDefaultTunRoutingConfig(*state.routingConfig)
+	newRC := cloneDefaultTunRoutingConfig(oldRC)
+	newRC.Families = routeFamilies(state.addrs, routes)
+
+	if err := s.tunConfig.SetTunRoutes(resolved.tun, nil); err != nil {
+		return errors.Join(
+			err,
+			s.tunConfig.SetTunRoutes(resolved.tun, oldMainRoutes),
+		)
+	}
+	if err := s.routingManager.Apply(newRC); err != nil {
+		return errors.Join(
+			err,
+			s.tunConfig.SetTunRoutes(resolved.tun, oldMainRoutes),
+			s.restoreDefaultTunRoutingLocked(oldRC, newRC),
+		)
+	}
+
+	state.routes = append([]string(nil), routes...)
+	state.routingConfig = &newRC
+	return nil
+}
+
+func (s *System) restoreDefaultTunLinkLocked(
+	t gtun.Tun,
+	addrs, routes []string,
+) error {
+	return errors.Join(
+		s.tunConfig.SetTunAddrs(t, addrs),
+		s.tunConfig.SetTunRoutes(t, routes),
+	)
+}
+
+func (s *System) restoreDefaultTunRoutingLocked(
+	oldRC, failedRC routing.Config,
+) error {
+	return errors.Join(
+		s.routingManager.Rollback(failedRC),
+		s.routingManager.Apply(oldRC),
+	)
+}
+
+func validateDefaultTunSourceAddrs(
+	addrs []string,
+	sourceRoutes []routing.SourceRoute,
+) error {
+	assigned := make(map[netip.Addr]struct{}, len(addrs))
+	for _, addr := range addrs {
+		prefix, err := netip.ParsePrefix(addr)
+		if err != nil {
+			return err
+		}
+		assigned[prefix.Addr()] = struct{}{}
+	}
+	for _, route := range sourceRoutes {
+		if _, ok := assigned[route.Source]; !ok {
+			return fmt.Errorf(
+				"default tun address update removes source route address %s",
+				route.Source,
+			)
+		}
+	}
+	return nil
+}
+
+func cloneDefaultTunRoutingConfig(config routing.Config) routing.Config {
+	cloned := config
+	if config.SourceRoutes != nil {
+		cloned.SourceRoutes = append(
+			[]routing.SourceRoute(nil),
+			config.SourceRoutes...,
+		)
+	}
+	return cloned
 }
 
 func (s *System) SetTunName(t gtun.Tun, name string) ([]string, error) {
