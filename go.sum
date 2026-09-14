@@ -6,8 +6,8 @@ github.com/asciimoth/gonnect-netstack v0.6.4 h1:nLBXXR14Wdffa8yuNHLyP+/DIeemwIms
 github.com/asciimoth/gonnect-netstack v0.6.4/go.mod h1:7I0GE8SgtUW7E701+7OrtUr4UaK9PI/yq3y4jB8qhx8=
 github.com/asciimoth/p-mark v0.2.0 h1:ZmJQy+Te+fZBWwy5zFzbCzQiladixKCNMKtXS3rZzeU=
 github.com/asciimoth/p-mark v0.2.0/go.mod h1:uBcCKIk6x5hjb7rDnH4trBCAfHr/4xOWM8q+tydLJAw=
-github.com/asciimoth/tuntap v0.3.34 h1:XV1NkJOPvj92thwVtKMf7UXBMCtoL3ESNa1AEcvu/0M=
-github.com/asciimoth/tuntap v0.3.34/go.mod h1:bUYzf3kfAKc0ztuTub1yVS7I5Puw/VKuMfRvaOGGJN4=
+github.com/asciimoth/tuntap v0.4.0 h1:NRWkGm39krOnktpXfESltS7IpD5WRrlSaDhxL4DG3iA=
+github.com/asciimoth/tuntap v0.4.0/go.mod h1:bUYzf3kfAKc0ztuTub1yVS7I5Puw/VKuMfRvaOGGJN4=
 github.com/cilium/ebpf v0.21.0 h1:4dpx1J/B/1apeTmWBH5BkVLayHTkFrMovVPnHEk+l3k=
 github.com/cilium/ebpf v0.21.0/go.mod h1:1kHKv6Kvh5a6TePP5vvvoMa1bclRyzUXELSs272fmIQ=
 github.com/go-quicktest/qt v1.101.1-0.20240301121107-c6c8733fa1e6 h1:teYtXy9B7y5lHTp8V9KPxpYRAVA7dozigQcMiBust1s=
