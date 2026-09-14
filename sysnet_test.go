@@ -38,9 +38,14 @@ func TestNewAutoBuildsAvailableComponents(t *testing.T) {
 	closer := &fakeCloser{}
 	autoSystemEnv = systemAutoEnvironment{
 		hasCapability: func(int) bool { return true },
-		probeTUN: func(TUNFactory) error {
+		probeTUN: func(
+			TUNFactory,
+			func(time.Duration),
+			func(string, ...any),
+		) error {
 			return nil
 		},
+		waitTUNProbeRetry: func(time.Duration) {},
 		newRoutingManager: func() (RoutingManager, error) {
 			return &fakeRouting{}, nil
 		},
@@ -150,9 +155,16 @@ func TestNewAutoDegradesUnavailableComponents(t *testing.T) {
 
 	autoSystemEnv = systemAutoEnvironment{
 		hasCapability: func(int) bool { return false },
-		probeTUN: func(TUNFactory) error {
+		probeTUN: func(
+			TUNFactory,
+			func(time.Duration),
+			func(string, ...any),
+		) error {
 			t.Fatal("probeTUN should not run without CAP_NET_ADMIN")
 			return nil
+		},
+		waitTUNProbeRetry: func(time.Duration) {
+			t.Fatal("TUN probe retry wait should not run")
 		},
 		newRoutingManager: func() (RoutingManager, error) {
 			t.Fatal(

@@ -99,6 +99,9 @@ func main() {
 }
 
 func run() error {
+	if err := checkAutoNewTUNProbeRetry(); err != nil {
+		return err
+	}
 	if err := checkDegradedSystem(); err != nil {
 		return err
 	}
@@ -532,6 +535,119 @@ func checkAutoNewDirectSystem() error {
 	}
 	if err := checkAutoNewDefaultTunWithoutRules(system, "direct"); err != nil {
 		return err
+	}
+	return nil
+}
+
+func checkAutoNewTUNProbeRetry() error {
+	blocker, err := os.CreateTemp("", "sysnet-tun-probe-blocker-")
+	if err != nil {
+		return fmt.Errorf("create TUN probe blocker: %w", err)
+	}
+	blockerPath := blocker.Name()
+	defer os.Remove(blockerPath)
+	if err := blocker.Close(); err != nil {
+		return fmt.Errorf("close TUN probe blocker: %w", err)
+	}
+
+	inotifyFD, err := unix.InotifyInit1(unix.IN_CLOEXEC)
+	if err != nil {
+		return fmt.Errorf("create TUN probe blocker watcher: %w", err)
+	}
+	defer unix.Close(inotifyFD)
+	if _, err := unix.InotifyAddWatch(
+		inotifyFD,
+		blockerPath,
+		unix.IN_OPEN,
+	); err != nil {
+		return fmt.Errorf("watch TUN probe blocker: %w", err)
+	}
+
+	const tunPath = "/dev/net/tun"
+	if err := unix.Mount(
+		blockerPath,
+		tunPath,
+		"",
+		unix.MS_BIND,
+		"",
+	); err != nil {
+		return fmt.Errorf("mount TUN probe blocker: %w", err)
+	}
+	defer func() { _ = unix.Unmount(tunPath, unix.MNT_DETACH) }()
+
+	preProbePollFDs := []unix.PollFd{{
+		Fd:     int32(inotifyFD),
+		Events: unix.POLLIN,
+	}}
+	count, err := unix.Poll(preProbePollFDs, 0)
+	if err != nil {
+		return fmt.Errorf("check TUN probe blocker watcher: %w", err)
+	}
+	if count != 0 {
+		return errors.New("TUN probe blocker opened before probe started")
+	}
+
+	unmountResult := make(chan error, 1)
+	go func() {
+		pollFDs := []unix.PollFd{{
+			Fd:     int32(inotifyFD),
+			Events: unix.POLLIN,
+		}}
+		count, pollErr := unix.Poll(
+			pollFDs,
+			int((2 * time.Second).Milliseconds()),
+		)
+		if pollErr != nil {
+			unmountResult <- fmt.Errorf(
+				"wait for blocked TUN probe: %w",
+				pollErr,
+			)
+			return
+		}
+		if count == 0 {
+			unmountResult <- errors.New("timed out waiting for blocked TUN probe")
+			return
+		}
+		unmountResult <- unix.Unmount(tunPath, unix.MNT_DETACH)
+	}()
+
+	system, systemErr := linux.New(linux.SystemConfig{
+		Features: linux.FeatureConfig{Tun: true},
+		Logf:     log.Printf,
+	})
+	if err := <-unmountResult; err != nil {
+		if system != nil {
+			_ = system.Close()
+		}
+		return fmt.Errorf("remove TUN probe blocker: %w", err)
+	}
+	if systemErr != nil {
+		return fmt.Errorf(
+			"create System after transient TUN failure: %w",
+			systemErr,
+		)
+	}
+	defer func() { _ = system.Close() }()
+
+	if !system.Features().Tun {
+		return errors.New("TUN disabled after transient probe failure")
+	}
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return fmt.Errorf("list interfaces after TUN probe: %w", err)
+	}
+	for _, intf := range interfaces {
+		if strings.HasPrefix(intf.Name, "snprobe-") {
+			return fmt.Errorf("probe TUN %q was not removed", intf.Name)
+		}
+	}
+
+	t, err := system.BuildTun(sysnet.TunOpts{MTU: 1400})
+	if err != nil {
+		return fmt.Errorf("build TUN after successful probe retry: %w", err)
+	}
+	if _, err := t.Name(); err != nil {
+		return fmt.Errorf("get TUN name after successful probe retry: %w", err)
 	}
 	return nil
 }

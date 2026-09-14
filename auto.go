@@ -30,7 +30,13 @@ import (
 const (
 	defaultDNSResolvconfInterface = "sysnet-linux"
 	defaultPmarkPriority          = 0
+	tunProbeMaxAttempts           = 3
 )
+
+var tunProbeRetryDelays = [...]time.Duration{
+	20 * time.Millisecond,
+	40 * time.Millisecond,
+}
 
 // DNSMode selects the host DNS integration used by New.
 //
@@ -108,7 +114,8 @@ type SystemConfig struct {
 
 type systemAutoEnvironment struct {
 	hasCapability     func(int) bool
-	probeTUN          func(TUNFactory) error
+	probeTUN          func(TUNFactory, func(time.Duration), func(string, ...any)) error
+	waitTUNProbeRetry func(time.Duration)
 	newRoutingManager func() (RoutingManager, error)
 	newDNSProvider    func(SystemConfig, gonnect.Network, gonnect.Network) (dns.DNSProvider, error)
 	newPmark          func(SystemConfig, func(format string, args ...any)) (PmarkController, []io.Closer, error)
@@ -118,6 +125,7 @@ type systemAutoEnvironment struct {
 var autoSystemEnv = systemAutoEnvironment{
 	hasCapability:     hasEffectiveCapability,
 	probeTUN:          probeTUNCreation,
+	waitTUNProbeRetry: time.Sleep,
 	newRoutingManager: newNativeRoutingManager,
 	newDNSProvider:    newAutoDNSProvider,
 	newPmark:          newAutoPmark,
@@ -157,7 +165,11 @@ func New(config SystemConfig) (*System, error) {
 			disableTUNFeatures(&features)
 			factory = nil
 			tunConfig = nil
-		} else if err := autoSystemEnv.probeTUN(factory); err != nil {
+		} else if err := autoSystemEnv.probeTUN(
+			factory,
+			autoSystemEnv.waitTUNProbeRetry,
+			logf,
+		); err != nil {
 			logf("system auto-detect: disabling TUN: %v", err)
 			disableTUNFeatures(&features)
 			factory = nil
@@ -349,12 +361,26 @@ func setupRoutingManager(
 	return manager
 }
 
-func probeTUNCreation(factory TUNFactory) error {
-	t, err := factory.CreateTUN("snprobe", 1420)
-	if err != nil {
-		return err
+func probeTUNCreation(
+	factory TUNFactory,
+	wait func(time.Duration),
+	warnf func(string, ...any),
+) error {
+	var createErr error
+	for attempt := range tunProbeMaxAttempts {
+		t, err := factory.CreateTUN("snprobe", 1420)
+		if err == nil {
+			if err := t.Close(); err != nil {
+				warnf("system auto-detect: TUN probe cleanup failed: %v", err)
+			}
+			return nil
+		}
+		createErr = err
+		if attempt < len(tunProbeRetryDelays) {
+			wait(tunProbeRetryDelays[attempt])
+		}
 	}
-	return t.Close()
+	return createErr
 }
 
 func newAutoDNSProvider(
