@@ -57,7 +57,8 @@ const (
 	rpfHTTPPort   = 18081
 	rpfUDPPort    = 18082
 
-	userMark = 0x4d000001
+	userMark                     = 0x4d000001
+	sourceRouteRebuildIterations = 32
 
 	socketProbeMode  = "socket-probe"
 	rpfHTTPServeMode = "rpfilter-http-server"
@@ -1270,6 +1271,13 @@ func checkDefaultTunDynamicUpdates(system *linux.System) error {
 			addrs,
 		)
 	}
+	if err := expectIPv6TunAddrsReady(
+		tunName,
+		"fd66::1",
+		"fd66::2",
+	); err != nil {
+		return fmt.Errorf("dynamic DefaultTun IPv6 readiness: %w", err)
+	}
 	beforeRejectedUpdate := append([]string(nil), addrs...)
 	if err := system.SetTunAddrs(dt, []string{
 		"10.77.0.1/32",
@@ -1855,6 +1863,13 @@ func checkDefaultTunSourceRoutes(system *linux.System) error {
 	if err := expectNoMainRoutesThroughTun(tunName); err != nil {
 		return err
 	}
+	if err := expectIPv6TunAddrsReady(
+		tunName,
+		v6DefaultSource,
+		v6SpecificSource,
+	); err != nil {
+		return fmt.Errorf("source-route DefaultTun IPv6 readiness: %w", err)
+	}
 	if err := expectSourceRoute(
 		"IPv4 default preferred source",
 		"-4",
@@ -1914,14 +1929,42 @@ func checkDefaultTunSourceRoutes(system *linux.System) error {
 	for left, right := 0, len(reversedAddrs)-1; left < right; left, right = left+1, right-1 {
 		reversedAddrs[left], reversedAddrs[right] = reversedAddrs[right], reversedAddrs[left]
 	}
-	rebuilt, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{
-		TunAddrs:     reversedAddrs,
-		SourceRoutes: policy,
-		DnsIP:        v4DefaultSource,
-		MTU:          1400,
-	})
-	if err != nil {
-		return fmt.Errorf("rebuild reversed source-route DefaultTun: %w", err)
+	var rebuilt sysnet.DefaultTun
+	for iteration := range sourceRouteRebuildIterations {
+		rebuildAddrs := addrs
+		if iteration%2 == 0 {
+			rebuildAddrs = reversedAddrs
+		}
+		rebuilt, err = system.BuildDefaultTun(sysnet.DefaultTunOpts{
+			TunAddrs:     rebuildAddrs,
+			SourceRoutes: policy,
+			DnsIP:        v4DefaultSource,
+			MTU:          1400,
+		})
+		if err != nil {
+			return fmt.Errorf(
+				"source-route DefaultTun rebuild %d: %w",
+				iteration+1,
+				err,
+			)
+		}
+		if rebuilt != dt {
+			return fmt.Errorf(
+				"source-route DefaultTun rebuild %d replaced public wrapper",
+				iteration+1,
+			)
+		}
+		if err := expectIPv6TunAddrsReady(
+			tunName,
+			v6DefaultSource,
+			v6SpecificSource,
+		); err != nil {
+			return fmt.Errorf(
+				"source-route DefaultTun rebuild %d IPv6 readiness: %w",
+				iteration+1,
+				err,
+			)
+		}
 	}
 	defer func() { _ = rebuilt.Close() }()
 	if err := expectSourceRoute(
@@ -2081,6 +2124,55 @@ func expectSourceRoute(
 				name,
 				output,
 				want,
+			)
+		}
+	}
+	return nil
+}
+
+func expectIPv6TunAddrsReady(tunName string, values ...string) error {
+	link, err := netlink.LinkByName(tunName)
+	if err != nil {
+		return fmt.Errorf("lookup TUN %s: %w", tunName, err)
+	}
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V6)
+	if err != nil {
+		return fmt.Errorf("list IPv6 addresses on %s: %w", tunName, err)
+	}
+	byIP := make(map[netip.Addr]netlink.Addr, len(addrs))
+	for _, addr := range addrs {
+		if addr.IPNet == nil {
+			continue
+		}
+		ip, ok := netip.AddrFromSlice(addr.IP)
+		if ok {
+			byIP[ip] = addr
+		}
+	}
+	for _, value := range values {
+		ip, err := netip.ParseAddr(value)
+		if err != nil {
+			return fmt.Errorf("parse expected IPv6 address %q: %w", value, err)
+		}
+		addr, ok := byIP[ip]
+		if !ok {
+			return fmt.Errorf("IPv6 address %s is absent from %s", ip, tunName)
+		}
+		if addr.Flags&unix.IFA_F_NODAD == 0 {
+			return fmt.Errorf(
+				"IPv6 address %s on %s does not have IFA_F_NODAD: flags=%#x",
+				ip,
+				tunName,
+				addr.Flags,
+			)
+		}
+		badFlags := addr.Flags & (unix.IFA_F_TENTATIVE | unix.IFA_F_DADFAILED)
+		if badFlags != 0 {
+			return fmt.Errorf(
+				"IPv6 address %s on %s is not ready: flags=%#x",
+				ip,
+				tunName,
+				addr.Flags,
 			)
 		}
 	}

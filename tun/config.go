@@ -45,11 +45,12 @@ func SetTunMTU(tun gtun.Tun, mtu int) error {
 	return nil
 }
 
-// SetTunAddrs updates list off addrs of provided Tun.
+// SetTunAddrs updates the addresses of the provided Tun.
 //
-// Existing interface addresses are removed before the new CIDR addresses are
-// added. The Tun must expose a non-nil File; otherwise sysnet.ErrUnknownTun is
-// returned.
+// Addresses outside the requested CIDR set are removed. Unchanged addresses
+// are preserved. Managed IPv6 addresses have DAD disabled and are ready when
+// this function returns. The Tun must expose a non-nil File; otherwise
+// sysnet.ErrUnknownTun is returned.
 func SetTunAddrs(tun gtun.Tun, addrs []string) error {
 	info, err := tunFileInfo(tun)
 	if err != nil {
@@ -59,31 +60,14 @@ func SetTunAddrs(tun gtun.Tun, addrs []string) error {
 	if err != nil {
 		return err
 	}
-
-	current, err := netlink.AddrList(info.link, netlink.FAMILY_ALL)
-	if err != nil {
-		return err
-	}
-	for _, addr := range current {
-		if err := netlink.AddrDel(info.link, &addr); err != nil {
-			return err
-		}
-	}
-	for i, prefix := range prefixes {
-		addr, err := netlinkAddrFromPrefix(prefix)
-		if err != nil {
-			return err
-		}
-		if err := netlink.AddrReplace(info.link, addr); err != nil {
-			return fmt.Errorf("update address %s: %w", addrs[i], err)
-		}
-	}
-	return nil
+	return setTunAddrPrefixes(realTunAddrNetlink{}, info.link, prefixes)
 }
 
-// AddTunAddr updates list off addrs of provided Tun.
+// AddTunAddr adds an address to the provided Tun.
 //
 // The address must be a CIDR prefix such as "10.0.0.1/32" or "fd00::1/128".
+// A managed IPv6 address has DAD disabled and is ready when this function
+// returns.
 // The Tun must expose a non-nil File; otherwise sysnet.ErrUnknownTun is
 // returned.
 func AddTunAddr(tun gtun.Tun, addr string) error {
@@ -91,14 +75,11 @@ func AddTunAddr(tun gtun.Tun, addr string) error {
 	if err != nil {
 		return err
 	}
-	nlAddr, err := netlinkAddrFromString(addr)
+	prefix, err := parseTunAddrPrefix(addr)
 	if err != nil {
 		return err
 	}
-	if err := netlink.AddrReplace(info.link, nlAddr); err != nil {
-		return fmt.Errorf("update address %s: %w", addr, err)
-	}
-	return nil
+	return addTunAddrPrefix(realTunAddrNetlink{}, info.link, prefix)
 }
 
 // GetTunAddrs returns list off addrs of provided Tun.
@@ -302,7 +283,11 @@ func netlinkAddrFromPrefix(prefix netip.Prefix) (*netlink.Addr, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &netlink.Addr{IPNet: ipNet}, nil
+	addr := &netlink.Addr{IPNet: ipNet}
+	if prefix.Addr().Is6() {
+		addr.Flags |= unix.IFA_F_NODAD
+	}
+	return addr, nil
 }
 
 func netlinkRouteFromPrefix(
