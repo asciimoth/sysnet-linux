@@ -1066,9 +1066,18 @@ func normalizeTunAddrs(
 	addrs []string,
 	fallbackCIDR, dnsIP string,
 ) ([]string, netip.Addr, error) {
+	var fallbackPrefix netip.Prefix
+	if fallbackCIDR != "" {
+		var err error
+		fallbackPrefix, err = netip.ParsePrefix(fallbackCIDR)
+		if err != nil {
+			return nil, netip.Addr{}, err
+		}
+	}
 	seen := map[string]bool{}
 	out := make([]string, 0, len(addrs)+1)
 	containsDNS := false
+	containsFallbackAddr := false
 	dnsAddr, _ := netip.ParseAddr(dnsIP)
 	for _, addr := range addrs {
 		prefix, err := netip.ParsePrefix(addr)
@@ -1086,26 +1095,24 @@ func normalizeTunAddrs(
 		if dnsAddr.IsValid() && prefix.Contains(dnsAddr) {
 			containsDNS = true
 		}
-	}
-	if fallbackCIDR != "" && !seen[fallbackCIDR] {
-		prefix, err := netip.ParsePrefix(fallbackCIDR)
-		if err != nil {
-			return nil, netip.Addr{}, err
+		if fallbackPrefix.IsValid() && prefix.Addr() == fallbackPrefix.Addr() {
+			containsFallbackAddr = true
 		}
-		out = append(out, prefix.String())
-		if dnsAddr.IsValid() && prefix.Contains(dnsAddr) {
+	}
+	if fallbackPrefix.IsValid() && !containsFallbackAddr {
+		cidr := fallbackPrefix.String()
+		if !seen[cidr] {
+			out = append(out, cidr)
+		}
+		if dnsAddr.IsValid() && fallbackPrefix.Contains(dnsAddr) {
 			containsDNS = true
 		}
 	}
 	if dnsAddr.IsValid() && containsDNS {
 		return out, dnsAddr, nil
 	}
-	if fallbackCIDR != "" {
-		prefix, err := netip.ParsePrefix(fallbackCIDR)
-		if err != nil {
-			return nil, netip.Addr{}, err
-		}
-		return out, prefix.Addr(), nil
+	if fallbackPrefix.IsValid() {
+		return out, fallbackPrefix.Addr(), nil
 	}
 	return out, netip.Addr{}, nil
 }
