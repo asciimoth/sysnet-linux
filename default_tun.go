@@ -286,16 +286,26 @@ func (s *System) BuildDefaultTun(
 		server.Detach()
 	}
 
-	var check pmark.CheckFunc
+	var pmarkConfig defaultTunPmarkConfig
 	if tunRulesSupported {
 		var err error
-		ruleIDs, check, err = s.defaultTunChecker(opts)
+		pmarkConfig, err = s.defaultTunChecker(opts)
 		if err != nil {
 			return nil, fail(err)
 		}
+		ruleIDs = pmarkConfig.ruleIDs
 	}
-	if check != nil {
-		if _, err := s.pmark.SetChecker(check); err != nil {
+	if pmarkConfig.check != nil {
+		var err error
+		if controller, ok := s.pmark.(pmarkKernelPolicyController); ok {
+			_, err = controller.SetKernelPolicy(
+				pmarkConfig.kernelPolicy,
+				pmarkConfig.check,
+			)
+		} else {
+			_, err = s.pmark.SetChecker(pmarkConfig.check)
+		}
+		if err != nil {
 			return nil, fail(err)
 		}
 		pmarkCheckerInstalled = true
@@ -460,17 +470,21 @@ func stateTun(state *defaultTunState) gtun.Tun {
 	return state.tun
 }
 
+type defaultTunPmarkConfig struct {
+	ruleIDs      []uint64
+	check        pmark.CheckFunc
+	kernelPolicy pmark.KernelPolicy
+}
+
 func (s *System) defaultTunChecker(
 	opts sysnet.DefaultTunOpts,
-) ([]uint64, pmark.CheckFunc, error) {
+) (defaultTunPmarkConfig, error) {
 	if s.ruleTracker == nil {
-		return nil, func(pmark.ProcessInfo) (int8, uint64, bool) {
-			return 0, 0, false
-		}, nil
+		return defaultTunPmarkConfig{}, nil
 	}
 	priority64, err := strconv.ParseInt(strconv.Itoa(s.pmarkPriority), 10, 8)
 	if err != nil {
-		return nil, nil, fmt.Errorf(
+		return defaultTunPmarkConfig{}, fmt.Errorf(
 			"pmark priority %d is outside int8 range",
 			s.pmarkPriority,
 		)
@@ -481,16 +495,35 @@ func (s *System) defaultTunChecker(
 		rules = opts.Include
 	}
 	var ids []uint64
+	var exactCommRules []pmark.ExactCommRule
+	hasFallbackRule := false
 	for _, rule := range rules {
 		compiled, err := compileRule(rule)
 		if err != nil {
-			return nil, nil, err
+			return defaultTunPmarkConfig{}, err
 		}
 		if compiled.process == nil {
 			continue
 		}
 		id := s.ruleTracker.RegisterRule(compiled.process)
 		ids = append(ids, id)
+		if rule.Type != "comm" {
+			hasFallbackRule = true
+			continue
+		}
+		comm, supported, err := pmark.ExactCommFromRegexp(rule.Rule)
+		if err != nil {
+			return defaultTunPmarkConfig{}, err
+		}
+		if !supported {
+			hasFallbackRule = true
+			continue
+		}
+		exactCommRules = append(exactCommRules, pmark.ExactCommRule{
+			Comm:     comm,
+			Priority: priority,
+			Mark:     fwmark.ToMark(s.userMark),
+		})
 	}
 	check := func(info pmark.ProcessInfo) (int8, uint64, bool) {
 		s.ruleTracker.ApplyProcess(info)
@@ -504,7 +537,20 @@ func (s *System) defaultTunChecker(
 		}
 		return 0, 0, false
 	}
-	return ids, check, nil
+	kernelPolicy := pmark.KernelPolicy{CommRules: exactCommRules}
+	switch {
+	case !hasFallbackRule:
+		kernelPolicy.Mode = pmark.KernelPolicyAuthoritative
+	case len(exactCommRules) != 0:
+		kernelPolicy.Mode = pmark.KernelPolicyPositiveOnly
+	default:
+		kernelPolicy.Mode = pmark.KernelPolicyUserspaceOnly
+	}
+	return defaultTunPmarkConfig{
+		ruleIDs:      ids,
+		check:        check,
+		kernelPolicy: kernelPolicy,
+	}, nil
 }
 
 func (s *System) updateKillswitch(

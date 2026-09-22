@@ -24,6 +24,7 @@ import (
 	"github.com/asciimoth/gonnect/sysnet"
 	gtun "github.com/asciimoth/gonnect/tun"
 	pmark "github.com/asciimoth/p-mark"
+	"github.com/asciimoth/p-mark/fwmark"
 	"github.com/asciimoth/p-mark/multirule"
 	linuxconnmark "github.com/asciimoth/sysnet-linux/connmark"
 	linuxdns "github.com/asciimoth/sysnet-linux/dns"
@@ -811,7 +812,7 @@ func TestBuildDefaultTunAppliesSideEffectsAndCloseRollsBack(t *testing.T) {
 		TunAddrs:  []string{"10.55.0.1/32"},
 		TunRoutes: []string{"0.0.0.0/0"},
 		DnsIP:     "10.55.0.1",
-		Exclude:   []sysnet.Rule{{Type: "pid", Rule: "7"}},
+		Exclude:   []sysnet.Rule{{Type: "comm", Rule: "^curl$"}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -839,11 +840,24 @@ func TestBuildDefaultTunAppliesSideEffectsAndCloseRollsBack(t *testing.T) {
 			wantMarks,
 		)
 	}
-	if pmarkCtl.setChecker == 0 || pmarkCtl.force == 0 {
+	if pmarkCtl.setKernelPolicyCalls != 1 ||
+		pmarkCtl.setChecker != 0 ||
+		pmarkCtl.force == 0 {
 		t.Fatalf(
-			"pmark calls set=%d force=%d, want both",
+			"pmark calls policy=%d checker=%d force=%d, want 1, 0, and nonzero",
+			pmarkCtl.setKernelPolicyCalls,
 			pmarkCtl.setChecker,
 			pmarkCtl.force,
+		)
+	}
+	if pmarkCtl.policy.Mode != pmark.KernelPolicyAuthoritative ||
+		len(pmarkCtl.policy.CommRules) != 1 ||
+		pmarkCtl.policy.CommRules[0].Comm != "curl" ||
+		pmarkCtl.policy.CommRules[0].Mark != fwmark.ToMark(defaultUserMark) {
+		t.Fatalf(
+			"pmark kernel policy = %+v, want authoritative curl rule for mark %#x",
+			pmarkCtl.policy,
+			fwmark.ToMark(defaultUserMark),
 		)
 	}
 	if ks.created == 0 {
@@ -870,6 +884,108 @@ func TestBuildDefaultTunAppliesSideEffectsAndCloseRollsBack(t *testing.T) {
 	}
 	if ks.deleted == 0 {
 		t.Fatal("DefaultTun.Close did not delete killswitch ruleset")
+	}
+	if pmarkCtl.setChecker != 1 {
+		t.Fatalf(
+			"pmark checker reset calls = %d, want 1",
+			pmarkCtl.setChecker,
+		)
+	}
+}
+
+func TestDefaultTunCheckerSelectsKernelPolicyMode(t *testing.T) {
+	tests := []struct {
+		name      string
+		rules     []sysnet.Rule
+		wantMode  pmark.KernelPolicyMode
+		wantComms []string
+	}{
+		{
+			name: "exact comm only",
+			rules: []sysnet.Rule{
+				{Type: "comm", Rule: "^curl$"},
+			},
+			wantMode:  pmark.KernelPolicyAuthoritative,
+			wantComms: []string{"curl"},
+		},
+		{
+			name: "exact comm with userspace fallback",
+			rules: []sysnet.Rule{
+				{Type: "comm", Rule: "^curl$"},
+				{Type: "cmd", Rule: "--proxy"},
+			},
+			wantMode:  pmark.KernelPolicyPositiveOnly,
+			wantComms: []string{"curl"},
+		},
+		{
+			name: "non-exact comm",
+			rules: []sysnet.Rule{
+				{Type: "comm", Rule: "^curl-[0-9]+$"},
+			},
+			wantMode: pmark.KernelPolicyUserspaceOnly,
+		},
+		{
+			name: "userspace rule only",
+			rules: []sysnet.Rule{
+				{Type: "pid", Rule: "7"},
+			},
+			wantMode: pmark.KernelPolicyUserspaceOnly,
+		},
+		{
+			name:     "no process rules",
+			wantMode: pmark.KernelPolicyAuthoritative,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tracker := multirule.New()
+			system := &System{
+				ruleTracker:   tracker,
+				pmarkPriority: 7,
+				userMark:      0x12345678,
+			}
+			config, err := system.defaultTunChecker(sysnet.DefaultTunOpts{
+				Exclude: tc.rules,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				for _, id := range config.ruleIDs {
+					tracker.UnregisterRule(id)
+				}
+			}()
+
+			if config.kernelPolicy.Mode != tc.wantMode {
+				t.Fatalf(
+					"kernel policy mode = %s, want %s",
+					config.kernelPolicy.Mode,
+					tc.wantMode,
+				)
+			}
+			if len(config.kernelPolicy.CommRules) != len(tc.wantComms) {
+				t.Fatalf(
+					"kernel comm rules = %+v, want comms %v",
+					config.kernelPolicy.CommRules,
+					tc.wantComms,
+				)
+			}
+			for index, wantComm := range tc.wantComms {
+				rule := config.kernelPolicy.CommRules[index]
+				if rule.Comm != wantComm ||
+					rule.Priority != 7 ||
+					rule.Mark != fwmark.ToMark(0x12345678) {
+					t.Fatalf(
+						"kernel comm rule %d = %+v, want comm=%q priority=7 mark=%#x",
+						index,
+						rule,
+						wantComm,
+						fwmark.ToMark(0x12345678),
+					)
+				}
+			}
+		})
 	}
 }
 
@@ -1589,15 +1705,26 @@ func (f *fakeConnmark) Close() error {
 }
 
 type fakePmark struct {
-	setChecker int
-	force      int
-	check      pmark.CheckFunc
+	setChecker           int
+	setKernelPolicyCalls int
+	force                int
+	check                pmark.CheckFunc
+	policy               pmark.KernelPolicy
 }
 
 func (f *fakePmark) SetChecker(check pmark.CheckFunc) (uint64, error) {
 	f.setChecker++
 	f.check = check
 	return uint64(f.setChecker), nil
+}
+func (f *fakePmark) SetKernelPolicy(
+	policy pmark.KernelPolicy,
+	check pmark.CheckFunc,
+) (uint64, error) {
+	f.setKernelPolicyCalls++
+	f.policy = policy
+	f.check = check
+	return uint64(f.setKernelPolicyCalls), nil
 }
 func (f *fakePmark) ForceProcessTraversal() error {
 	f.force++

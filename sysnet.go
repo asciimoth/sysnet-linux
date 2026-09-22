@@ -94,6 +94,13 @@ type PmarkController interface {
 	ForceProcessTraversal() error
 }
 
+// pmarkKernelPolicyController is implemented by p-mark versions that can apply
+// exact comm rules synchronously in the exec tracepoint. Keep this extension
+// separate from PmarkController so older custom controllers continue to work.
+type pmarkKernelPolicyController interface {
+	SetKernelPolicy(pmark.KernelPolicy, pmark.CheckFunc) (uint64, error)
+}
+
 // KillswitchClient is the killswitch temporary-ruleset surface used by System.
 type KillswitchClient interface {
 	CreateTMPRuleset(killswitch.AllowRules) (uint64, error)

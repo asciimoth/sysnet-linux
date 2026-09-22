@@ -32,9 +32,10 @@ for case_name in "${cases[@]}"; do
 		.
 
 	echo "running system e2e: $case_name"
+	# p-mark tracepoints and /proc must expose the same host process IDs.
 	if [[ "$case_name" == "systemd-resolved" ]]; then
-		docker run --rm --privileged "$image" systemd-resolved
+		docker run --rm --privileged --pid=host "$image" systemd-resolved
 	else
-		docker run --rm --privileged "$image"
+		docker run --rm --privileged --pid=host "$image"
 	fi
 done

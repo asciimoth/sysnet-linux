@@ -59,6 +59,7 @@ const (
 
 	userMark                     = 0x4d000001
 	sourceRouteRebuildIterations = 32
+	pmarkVTunCurlIterations      = 64
 
 	socketProbeMode  = "socket-probe"
 	rpfHTTPServeMode = "rpfilter-http-server"
@@ -3540,7 +3541,10 @@ func checkFullPmarkEBPFSetup() error {
 	if err := checkPmarkEBPFSocketProbe(harness.system); err != nil {
 		return err
 	}
-	if err := checkPmarkEBPFVTunCurl(harness.system); err != nil {
+	if err := checkPmarkEBPFVTunCurl(
+		harness.system,
+		harness.daemon,
+	); err != nil {
 		return err
 	}
 	return nil
@@ -3641,6 +3645,7 @@ func checkAutoNewPmarkSocketProbeSetup() error {
 
 type pmarkEBPFHarness struct {
 	system  *linux.System
+	daemon  *pmark.Daemon
 	cleanup func()
 }
 
@@ -3707,7 +3712,11 @@ func newPmarkEBPFHarness() (*pmarkEBPFHarness, error) {
 	}
 	cleanups = append(cleanups, func() { _ = system.Close() })
 
-	return &pmarkEBPFHarness{system: system, cleanup: cleanup}, nil
+	return &pmarkEBPFHarness{
+		system:  system,
+		daemon:  daemon,
+		cleanup: cleanup,
+	}, nil
 }
 
 func checkPmarkEBPFSocketProbe(system *linux.System) error {
@@ -3766,7 +3775,10 @@ func checkPmarkEBPFSocketProbe(system *linux.System) error {
 	return nil
 }
 
-func checkPmarkEBPFVTunCurl(system *linux.System) error {
+func checkPmarkEBPFVTunCurl(
+	system *linux.System,
+	daemon *pmark.Daemon,
+) error {
 	dt, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{
 		TunAddrs: []string{dnsIP + "/32"},
 		DnsIP:    dnsIP,
@@ -3780,6 +3792,14 @@ func checkPmarkEBPFVTunCurl(system *linux.System) error {
 		return fmt.Errorf("build curl pmark eBPF DefaultTun: %w", err)
 	}
 	defer func() { _ = dt.Close() }()
+	policy := daemon.KernelPolicyState()
+	if policy.Mode != pmark.KernelPolicyAuthoritative ||
+		policy.RuleCount != 1 {
+		return fmt.Errorf(
+			"curl pmark kernel policy = %+v, want authoritative policy with one rule",
+			policy,
+		)
+	}
 
 	tunName, err := dt.Name()
 	if err != nil {
@@ -3808,32 +3828,38 @@ func checkPmarkEBPFVTunCurl(system *linux.System) error {
 	}
 	defer stopService()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	output, err := commandOutputContext(
-		ctx,
-		"curl",
-		"--fail",
-		"--silent",
-		"--show-error",
-		"--max-time",
-		"5",
-		serviceURL,
-	)
-	if err != nil {
-		return fmt.Errorf(
-			"curl vtun service %s output %q: %w",
+	for iteration := range pmarkVTunCurlIterations {
+		output, err := commandOutputContext(
+			ctx,
+			"curl",
+			"--fail",
+			"--silent",
+			"--show-error",
+			"--max-time",
+			"5",
 			serviceURL,
-			output,
-			err,
 		)
-	}
-	if strings.TrimSpace(output) != "sysnet vtun ok" {
-		return fmt.Errorf(
-			"curl vtun service response = %q, want %q",
-			output,
-			"sysnet vtun ok",
-		)
+		if err != nil {
+			return fmt.Errorf(
+				"curl vtun service iteration %d/%d %s output %q: %w",
+				iteration+1,
+				pmarkVTunCurlIterations,
+				serviceURL,
+				output,
+				err,
+			)
+		}
+		if strings.TrimSpace(output) != "sysnet vtun ok" {
+			return fmt.Errorf(
+				"curl vtun service iteration %d/%d response = %q, want %q",
+				iteration+1,
+				pmarkVTunCurlIterations,
+				output,
+				"sysnet vtun ok",
+			)
+		}
 	}
 	return nil
 }
