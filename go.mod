@@ -4,7 +4,7 @@ go 1.25.5
 
 require (
 	github.com/asciimoth/gonnect v0.54.0
-	github.com/asciimoth/gonnect-netstack v0.7.2
+	github.com/asciimoth/gonnect-netstack v0.8.0
 	github.com/asciimoth/p-mark v0.4.0
 	github.com/asciimoth/tuntap v0.4.2
 	github.com/godbus/dbus/v5 v5.2.2
