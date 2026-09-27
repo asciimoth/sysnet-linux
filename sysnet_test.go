@@ -74,16 +74,44 @@ func TestNewAutoBuildsAvailableComponents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	features := s.Features()
-	if !features.Tun || !features.DefaultTun || !features.DynTun ||
-		!features.DynDefaultTun || !features.TunNames || !features.StrictMode ||
-		!features.DefaultTunSourceRoutes {
-		t.Fatalf("Features() = %+v, want native feature set", features)
+	report := s.Capabilities()
+	if err := report.Validate(); err != nil {
+		t.Fatalf("Capabilities() is invalid: %v", err)
 	}
-	rules := s.ListRules()
-	if len(rules.TunRules) != len(supportedRules) ||
-		len(rules.MatcherRules) != len(supportedRules) {
-		t.Fatalf("ListRules() = %+v, want all rule contexts", rules)
+	for _, key := range []sysnet.OperationKey{
+		{Target: sysnet.TargetTun, Operation: sysnet.OpCreate, Family: sysnet.FamilyIPv4},
+		{Target: sysnet.TargetTun, Operation: sysnet.OpCreateNamed, Family: sysnet.FamilyIPv4},
+		{Target: sysnet.TargetTun, Operation: sysnet.OpSetMTU, Family: sysnet.FamilyNone},
+		{Target: sysnet.TargetDefaultTun, Operation: sysnet.OpCreate, Family: sysnet.FamilyIPv4},
+		{Target: sysnet.TargetDefaultTun, Operation: sysnet.OpSetMTU, Family: sysnet.FamilyNone},
+		{Target: sysnet.TargetDefaultTun, Operation: sysnet.OpSourceRoutes, Family: sysnet.FamilyIPv4},
+	} {
+		if got := report.Operation(
+			key,
+		).State; got != sysnet.CapabilityAvailable {
+			t.Fatalf("operation %+v state = %v, want available", key, got)
+		}
+	}
+	profile := report.DefaultTunProfile(sysnet.RoutingProfileKey{
+		Family: sysnet.FamilyIPv4,
+		Mode:   sysnet.RoutingExclude,
+		Strict: true,
+	})
+	if profile.State != sysnet.CapabilityAvailable ||
+		len(profile.Rules) != len(supportedRules) {
+		t.Fatalf(
+			"strict exclude profile = %+v, want all routing rules",
+			profile,
+		)
+	}
+	for _, rule := range report.Rules {
+		if len(rule.Matchers) != 4 {
+			t.Fatalf(
+				"rule %q matcher profiles = %d, want 4",
+				rule.Type,
+				len(rule.Matchers),
+			)
+		}
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
@@ -197,33 +225,58 @@ func TestNewAutoDegradesUnavailableComponents(t *testing.T) {
 	}
 	defer s.Close()
 
-	features := s.Features()
-	if features.Tun || features.DefaultTun || features.DynTun ||
-		features.DynDefaultTun || features.TunNames || features.StrictMode ||
-		features.DefaultTunSourceRoutes {
+	report := s.Capabilities()
+	create := report.Operation(sysnet.OperationKey{
+		Target: sysnet.TargetTun, Operation: sysnet.OpCreate, Family: sysnet.FamilyNone,
+	})
+	if create.State != sysnet.CapabilityUnavailable ||
+		!slices.Equal(
+			create.Reasons,
+			[]sysnet.CapabilityReason{sysnet.ReasonPermissionDenied},
+		) {
 		t.Fatalf(
-			"Features() = %+v, want TUN/routing features disabled",
-			features,
+			"TUN create capability = %+v, want unavailable permission_denied",
+			create,
 		)
 	}
-	if err := s.VerifyTunOpts(
-		sysnet.TunOpts{},
-	); !errors.Is(
+	if err := s.CheckTunOpts(sysnet.TunOpts{}).Err(); !errors.Is(
 		err,
-		sysnet.ErrNotSupported,
+		sysnet.ErrUnavailable,
 	) {
-		t.Fatalf("VerifyTunOpts error = %v, want ErrNotSupported", err)
+		t.Fatalf("CheckTunOpts error = %v, want ErrUnavailable", err)
 	}
-	rules := s.ListRules()
-	if len(rules.TunRules) != 0 {
-		t.Fatalf("TunRules len = %d, want 0", len(rules.TunRules))
-	}
-	if len(rules.MatcherRules) != len(supportedRules) {
+	profile := report.DefaultTunProfile(sysnet.RoutingProfileKey{
+		Family: sysnet.FamilyIPv4,
+		Mode:   sysnet.RoutingExclude,
+	})
+	if profile.State != sysnet.CapabilityUnavailable ||
+		!slices.Contains(profile.Reasons, sysnet.ReasonPermissionDenied) {
 		t.Fatalf(
-			"MatcherRules len = %d, want %d",
-			len(rules.MatcherRules),
-			len(supportedRules),
+			"exclude profile = %+v, want unavailable permission_denied",
+			profile,
 		)
+	}
+	outDNS := report.Operation(sysnet.OperationKey{
+		Target: sysnet.TargetOutDNS, Operation: sysnet.OpQueryUDP, Family: sysnet.FamilyIPv4,
+	})
+	if outDNS.State != sysnet.CapabilityUnavailable ||
+		!slices.Equal(
+			outDNS.Reasons,
+			[]sysnet.CapabilityReason{sysnet.ReasonProbeFailed},
+		) {
+		t.Fatalf(
+			"out-DNS capability = %+v, want unavailable probe_failed",
+			outDNS,
+		)
+	}
+	for _, rule := range report.Rules {
+		if rule.Matchers[0].State != sysnet.CapabilityAvailable {
+			t.Fatalf(
+				"matcher rule %q is unavailable: %+v",
+				rule.Type,
+				rule.Matchers[0],
+			)
+		}
 	}
 	if s.dnsProvider != nil || s.routingManager != nil || s.killswitch == nil ||
 		s.pmark != nil {
@@ -265,28 +318,34 @@ func TestFeaturesAndRulesDegradeWithDependencies(t *testing.T) {
 	}
 	defer s.Close()
 
-	features := s.Features()
-	if !features.Tun || !features.DefaultTun || !features.DynTun ||
-		!features.StrictMode || !features.DefaultTunSourceRoutes {
+	report := s.Capabilities()
+	full := report.DefaultTunProfile(sysnet.RoutingProfileKey{
+		Family: sysnet.FamilyIPv4,
+		Mode:   sysnet.RoutingFull,
+	})
+	if full.State != sysnet.CapabilityAvailable {
+		t.Fatalf("full profile = %+v, want available", full)
+	}
+	profile := report.DefaultTunProfile(sysnet.RoutingProfileKey{
+		Family: sysnet.FamilyIPv4,
+		Mode:   sysnet.RoutingExclude,
+		Strict: true,
+	})
+	if profile.State != sysnet.CapabilityAvailable ||
+		len(profile.Rules) != len(supportedRules) {
 		t.Fatalf(
-			"Features() = %+v, want tun/default/dyn/strict support",
-			features,
+			"strict exclude profile = %+v, want all rules available",
+			profile,
 		)
 	}
-	rules := s.ListRules()
-	if len(rules.TunRules) != len(supportedRules) {
-		t.Fatalf(
-			"TunRules len = %d, want %d",
-			len(rules.TunRules),
-			len(supportedRules),
-		)
-	}
-	if len(rules.MatcherRules) != len(supportedRules) {
-		t.Fatalf(
-			"MatcherRules len = %d, want %d",
-			len(rules.MatcherRules),
-			len(supportedRules),
-		)
+	for _, rule := range report.Rules {
+		if rule.Matchers[0].State != sysnet.CapabilityAvailable {
+			t.Fatalf(
+				"matcher rule %q is unavailable: %+v",
+				rule.Type,
+				rule.Matchers[0],
+			)
+		}
 	}
 }
 
@@ -316,30 +375,50 @@ func TestTunRulesRequirePmarkFeatureEnabled(t *testing.T) {
 	}
 	defer s.Close()
 
-	rules := s.ListRules()
-	if len(rules.TunRules) != 0 {
-		t.Fatalf("TunRules len = %d, want 0", len(rules.TunRules))
+	report := s.Capabilities()
+	full := report.DefaultTunProfile(sysnet.RoutingProfileKey{
+		Family: sysnet.FamilyIPv4,
+		Mode:   sysnet.RoutingFull,
+	})
+	if full.State != sysnet.CapabilityAvailable {
+		t.Fatalf("full profile = %+v, want available without p-mark", full)
 	}
-	if len(rules.MatcherRules) != len(supportedRules) {
+	profile := report.DefaultTunProfile(sysnet.RoutingProfileKey{
+		Family: sysnet.FamilyIPv4,
+		Mode:   sysnet.RoutingExclude,
+	})
+	if profile.State != sysnet.CapabilityUnavailable ||
+		!slices.Equal(
+			profile.Reasons,
+			[]sysnet.CapabilityReason{sysnet.ReasonMissingDependency},
+		) {
 		t.Fatalf(
-			"MatcherRules len = %d, want %d",
-			len(rules.MatcherRules),
-			len(supportedRules),
+			"exclude profile = %+v, want unavailable missing_dependency",
+			profile,
 		)
 	}
-	err = s.VerifyDefaultTunOpts(sysnet.DefaultTunOpts{
+	if matcher := report.Rules[0].Matchers[0]; matcher.State != sysnet.CapabilityAvailable {
+		t.Fatalf("matcher = %+v, want available without p-mark", matcher)
+	}
+	err = s.CheckDefaultTunOpts(sysnet.DefaultTunOpts{
 		TunAddrs:  []string{"10.55.0.1/32"},
 		TunRoutes: []string{"0.0.0.0/0"},
 		DnsIP:     "10.55.0.1",
 		Exclude:   []sysnet.Rule{{Type: "pid", Rule: "7"}},
-	})
-	if !errors.Is(err, sysnet.ErrNotSupported) {
-		t.Fatalf("VerifyDefaultTunOpts error = %v, want ErrNotSupported", err)
+	}).Err()
+	if !errors.Is(err, sysnet.ErrUnavailable) {
+		t.Fatalf("CheckDefaultTunOpts error = %v, want ErrUnavailable", err)
 	}
 }
 
-func TestRuleVerifyCoversSharedContract(t *testing.T) {
-	s, err := NewSystem(Config{})
+func TestCheckRuleCoversSharedContract(t *testing.T) {
+	s, err := NewSystem(Config{
+		Features:    FeatureConfig{MatcherRules: true},
+		RuleTracker: multirule.New(),
+		OwnerLookup: func(sockowner.FlowTuple) (*sockowner.SocketOwner, error) {
+			return &sockowner.SocketOwner{}, nil
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,14 +442,27 @@ func TestRuleVerifyCoversSharedContract(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := s.RuleVerify(tc.rule); got != tc.want {
-				t.Fatalf("RuleVerify(%+v) = %v, want %v", tc.rule, got, tc.want)
+			key := sysnet.MatcherProfileKey{
+				Family: sysnet.FamilyIPv4, Transport: sysnet.TransportTCP,
+			}
+			err := s.CheckRule(
+				tc.rule,
+				sysnet.RuleContext{Matcher: &key},
+			).Err()
+			if got := err == nil; got != tc.want {
+				t.Fatalf(
+					"CheckRule(%+v) error = %v, valid=%v want %v",
+					tc.rule,
+					err,
+					got,
+					tc.want,
+				)
 			}
 		})
 	}
 }
 
-func TestRuleComplAccounts(t *testing.T) {
+func TestCompleteRuleAccounts(t *testing.T) {
 	passwd := filepath.Join(t.TempDir(), "passwd")
 	if err := os.WriteFile(
 		passwd,
@@ -427,7 +519,7 @@ apps:x:1000:alex
 	}
 }
 
-func TestRuleComplExecPath(t *testing.T) {
+func TestCompleteRuleExecPath(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{"bash", "batch", "cat"} {
 		if err := os.WriteFile(
@@ -455,7 +547,7 @@ func TestRuleComplExecPath(t *testing.T) {
 	}
 }
 
-func TestRuleComplExecPathIsCapped(t *testing.T) {
+func TestCompleteRuleExecPathIsCapped(t *testing.T) {
 	dir := t.TempDir()
 	for i := range 12 {
 		name := "tool" + strconv.Itoa(i)
@@ -485,17 +577,30 @@ func TestRuleComplExecPathIsCapped(t *testing.T) {
 	}
 }
 
-func TestRuleComplErrorsReturnNil(t *testing.T) {
-	s, err := NewSystem(Config{})
+func TestCompleteRuleReturnsCompletionErrors(t *testing.T) {
+	s, err := NewSystem(Config{
+		Features:    FeatureConfig{MatcherRules: true},
+		RuleTracker: multirule.New(),
+		OwnerLookup: func(sockowner.FlowTuple) (*sockowner.SocketOwner, error) {
+			return &sockowner.SocketOwner{}, nil
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := s.RuleCompl(sysnet.Rule{
+	key := sysnet.MatcherProfileKey{
+		Family: sysnet.FamilyIPv4, Transport: sysnet.TransportTCP,
+	}
+	got, err := s.CompleteRule(sysnet.Rule{
 		Type: "exec",
 		Rule: filepath.Join(t.TempDir(), "missing", "ba"),
-	})
-	if got != nil {
-		t.Fatalf("RuleCompl missing dir = %#v, want nil", got)
+	}, sysnet.RuleContext{Matcher: &key})
+	if err == nil || got != nil {
+		t.Fatalf(
+			"CompleteRule missing dir = (%#v, %v), want nil and error",
+			got,
+			err,
+		)
 	}
 }
 
@@ -540,7 +645,11 @@ func TestBuildTunConfiguresAndChecksOwnership(t *testing.T) {
 	cfg := &fakeTunConfig{}
 	factory := &fakeTUNFactory{}
 	s, err := NewSystem(Config{
-		Features:   FeatureConfig{Tun: true},
+		Features: FeatureConfig{
+			Tun:      true,
+			DynTun:   true,
+			TunNames: true,
+		},
 		TUNFactory: factory,
 		TunConfig:  cfg,
 	})
@@ -558,21 +667,18 @@ func TestBuildTunConfiguresAndChecksOwnership(t *testing.T) {
 	if len(factory.created) != 1 {
 		t.Fatalf("created TUNs = %d, want 1", len(factory.created))
 	}
-	if got := cfg.addrs[tun][0]; got != "10.0.0.2/32" {
+	native := factory.created[0]
+	if got := cfg.addrs[native][0]; got != "10.0.0.2/32" {
 		t.Fatalf("configured addr = %q, want 10.0.0.2/32", got)
 	}
-	if got := cfg.routes[tun][0]; got != "0.0.0.0/0" {
+	if got := cfg.routes[native][0]; got != "0.0.0.0/0" {
 		t.Fatalf("configured route = %q, want 0.0.0.0/0", got)
 	}
-	names, err := s.SetTunName(tun, "renamed0")
-	if err != nil {
+	if err := s.SetTunName(tun, "renamed0"); err != nil {
 		t.Fatalf("SetTunName error = %v", err)
 	}
-	if got := cfg.names[tun]; got != "renamed0" {
+	if got := cfg.names[native]; got != "renamed0" {
 		t.Fatalf("configured name = %q, want renamed0", got)
-	}
-	if len(names) != 1 || names[0] != "renamed0" {
-		t.Fatalf("SetTunName = %v, want [renamed0]", names)
 	}
 	if err := s.SetTunMTU(
 		&fakeTun{},
@@ -583,7 +689,7 @@ func TestBuildTunConfiguresAndChecksOwnership(t *testing.T) {
 	) {
 		t.Fatalf("SetTunMTU(unknown) = %v, want ErrUnknownTun", err)
 	}
-	if _, err := s.SetTunName(
+	if err := s.SetTunName(
 		&fakeTun{},
 		"unknown0",
 	); !errors.Is(
@@ -869,7 +975,9 @@ func TestBuildDefaultTunAppliesSideEffectsAndCloseRollsBack(t *testing.T) {
 			packetListen.addr,
 		)
 	}
-	dt.SetDns(dnsProvider)
+	if err := dt.SetDNS(dnsProvider); err != nil {
+		t.Fatal(err)
+	}
 	if err := dt.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1265,7 +1373,9 @@ func TestBuildDefaultTunRecreatesMissingLinkAndUpdatesInterfaceIndex(
 			routingManager.applied,
 		)
 	}
-	first.SetDns(dnsProvider)
+	if err := first.SetDNS(dnsProvider); err != nil {
+		t.Fatal(err)
+	}
 	if err := second.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1371,7 +1481,9 @@ func TestBuildDefaultTunRebindsDNSListenerOnDNSIPChange(t *testing.T) {
 	if dnsProvider.setDNS != netip.MustParseAddr("10.55.0.2") {
 		t.Fatalf("SetDNS = %v, want 10.55.0.2", dnsProvider.setDNS)
 	}
-	first.SetDns(dnsProvider)
+	if err := first.SetDNS(dnsProvider); err != nil {
+		t.Fatal(err)
+	}
 	if err := second.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1511,7 +1623,7 @@ type fakeTUNFactory struct {
 }
 
 func (f *fakeTUNFactory) CreateTUN(name string, mtu int) (gtun.Tun, error) {
-	t := &fakeTun{events: make(chan gtun.Event)}
+	t := &fakeTun{name: name, events: make(chan gtun.Event)}
 	f.created = append(f.created, t)
 	f.names = append(f.names, name)
 	f.mtus = append(f.mtus, mtu)
@@ -1520,6 +1632,7 @@ func (f *fakeTUNFactory) CreateTUN(name string, mtu int) (gtun.Tun, error) {
 
 type fakeTun struct {
 	closed bool
+	name   string
 	events chan gtun.Event
 }
 
@@ -1532,7 +1645,7 @@ func (f *fakeTun) Write([][]byte, int) (int, error) { return 0, net.ErrClosed }
 func (f *fakeTun) MWO() int                         { return 0 }
 func (f *fakeTun) MRO() int                         { return 0 }
 func (f *fakeTun) MTU() (int, error)                { return 1500, nil }
-func (f *fakeTun) Name() (string, error)            { return "fake0", nil }
+func (f *fakeTun) Name() (string, error)            { return f.name, nil }
 func (f *fakeTun) Events() <-chan gtun.Event        { return f.events }
 func (f *fakeTun) Close() error {
 	if !f.closed {
@@ -1587,14 +1700,17 @@ func (f *fakeTunConfig) AddTunRoute(t gtun.Tun, route string) error {
 	f.routes[t] = append(f.routes[t], route)
 	return nil
 }
-func (f *fakeTunConfig) GetTunRotue(t gtun.Tun) ([]string, error) {
+func (f *fakeTunConfig) GetTunRoutes(t gtun.Tun) ([]string, error) {
 	f.init()
 	return append([]string(nil), f.routes[t]...), nil
 }
-func (f *fakeTunConfig) SetTunName(t gtun.Tun, name string) ([]string, error) {
+func (f *fakeTunConfig) SetTunName(t gtun.Tun, name string) error {
 	f.init()
 	f.names[t] = name
-	return []string{name}, nil
+	if fake, ok := t.(*fakeTun); ok {
+		fake.name = name
+	}
+	return nil
 }
 
 type fakeDNSProvider struct {

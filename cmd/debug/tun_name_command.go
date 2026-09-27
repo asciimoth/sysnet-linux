@@ -103,7 +103,7 @@ func runTUNNameCommand(args []string) int {
 		fmt.Fprintf(os.Stderr, "get addrs: %v\n", err)
 		return 1
 	}
-	finalRoutes, err := systun.GetTunRotue(tun)
+	finalRoutes, err := systun.GetTunRoutes(tun)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "get routes: %v\n", err)
 		return 1

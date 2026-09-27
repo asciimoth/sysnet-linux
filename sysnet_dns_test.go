@@ -602,14 +602,10 @@ func assertResolverNetwork(t *testing.T, network gonnect.Network) {
 			network,
 		)
 	}
-	if _, ok := wrapper.GetNetwork().(*gonnect.NativeNetwork); !ok {
-		t.Fatalf(
-			"wrapped network type = %T, want *gonnect.NativeNetwork",
-			wrapper.GetNetwork(),
+	if wrapper.IsNative() || wrapper.GetNetwork().IsNative() {
+		t.Fatal(
+			"policy network reports native access and can bypass socket marks",
 		)
-	}
-	if !wrapper.IsNative() {
-		t.Fatal("resolver wrapper did not preserve native network status")
 	}
 }
 

@@ -232,7 +232,7 @@ func checkTunDefaultRoutes() error {
 }
 
 func expectTunRoute(t gtun.Tun, prefix, operation string) error {
-	routes, err := linuxtun.GetTunRotue(t)
+	routes, err := linuxtun.GetTunRoutes(t)
 	if err != nil {
 		return fmt.Errorf("get TUN routes after %s: %w", operation, err)
 	}
@@ -271,6 +271,7 @@ func newSystem(pmarkCtl linux.PmarkController) (*linux.System, error) {
 			DefaultTun:    true,
 			DynTun:        true,
 			DynDefaultTun: true,
+			TunNames:      true,
 			StrictMode:    true,
 			TunRules:      true,
 			MatcherRules:  true,
@@ -383,6 +384,7 @@ func newResolvedSystem(pmarkCtl linux.PmarkController) (*linux.System, error) {
 			DefaultTun:    true,
 			DynTun:        true,
 			DynDefaultTun: true,
+			TunNames:      true,
 			StrictMode:    true,
 			TunRules:      true,
 			MatcherRules:  true,
@@ -631,8 +633,14 @@ func checkAutoNewTUNProbeRetry() error {
 	}
 	defer func() { _ = system.Close() }()
 
-	if !system.Features().Tun {
-		return errors.New("TUN disabled after transient probe failure")
+	create := system.Capabilities().Operation(sysnet.OperationKey{
+		Target: sysnet.TargetTun, Operation: sysnet.OpCreate, Family: sysnet.FamilyNone,
+	})
+	if create.State != sysnet.CapabilityAvailable {
+		return fmt.Errorf(
+			"TUN create capability = %+v after transient probe failure",
+			create,
+		)
 	}
 	interfaces, err := net.Interfaces()
 	if err != nil {
@@ -686,37 +694,61 @@ func checkAutoNewResolvedSystem() error {
 }
 
 func checkAutoNewNoPmarkFeatures(system *linux.System, label string) error {
-	features := system.Features()
-	if !features.Tun || !features.DefaultTun || !features.DynTun ||
-		!features.DynDefaultTun || !features.StrictMode {
+	report := system.Capabilities()
+	if err := report.Validate(); err != nil {
+		return fmt.Errorf("auto New %s capability report: %w", label, err)
+	}
+	for _, key := range []sysnet.OperationKey{
+		{Target: sysnet.TargetTun, Operation: sysnet.OpCreate, Family: sysnet.FamilyIPv4},
+		{Target: sysnet.TargetTun, Operation: sysnet.OpSetMTU, Family: sysnet.FamilyNone},
+		{Target: sysnet.TargetDefaultTun, Operation: sysnet.OpCreate, Family: sysnet.FamilyIPv4},
+		{Target: sysnet.TargetDefaultTun, Operation: sysnet.OpSetMTU, Family: sysnet.FamilyNone},
+	} {
+		if report.Operation(key).State != sysnet.CapabilityAvailable {
+			return fmt.Errorf(
+				"auto New %s operation %+v is unavailable",
+				label,
+				key,
+			)
+		}
+	}
+	fullStrict := report.DefaultTunProfile(sysnet.RoutingProfileKey{
+		Family: sysnet.FamilyIPv4, Mode: sysnet.RoutingFull, Strict: true,
+	})
+	if fullStrict.State != sysnet.CapabilityAvailable {
 		return fmt.Errorf(
-			"auto New %s features = %+v, want native TUN/DefaultTun support",
+			"auto New %s strict full profile = %+v, want available",
 			label,
-			features,
+			fullStrict,
 		)
 	}
-	rules := system.ListRules()
-	if len(rules.TunRules) != 0 {
+	exclude := report.DefaultTunProfile(sysnet.RoutingProfileKey{
+		Family: sysnet.FamilyIPv4, Mode: sysnet.RoutingExclude,
+	})
+	if exclude.State == sysnet.CapabilityAvailable {
 		return fmt.Errorf(
-			"auto New %s TunRules len = %d, want 0 without p-mark",
+			"auto New %s exclude profile = %+v, want unavailable without p-mark",
 			label,
-			len(rules.TunRules),
+			exclude,
 		)
 	}
-	if len(rules.MatcherRules) != 8 {
+	matcherKey := sysnet.MatcherProfileKey{
+		Family: sysnet.FamilyIPv4, Transport: sysnet.TransportTCP,
+	}
+	if countAvailableMatcherRules(report, matcherKey) != 8 {
 		return fmt.Errorf(
-			"auto New %s MatcherRules len = %d, want 8",
+			"auto New %s available matcher rules = %d, want 8",
 			label,
-			len(rules.MatcherRules),
+			countAvailableMatcherRules(report, matcherKey),
 		)
 	}
-	if err := system.VerifyDefaultTunOpts(sysnet.DefaultTunOpts{
+	if err := system.CheckDefaultTunOpts(sysnet.DefaultTunOpts{
 		TunAddrs: []string{dnsIP + "/32"},
 		DnsIP:    dnsIP,
 		Exclude:  []sysnet.Rule{{Type: "pid", Rule: strconv.Itoa(os.Getpid())}},
-	}); !errors.Is(err, sysnet.ErrNotSupported) {
+	}).Err(); !errors.Is(err, sysnet.ErrUnavailable) {
 		return fmt.Errorf(
-			"auto New %s VerifyDefaultTunOpts with rules = %v, want ErrNotSupported",
+			"auto New %s CheckDefaultTunOpts with rules = %v, want ErrUnavailable",
 			label,
 			err,
 		)
@@ -765,7 +797,11 @@ func checkAutoNewDefaultTunWithoutRules(
 	); err != nil {
 		return err
 	}
-	dt.SetDns(newStaticDNS(netip.MustParseAddr("203.0.113.111")))
+	if err := dt.SetDNS(
+		newStaticDNS(netip.MustParseAddr("203.0.113.111")),
+	); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := expectDNSA(
 		"auto New "+label+" attached DNS",
 		netip.MustParseAddr("203.0.113.111"),
@@ -810,7 +846,11 @@ func checkAutoNewResolvedDefaultTunWithoutRules(system *linux.System) error {
 	); err != nil {
 		return err
 	}
-	dt.SetDns(newStaticDNS(netip.MustParseAddr("203.0.113.122")))
+	if err := dt.SetDNS(
+		newStaticDNS(netip.MustParseAddr("203.0.113.122")),
+	); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
@@ -847,35 +887,42 @@ func checkDegradedSystem() error {
 	}
 	defer func() { _ = system.Close() }()
 
-	features := system.Features()
-	if !features.Tun {
-		return fmt.Errorf("degraded features = %+v, want Tun support", features)
-	}
-	if features.DefaultTun || features.StrictMode {
+	report := system.Capabilities()
+	regularCreate := report.Operation(sysnet.OperationKey{
+		Target: sysnet.TargetTun, Operation: sysnet.OpCreate, Family: sysnet.FamilyIPv4,
+	})
+	defaultCreate := report.Operation(sysnet.OperationKey{
+		Target: sysnet.TargetDefaultTun, Operation: sysnet.OpCreate, Family: sysnet.FamilyIPv4,
+	})
+	if regularCreate.State != sysnet.CapabilityAvailable ||
+		defaultCreate.State == sysnet.CapabilityAvailable {
 		return fmt.Errorf(
-			"degraded features = %+v, want no DefaultTun or StrictMode",
-			features,
+			"degraded create capabilities regular=%+v default=%+v",
+			regularCreate,
+			defaultCreate,
 		)
 	}
-	rules := system.ListRules()
-	if len(rules.TunRules) != 0 || len(rules.MatcherRules) != 0 {
-		return fmt.Errorf("degraded rules = %+v, want no rules", rules)
+	matcherKey := sysnet.MatcherProfileKey{
+		Family: sysnet.FamilyIPv4, Transport: sysnet.TransportTCP,
+	}
+	if countAvailableMatcherRules(report, matcherKey) != 0 {
+		return fmt.Errorf("degraded report unexpectedly advertises matchers")
 	}
 	if _, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{}); !errors.Is(
 		err,
-		sysnet.ErrNotSupported,
+		sysnet.ErrUnavailable,
 	) {
 		return fmt.Errorf(
-			"degraded BuildDefaultTun error = %v, want ErrNotSupported",
+			"degraded BuildDefaultTun error = %v, want ErrUnavailable",
 			err,
 		)
 	}
 	if _, err := system.BuildMatcher(sysnet.Rule{
 		Type: "pid",
 		Rule: strconv.Itoa(os.Getpid()),
-	}); !errors.Is(err, sysnet.ErrNotSupported) {
+	}); !errors.Is(err, sysnet.ErrUnavailable) {
 		return fmt.Errorf(
-			"degraded BuildMatcher error = %v, want ErrNotSupported",
+			"degraded BuildMatcher error = %v, want ErrUnavailable",
 			err,
 		)
 	}
@@ -895,24 +942,23 @@ func checkMatcherOnlySystem() error {
 	}
 	defer func() { _ = system.Close() }()
 
-	features := system.Features()
-	if features.Tun || features.DefaultTun || features.StrictMode {
+	report := system.Capabilities()
+	matcherKey := sysnet.MatcherProfileKey{
+		Family: sysnet.FamilyIPv4, Transport: sysnet.TransportTCP,
+	}
+	if countAvailableMatcherRules(report, matcherKey) != 8 {
 		return fmt.Errorf(
-			"matcher-only features = %+v, want no TUN/DefaultTun/StrictMode",
-			features,
+			"matcher-only available rules = %d, want 8",
+			countAvailableMatcherRules(report, matcherKey),
 		)
 	}
-	rules := system.ListRules()
-	if len(rules.MatcherRules) != 8 {
+	exclude := report.DefaultTunProfile(sysnet.RoutingProfileKey{
+		Family: sysnet.FamilyIPv4, Mode: sysnet.RoutingExclude,
+	})
+	if exclude.State == sysnet.CapabilityAvailable {
 		return fmt.Errorf(
-			"matcher-only MatcherRules len = %d, want 8",
-			len(rules.MatcherRules),
-		)
-	}
-	if len(rules.TunRules) != 0 {
-		return fmt.Errorf(
-			"matcher-only TunRules len = %d, want 0 without pmark",
-			len(rules.TunRules),
+			"matcher-only exclude profile = %+v, want unavailable",
+			exclude,
 		)
 	}
 	matcher, err := system.BuildMatcher(sysnet.Rule{
@@ -929,28 +975,36 @@ func checkMatcherOnlySystem() error {
 }
 
 func checkFeaturesAndRules(system *linux.System) error {
-	features := system.Features()
-	if !features.Tun || !features.DefaultTun || !features.StrictMode ||
-		!features.DefaultTunSourceRoutes {
+	report := system.Capabilities()
+	if report.Operation(sysnet.OperationKey{
+		Target: sysnet.TargetTun, Operation: sysnet.OpCreate, Family: sysnet.FamilyIPv4,
+	}).State != sysnet.CapabilityAvailable || report.Operation(sysnet.OperationKey{
+		Target: sysnet.TargetDefaultTun, Operation: sysnet.OpSourceRoutes, Family: sysnet.FamilyIPv4,
+	}).State != sysnet.CapabilityAvailable {
+		return fmt.Errorf("required TUN operations are unavailable")
+	}
+	profileKey := sysnet.RoutingProfileKey{
+		Family: sysnet.FamilyIPv4, Mode: sysnet.RoutingExclude, Strict: true,
+	}
+	profile := report.DefaultTunProfile(profileKey)
+	if profile.State != sysnet.CapabilityAvailable ||
+		countAvailableRuleBindings(profile) != 8 {
+		return fmt.Errorf("strict exclude profile = %+v, want 8 rules", profile)
+	}
+	matcherKey := sysnet.MatcherProfileKey{
+		Family: sysnet.FamilyIPv4, Transport: sysnet.TransportTCP,
+	}
+	if countAvailableMatcherRules(report, matcherKey) != 8 {
 		return fmt.Errorf(
-			"features = %+v, want TUN, DefaultTun, StrictMode, source routes",
-			features,
+			"available matcher rules = %d, want 8",
+			countAvailableMatcherRules(report, matcherKey),
 		)
 	}
-	rules := system.ListRules()
-	if len(rules.TunRules) != 8 {
-		return fmt.Errorf("TunRules len = %d, want 8", len(rules.TunRules))
-	}
-	if len(rules.MatcherRules) != 8 {
-		return fmt.Errorf(
-			"MatcherRules len = %d, want 8",
-			len(rules.MatcherRules),
-		)
-	}
-	if !system.RuleVerify(
+	if err := system.CheckRule(
 		sysnet.Rule{Type: "pid", Rule: strconv.Itoa(os.Getpid())},
-	) {
-		return fmt.Errorf("pid rule did not verify")
+		sysnet.RuleContext{Routing: &profileKey},
+	).Err(); err != nil {
+		return fmt.Errorf("pid rule did not validate: %w", err)
 	}
 	return nil
 }
@@ -986,21 +1040,27 @@ func checkInvalidRules(system *linux.System) error {
 			rule: sysnet.Rule{Type: "group", Rule: "sysnet-e2e-missing-group"},
 		},
 	}
+	matcherKey := sysnet.MatcherProfileKey{
+		Family: sysnet.FamilyIPv4, Transport: sysnet.TransportTCP,
+	}
 	for _, tc := range cases {
-		if system.RuleVerify(tc.rule) {
+		if err := system.CheckRule(
+			tc.rule,
+			sysnet.RuleContext{Matcher: &matcherKey},
+		).Err(); err == nil {
 			return fmt.Errorf(
-				"%s RuleVerify(%+v) = true, want false",
+				"%s CheckRule(%+v) succeeded, want error",
 				tc.name,
 				tc.rule,
 			)
 		}
-		if err := system.VerifyDefaultTunOpts(sysnet.DefaultTunOpts{
+		if err := system.CheckDefaultTunOpts(sysnet.DefaultTunOpts{
 			TunAddrs: []string{dnsIP + "/32"},
 			DnsIP:    dnsIP,
 			Exclude:  []sysnet.Rule{tc.rule},
-		}); err == nil {
+		}).Err(); err == nil {
 			return fmt.Errorf(
-				"%s VerifyDefaultTunOpts succeeded, want error",
+				"%s CheckDefaultTunOpts succeeded, want error",
 				tc.name,
 			)
 		}
@@ -1008,14 +1068,14 @@ func checkInvalidRules(system *linux.System) error {
 			return fmt.Errorf("%s BuildMatcher succeeded, want error", tc.name)
 		}
 	}
-	if err := system.VerifyDefaultTunOpts(sysnet.DefaultTunOpts{
+	if err := system.CheckDefaultTunOpts(sysnet.DefaultTunOpts{
 		TunAddrs: []string{dnsIP + "/32"},
 		DnsIP:    dnsIP,
 		Exclude:  []sysnet.Rule{{Type: "pid", Rule: strconv.Itoa(os.Getpid())}},
 		Include:  []sysnet.Rule{{Type: "uid", Rule: strconv.Itoa(os.Getuid())}},
-	}); err == nil {
+	}).Err(); err == nil {
 		return fmt.Errorf(
-			"VerifyDefaultTunOpts with exclude and include succeeded, want error",
+			"CheckDefaultTunOpts with exclude and include succeeded, want error",
 		)
 	}
 	return nil
@@ -1060,20 +1120,27 @@ func checkValidRuleBoundaries(system *linux.System) error {
 			},
 		},
 	}
+	matcherKey := sysnet.MatcherProfileKey{
+		Family: sysnet.FamilyIPv4, Transport: sysnet.TransportTCP,
+	}
 	for _, tc := range cases {
-		if !system.RuleVerify(tc.rule) {
+		if err := system.CheckRule(
+			tc.rule,
+			sysnet.RuleContext{Matcher: &matcherKey},
+		).Err(); err != nil {
 			return fmt.Errorf(
-				"%s RuleVerify(%+v) = false, want true",
+				"%s CheckRule(%+v) error = %v, want nil",
 				tc.name,
 				tc.rule,
+				err,
 			)
 		}
-		if err := system.VerifyDefaultTunOpts(sysnet.DefaultTunOpts{
+		if err := system.CheckDefaultTunOpts(sysnet.DefaultTunOpts{
 			TunAddrs: []string{dnsIP + "/32"},
 			DnsIP:    dnsIP,
 			Exclude:  []sysnet.Rule{tc.rule},
-		}); err != nil {
-			return fmt.Errorf("%s VerifyDefaultTunOpts: %w", tc.name, err)
+		}).Err(); err != nil {
+			return fmt.Errorf("%s CheckDefaultTunOpts: %w", tc.name, err)
 		}
 		matcher, err := system.BuildMatcher(tc.rule)
 		if err != nil {
@@ -1107,12 +1174,8 @@ func checkRegularTun(system *linux.System) error {
 		)
 	}
 	renamed := fmt.Sprintf("snr%d", os.Getpid())
-	names, err := system.SetTunName(t, renamed)
-	if err != nil {
+	if err := system.SetTunName(t, renamed); err != nil {
 		return fmt.Errorf("rename regular TUN: %w", err)
-	}
-	if len(names) != 1 || names[0] != renamed {
-		return fmt.Errorf("SetTunName = %v, want [%s]", names, renamed)
 	}
 	iface, err := net.InterfaceByName(renamed)
 	if err != nil {
@@ -1171,13 +1234,13 @@ func checkRegularTun(system *linux.System) error {
 	) {
 		return fmt.Errorf("AddTunRoute(nil) = %v, want ErrUnknownTun", err)
 	}
-	if _, err := system.GetTunRotue(nil); !errors.Is(
+	if _, err := system.GetTunRoutes(nil); !errors.Is(
 		err,
 		sysnet.ErrUnknownTun,
 	) {
-		return fmt.Errorf("GetTunRotue(nil) = %v, want ErrUnknownTun", err)
+		return fmt.Errorf("GetTunRoutes(nil) = %v, want ErrUnknownTun", err)
 	}
-	if _, err := system.SetTunName(nil, "unused0"); !errors.Is(
+	if err := system.SetTunName(nil, "unused0"); !errors.Is(
 		err,
 		sysnet.ErrUnknownTun,
 	) {
@@ -1314,7 +1377,7 @@ func checkDefaultTunDynamicUpdates(system *linux.System) error {
 		return fmt.Errorf("add dynamic DefaultTun route: %w", err)
 	}
 	wantRoutes = append(wantRoutes, "198.51.100.7/24")
-	routes, err := system.GetTunRotue(dt)
+	routes, err := system.GetTunRoutes(dt)
 	if err != nil {
 		return fmt.Errorf("get dynamic DefaultTun route intent: %w", err)
 	}
@@ -1480,7 +1543,9 @@ func checkDefaultTunFallbackDNS(system *linux.System) error {
 		return err
 	}
 	answer := netip.MustParseAddr("203.0.113.99")
-	dt.SetDns(newStaticDNS(answer))
+	if err := dt.SetDNS(newStaticDNS(answer)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := expectDNSAAt(
 		"fallback attached DefaultTun DNS",
 		server,
@@ -1519,7 +1584,9 @@ func checkOutNetDNSAfterDefaultTun(
 
 	managedDNS := newStaticDNSWithRCode(gdns.RCodeServerFailure)
 	defer func() { _ = managedDNS.Close() }()
-	dt.SetDns(managedDNS)
+	if err := dt.SetDNS(managedDNS); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 
 	_, port, err := net.SplitHostPort(targets.HTTP)
 	if err != nil {
@@ -1593,7 +1660,9 @@ func checkDefaultTunLifecycle(
 	}
 	answerA := netip.MustParseAddr("203.0.113.77")
 	answerB := netip.MustParseAddr("203.0.113.88")
-	dt.SetDns(newStaticDNS(answerA))
+	if err := dt.SetDNS(newStaticDNS(answerA)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := expectDNSA("attached DefaultTun DNS", answerA); err != nil {
 		return err
 	}
@@ -1658,17 +1727,19 @@ func checkDefaultTunLifecycle(
 			sourceGeneration,
 		)
 	}
-	if _, err := system.SetTunName(rebuilt, "unused0"); !errors.Is(
+	if err := system.SetTunName(rebuilt, "unused0"); !errors.Is(
 		err,
-		sysnet.ErrUnknownTun,
+		sysnet.ErrNotSupported,
 	) {
 		return fmt.Errorf(
-			"SetTunName(DefaultTun) = %v, want ErrUnknownTun",
+			"SetTunName(DefaultTun) = %v, want ErrNotSupported",
 			err,
 		)
 	}
 
-	dt.SetDns(newStaticDNS(answerB))
+	if err := dt.SetDNS(newStaticDNS(answerB)); err != nil {
+		return fmt.Errorf("replace DefaultTun DNS: %w", err)
+	}
 	if err := expectDNSA("stable rebuilt DefaultTun DNS", answerB); err != nil {
 		return err
 	}
@@ -2404,7 +2475,9 @@ func checkDefaultTunRebuildDNSMutation(system *linux.System) error {
 		return err
 	}
 	answerA := netip.MustParseAddr("203.0.113.101")
-	dt.SetDns(newStaticDNS(answerA))
+	if err := dt.SetDNS(newStaticDNS(answerA)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := expectDNSA(
 		"DNS mutation initial attached DNS",
 		answerA,
@@ -2470,7 +2543,9 @@ func checkDefaultTunRebuildDNSMutation(system *linux.System) error {
 		return err
 	}
 	stableAnswer := netip.MustParseAddr("203.0.113.102")
-	dt.SetDns(newStaticDNS(stableAnswer))
+	if err := dt.SetDNS(newStaticDNS(stableAnswer)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := expectDNSAAt(
 		"DNS mutation stable wrapper after rebuild",
 		rebuiltDNSIP,
@@ -2479,7 +2554,9 @@ func checkDefaultTunRebuildDNSMutation(system *linux.System) error {
 		return err
 	}
 	answerB := netip.MustParseAddr("203.0.113.103")
-	rebuilt.SetDns(newStaticDNS(answerB))
+	if err := rebuilt.SetDNS(newStaticDNS(answerB)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := expectDNSAAt(
 		"DNS mutation rebuilt attached DNS",
 		rebuiltDNSIP,
@@ -2487,7 +2564,9 @@ func checkDefaultTunRebuildDNSMutation(system *linux.System) error {
 	); err != nil {
 		return err
 	}
-	rebuilt.SetDns(nil)
+	if err := rebuilt.SetDNS(nil); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := expectDNSRCodeAt(
 		"DNS mutation rebuilt detached with nil DNS",
 		rebuiltDNSIP,
@@ -2533,7 +2612,9 @@ func checkDefaultTunUnderlyingLinkRecreate(system *linux.System) error {
 		return err
 	}
 	answerA := netip.MustParseAddr("203.0.113.131")
-	dt.SetDns(newStaticDNS(answerA))
+	if err := dt.SetDNS(newStaticDNS(answerA)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := expectDNSA(
 		"link recreate initial attached DNS",
 		answerA,
@@ -2624,7 +2705,9 @@ func checkDefaultTunUnderlyingLinkRecreate(system *linux.System) error {
 		return err
 	}
 	stableAnswer := netip.MustParseAddr("203.0.113.132")
-	dt.SetDns(newStaticDNS(stableAnswer))
+	if err := dt.SetDNS(newStaticDNS(stableAnswer)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := expectDNSA(
 		"deleted-link stable wrapper after rebuild",
 		stableAnswer,
@@ -2632,7 +2715,9 @@ func checkDefaultTunUnderlyingLinkRecreate(system *linux.System) error {
 		return err
 	}
 	answerB := netip.MustParseAddr("203.0.113.133")
-	rebuilt.SetDns(newStaticDNS(answerB))
+	if err := rebuilt.SetDNS(newStaticDNS(answerB)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := expectDNSA(
 		"deleted-link rebuilt attached DNS",
 		answerB,
@@ -2685,7 +2770,9 @@ func checkResolvedDefaultTunLifecycle(
 	}
 	answerA := netip.MustParseAddr("203.0.113.177")
 	answerB := netip.MustParseAddr("203.0.113.188")
-	dt.SetDns(newStaticDNS(answerA))
+	if err := dt.SetDNS(newStaticDNS(answerA)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
@@ -2752,7 +2839,9 @@ func checkResolvedDefaultTunLifecycle(
 	if err := waitForResolvedLinkDNS(rebuiltName, dnsIP); err != nil {
 		return err
 	}
-	dt.SetDns(newStaticDNS(answerB))
+	if err := dt.SetDNS(newStaticDNS(answerB)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
@@ -2795,7 +2884,9 @@ func checkResolvedDefaultTunDNSWarnings(system *linux.System) error {
 		return err
 	}
 	answer := netip.MustParseAddr("203.0.113.210")
-	dt.SetDns(newStaticDNS(answer))
+	if err := dt.SetDNS(newStaticDNS(answer)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
@@ -3008,7 +3099,9 @@ func checkResolvedDefaultTunRebuildDNSMutation(system *linux.System) error {
 		return err
 	}
 	answerA := netip.MustParseAddr("203.0.113.201")
-	dt.SetDns(newStaticDNS(answerA))
+	if err := dt.SetDNS(newStaticDNS(answerA)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
@@ -3086,7 +3179,9 @@ func checkResolvedDefaultTunRebuildDNSMutation(system *linux.System) error {
 		return err
 	}
 	stableAnswer := netip.MustParseAddr("203.0.113.202")
-	dt.SetDns(newStaticDNS(stableAnswer))
+	if err := dt.SetDNS(newStaticDNS(stableAnswer)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
@@ -3098,7 +3193,9 @@ func checkResolvedDefaultTunRebuildDNSMutation(system *linux.System) error {
 		return err
 	}
 	answerB := netip.MustParseAddr("203.0.113.203")
-	rebuilt.SetDns(newStaticDNS(answerB))
+	if err := rebuilt.SetDNS(newStaticDNS(answerB)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
@@ -3109,7 +3206,9 @@ func checkResolvedDefaultTunRebuildDNSMutation(system *linux.System) error {
 	); err != nil {
 		return err
 	}
-	rebuilt.SetDns(nil)
+	if err := rebuilt.SetDNS(nil); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
@@ -3161,7 +3260,9 @@ func checkResolvedDefaultTunUnderlyingLinkRecreate(system *linux.System) error {
 		return err
 	}
 	answerA := netip.MustParseAddr("203.0.113.231")
-	dt.SetDns(newStaticDNS(answerA))
+	if err := dt.SetDNS(newStaticDNS(answerA)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
@@ -3278,7 +3379,9 @@ func checkResolvedDefaultTunUnderlyingLinkRecreate(system *linux.System) error {
 		return err
 	}
 	stableAnswer := netip.MustParseAddr("203.0.113.232")
-	dt.SetDns(newStaticDNS(stableAnswer))
+	if err := dt.SetDNS(newStaticDNS(stableAnswer)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
@@ -3290,7 +3393,9 @@ func checkResolvedDefaultTunUnderlyingLinkRecreate(system *linux.System) error {
 		return err
 	}
 	answerB := netip.MustParseAddr("203.0.113.233")
-	rebuilt.SetDns(newStaticDNS(answerB))
+	if err := rebuilt.SetDNS(newStaticDNS(answerB)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
@@ -3373,7 +3478,9 @@ func checkResolvedDefaultTunFallbackDNS(
 		return err
 	}
 	answer := netip.MustParseAddr("203.0.113.199")
-	dt.SetDns(newStaticDNS(answer))
+	if err := dt.SetDNS(newStaticDNS(answer)); err != nil {
+		return fmt.Errorf("set DefaultTun DNS: %w", err)
+	}
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
@@ -3400,6 +3507,33 @@ func checkResolvedDefaultTunFallbackDNS(
 type ruleCase struct {
 	name string
 	rule sysnet.Rule
+}
+
+func countAvailableRuleBindings(profile sysnet.DefaultTunProfile) int {
+	count := 0
+	for _, binding := range profile.Rules {
+		if binding.State == sysnet.CapabilityAvailable {
+			count++
+		}
+	}
+	return count
+}
+
+func countAvailableMatcherRules(
+	report sysnet.CapabilityReport,
+	key sysnet.MatcherProfileKey,
+) int {
+	count := 0
+	for _, rule := range report.Rules {
+		for _, matcher := range rule.Matchers {
+			if matcher.Key == key &&
+				matcher.State == sysnet.CapabilityAvailable {
+				count++
+				break
+			}
+		}
+	}
+	return count
 }
 
 func checkDefaultTunRuleContexts(
@@ -3579,13 +3713,15 @@ func checkAutoNewPmarkSocketProbeSetup() error {
 	}
 	defer func() { _ = system.Close() }()
 
-	features := system.Features()
-	rules := system.ListRules()
-	if len(rules.TunRules) != 8 {
+	report := system.Capabilities()
+	profile := report.DefaultTunProfile(sysnet.RoutingProfileKey{
+		Family: sysnet.FamilyIPv4, Mode: sysnet.RoutingInclude,
+	})
+	if profile.State != sysnet.CapabilityAvailable ||
+		countAvailableRuleBindings(profile) != 8 {
 		return fmt.Errorf(
-			"auto New pmark TunRules len = %d with features %+v, want 8",
-			len(rules.TunRules),
-			features,
+			"auto New pmark include profile = %+v, want 8 rules",
+			profile,
 		)
 	}
 

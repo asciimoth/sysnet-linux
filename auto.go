@@ -16,6 +16,7 @@ import (
 
 	"github.com/asciimoth/gonnect"
 	"github.com/asciimoth/gonnect/sockopt"
+	"github.com/asciimoth/gonnect/sysnet"
 	pmark "github.com/asciimoth/p-mark"
 	"github.com/asciimoth/p-mark/fwmark"
 	"github.com/asciimoth/p-mark/multirule"
@@ -142,7 +143,7 @@ var autoSystemEnv = systemAutoEnvironment{
 // enabled only when a configured provider can be built; killswitch is enabled
 // only when requested and a daemon path is usable; TunRules are enabled only
 // when p-mark starts successfully. A missing optional integration is logged and
-// degrades Features(), rather than making construction fail.
+// degrades the capability report, rather than making construction fail.
 //
 // Errors are reserved for invalid static configuration or failures in the
 // underlying System constructor after feature degradation.
@@ -155,6 +156,7 @@ func New(config SystemConfig) (*System, error) {
 	if features == (FeatureConfig{}) {
 		features = defaultSystemFeatures()
 	}
+	var capabilityFailures capabilityFailures
 
 	allocator := linuxsubnet.NewDefaultAllocator(config.Allocator)
 	factory := tunFactoryFunc(linuxtun.CreateDefaultTUN)
@@ -162,6 +164,9 @@ func New(config SystemConfig) (*System, error) {
 	if features.Tun {
 		if !autoSystemEnv.hasCapability(unix.CAP_NET_ADMIN) {
 			logf("system auto-detect: disabling TUN: missing CAP_NET_ADMIN")
+			capabilityFailures.tun = []sysnet.CapabilityReason{
+				sysnet.ReasonPermissionDenied,
+			}
 			disableTUNFeatures(&features)
 			factory = nil
 			tunConfig = nil
@@ -171,6 +176,9 @@ func New(config SystemConfig) (*System, error) {
 			logf,
 		); err != nil {
 			logf("system auto-detect: disabling TUN: %v", err)
+			capabilityFailures.tun = []sysnet.CapabilityReason{
+				sysnet.ReasonProbeFailed,
+			}
 			disableTUNFeatures(&features)
 			factory = nil
 			tunConfig = nil
@@ -179,7 +187,11 @@ func New(config SystemConfig) (*System, error) {
 
 	var routingManager RoutingManager
 	if features.Routing {
-		routingManager = setupRoutingManager(&features, logf)
+		routingManager = setupRoutingManager(
+			&features,
+			&capabilityFailures,
+			logf,
+		)
 	}
 
 	appMark := config.AppBypassMark
@@ -192,6 +204,9 @@ func New(config SystemConfig) (*System, error) {
 		provider, err := autoSystemEnv.newDNSProvider(config, dnsNet, dnsNet)
 		if err != nil {
 			logf("system auto-detect: disabling DNS control: %v", err)
+			capabilityFailures.dns = []sysnet.CapabilityReason{
+				sysnet.ReasonProbeFailed,
+			}
 			features.DNSControl = false
 			features.DefaultTun = false
 			features.DynDefaultTun = false
@@ -206,6 +221,9 @@ func New(config SystemConfig) (*System, error) {
 		controller, closers, err := autoSystemEnv.newPmark(config, logf)
 		if err != nil {
 			logf("system auto-detect: disabling p-mark: %v", err)
+			capabilityFailures.pmark = []sysnet.CapabilityReason{
+				sysnet.ReasonProbeFailed,
+			}
 			features.Pmark = false
 			features.TunRules = false
 			closeAll(closers)
@@ -213,6 +231,9 @@ func New(config SystemConfig) (*System, error) {
 			pmarkController = controller
 			extraClosers = append(extraClosers, closers...)
 			if pmarkController == nil {
+				capabilityFailures.pmark = []sysnet.CapabilityReason{
+					sysnet.ReasonDisabledByConfig,
+				}
 				features.Pmark = false
 				features.TunRules = false
 			}
@@ -254,6 +275,7 @@ func New(config SystemConfig) (*System, error) {
 		Callbacks:              config.Callbacks,
 		ExtraClosers:           extraClosers,
 		DefaultTunBaseName:     config.DefaultTunBaseName,
+		capabilityFailures:     capabilityFailures,
 	})
 	if err != nil {
 		closeAll(extraClosers)
@@ -321,7 +343,7 @@ func buildMarkedNetwork(
 			logf("set SO_MARK on %s %s: %v", network, address, err)
 		}
 	}
-	return gonnect.NativeConfig{
+	native := gonnect.NativeConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			setRoutingMark(network, address, c)
 			return nil
@@ -337,6 +359,7 @@ func buildMarkedNetwork(
 			},
 		},
 	}.Build()
+	return policyNetwork{Network: native}
 }
 
 func newNativeRoutingManager() (RoutingManager, error) {
@@ -345,16 +368,23 @@ func newNativeRoutingManager() (RoutingManager, error) {
 
 func setupRoutingManager(
 	features *FeatureConfig,
+	failures *capabilityFailures,
 	logf func(format string, args ...any),
 ) RoutingManager {
 	if !autoSystemEnv.hasCapability(unix.CAP_NET_ADMIN) {
 		logf("system auto-detect: disabling routing: missing CAP_NET_ADMIN")
+		failures.routing = []sysnet.CapabilityReason{
+			sysnet.ReasonPermissionDenied,
+		}
 		disableRoutingFeatures(features)
 		return nil
 	}
 	manager, err := autoSystemEnv.newRoutingManager()
 	if err != nil {
 		logf("system auto-detect: disabling routing: %v", err)
+		failures.routing = []sysnet.CapabilityReason{
+			sysnet.ReasonProbeFailed,
+		}
 		disableRoutingFeatures(features)
 		return nil
 	}

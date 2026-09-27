@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/asciimoth/gonnect"
+	"github.com/asciimoth/gonnect/sysnet"
 	gtun "github.com/asciimoth/gonnect/tun"
 	"github.com/asciimoth/sysnet-linux/dns"
 	"github.com/asciimoth/sysnet-linux/killswitch"
@@ -206,8 +207,14 @@ func TestNewRetriesOnlyTUNProbe(t *testing.T) {
 		}
 	}()
 
-	if !system.Features().Tun {
-		t.Fatal("TUN feature is disabled after successful retry")
+	create := system.Capabilities().Operation(sysnet.OperationKey{
+		Target: sysnet.TargetTun, Operation: sysnet.OpCreate, Family: sysnet.FamilyNone,
+	})
+	if create.State != sysnet.CapabilityAvailable {
+		t.Fatalf(
+			"TUN create capability = %+v, want available after retry",
+			create,
+		)
 	}
 	if probeFactory.calls != 2 {
 		t.Fatalf("TUN creation calls = %d, want 2", probeFactory.calls)
@@ -267,8 +274,16 @@ func TestNewDisablesTUNAfterAllProbeAttemptsFail(t *testing.T) {
 		}
 	}()
 
-	if system.Features().Tun {
-		t.Fatal("TUN feature remains enabled after three creation failures")
+	create := system.Capabilities().Operation(sysnet.OperationKey{
+		Target: sysnet.TargetTun, Operation: sysnet.OpCreate, Family: sysnet.FamilyNone,
+	})
+	wantReasons := []sysnet.CapabilityReason{sysnet.ReasonProbeFailed}
+	if create.State != sysnet.CapabilityUnavailable ||
+		!slices.Equal(create.Reasons, wantReasons) {
+		t.Fatalf(
+			"TUN create capability = %+v, want unavailable probe_failed",
+			create,
+		)
 	}
 	if probeFactory.calls != 3 {
 		t.Fatalf("TUN creation calls = %d, want 3", probeFactory.calls)

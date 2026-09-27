@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"reflect"
 	"slices"
 	"sync"
@@ -44,19 +45,24 @@ var _ sysnet.System = (*System)(nil)
 // FeatureConfig describes features requested by the caller. Effective feature
 // support is the requested value degraded by the components supplied in Config.
 type FeatureConfig struct {
-	Tun             bool
-	DefaultTun      bool
-	DynTun          bool
-	DynDefaultTun   bool
-	TunNames        bool
+	Tun           bool
+	DefaultTun    bool
+	DynTun        bool
+	DynDefaultTun bool
+	TunNames      bool
+
+	// DefaultTunNames is reserved for compatibility. Linux reports default-TUN
+	// name creation and rename as unsupported because a rename invalidates
+	// installed policy routes.
 	DefaultTunNames bool
-	StrictMode      bool
-	TunRules        bool
-	MatcherRules    bool
-	DNSControl      bool
-	Routing         bool
-	Pmark           bool
-	Killswitch      bool
+
+	StrictMode   bool
+	TunRules     bool
+	MatcherRules bool
+	DNSControl   bool
+	Routing      bool
+	Pmark        bool
+	Killswitch   bool
 }
 
 // Callbacks are optional hooks fired after successful lifecycle operations.
@@ -128,8 +134,8 @@ type TunConfigurator interface {
 	GetTunAddrs(gtun.Tun) ([]string, error)
 	SetTunRoutes(gtun.Tun, []string) error
 	AddTunRoute(gtun.Tun, string) error
-	GetTunRotue(gtun.Tun) ([]string, error)
-	SetTunName(gtun.Tun, string) ([]string, error)
+	GetTunRoutes(gtun.Tun) ([]string, error)
+	SetTunName(gtun.Tun, string) error
 }
 
 type systemTunConfigurator struct{}
@@ -155,14 +161,14 @@ func (systemTunConfigurator) SetTunRoutes(t gtun.Tun, routes []string) error {
 func (systemTunConfigurator) AddTunRoute(t gtun.Tun, route string) error {
 	return linuxtun.AddTunRoute(t, route)
 }
-func (systemTunConfigurator) GetTunRotue(t gtun.Tun) ([]string, error) {
-	return linuxtun.GetTunRotue(t)
+func (systemTunConfigurator) GetTunRoutes(t gtun.Tun) ([]string, error) {
+	return linuxtun.GetTunRoutes(t)
 }
 
 func (systemTunConfigurator) SetTunName(
 	t gtun.Tun,
 	name string,
-) ([]string, error) {
+) error {
 	return linuxtun.SetTunName(t, name)
 }
 
@@ -213,6 +219,11 @@ type Config struct {
 	// injected components. They are closed by System.Close after DNS, routing,
 	// and killswitch state has been released.
 	ExtraClosers []io.Closer
+
+	// capabilityFailures records host-probe failures from New. It is internal
+	// because callers of NewSystem describe requested behavior through Features
+	// and injected dependencies directly.
+	capabilityFailures capabilityFailures
 }
 
 // System composes the Linux DNS, TUN, routing, p-mark, and killswitch helpers.
@@ -257,6 +268,8 @@ type System struct {
 	logf                   func(format string, args ...any)
 	callbacks              Callbacks
 	extraClosers           []io.Closer
+	capabilityFailures     capabilityFailures
+	capabilityReport       sysnet.CapabilityReport
 
 	tuns       map[gtun.Tun]*tunState
 	defaultTun *defaultTunState
@@ -265,8 +278,22 @@ type System struct {
 }
 
 type tunState struct {
-	tun gtun.Tun
+	mu sync.Mutex
+
+	tun      gtun.Tun
+	public   *regularTun
+	revision uint64
 }
+
+// regularTun keeps regular-TUN ownership observable after the caller closes
+// the object. A raw native TUN cannot notify System when its Close method is
+// called, which would make CapabilitiesForTun accept a stale object.
+type regularTun struct {
+	state  *tunState
+	system *System
+}
+
+var _ gtun.Tun = (*regularTun)(nil)
 
 // NewSystem creates a Linux System from supplied components.
 func NewSystem(config Config) (*System, error) {
@@ -368,7 +395,8 @@ func NewSystem(config Config) (*System, error) {
 		extraClosers: append(
 			[]io.Closer(nil),
 			config.ExtraClosers...),
-		tuns: make(map[gtun.Tun]*tunState),
+		capabilityFailures: config.capabilityFailures.clone(),
+		tuns:               make(map[gtun.Tun]*tunState),
 	}
 	s.reserveDefaultTunIP()
 	s.outNet = s.buildMarkedNetwork()
@@ -382,6 +410,8 @@ func NewSystem(config Config) (*System, error) {
 		s.outNet = gonnect.NewNetworkWithResolver(s.outNet, resolver)
 		s.localNet = gonnect.NewNetworkWithResolver(s.localNet, resolver)
 	}
+	s.capabilityReport = s.openCapabilityReportLocked()
+	s.capabilityReport.Revision = 1
 	return s, nil
 }
 
@@ -406,7 +436,7 @@ func (s *System) buildMarkedNetwork() gonnect.Network {
 			s.logf("set SO_MARK on %s %s: %v", network, address, err)
 		}
 	}
-	return gonnect.NativeConfig{
+	native := gonnect.NativeConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			setRoutingMark(network, address, c)
 			return nil
@@ -422,7 +452,17 @@ func (s *System) buildMarkedNetwork() gonnect.Network {
 			},
 		},
 	}.Build()
+	return policyNetwork{Network: native}
 }
+
+// policyNetwork prevents consumers from bypassing the socket-control hooks
+// that apply the routing mark. The wrapped network uses native sockets, but it
+// is not safe to use as an unrestricted native network.
+type policyNetwork struct {
+	gonnect.Network
+}
+
+func (policyNetwork) IsNative() bool { return false }
 
 // Close releases every object owned by System.
 func (s *System) Close() error {
@@ -437,8 +477,13 @@ func (s *System) Close() error {
 	defaultTun := s.defaultTun
 	s.defaultTun = nil
 	tuns := make([]gtun.Tun, 0, len(s.tuns))
-	for tun := range s.tuns {
-		tuns = append(tuns, tun)
+	for _, state := range s.tuns {
+		state.mu.Lock()
+		if state.tun != nil {
+			tuns = append(tuns, state.tun)
+			state.tun = nil
+		}
+		state.mu.Unlock()
 	}
 	s.tuns = make(map[gtun.Tun]*tunState)
 	s.mu.Unlock()
@@ -469,32 +514,6 @@ func (s *System) Close() error {
 		}
 	}
 	return err
-}
-
-// Features returns effective support after degrading requested features by
-// supplied component availability.
-func (s *System) Features() sysnet.Features {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.featuresLocked()
-}
-
-func (s *System) featuresLocked() sysnet.Features {
-	tunOK := s.features.Tun && s.tunFactory != nil && s.tunConfig != nil
-	routingOK := s.features.Routing && s.routingManager != nil
-	dnsOK := s.features.DNSControl && s.dnsProvider != nil &&
-		s.packetListen != nil
-	defaultOK := s.features.DefaultTun && tunOK && routingOK && dnsOK
-	return sysnet.Features{
-		Tun:                    tunOK,
-		DefaultTun:             defaultOK,
-		DynTun:                 s.features.DynTun && tunOK,
-		DynDefaultTun:          s.features.DynDefaultTun && defaultOK,
-		TunNames:               s.features.TunNames && tunOK,
-		DefaultTunNames:        false,
-		StrictMode:             s.features.StrictMode && routingOK,
-		DefaultTunSourceRoutes: defaultOK,
-	}
 }
 
 // AllocIP returns the shared IP allocator.
@@ -539,24 +558,9 @@ func (s *System) TunNameVerify(name string) (bool, bool) {
 	return true, true
 }
 
-// VerifyTunOpts validates regular TUN options.
-func (s *System) VerifyTunOpts(opts sysnet.TunOpts) error {
-	if !s.Features().Tun {
-		return sysnet.ErrNotSupported
-	}
-	_, _, err := normalizeTunAddrs(opts.TunAddrs, "", "")
-	if err != nil {
-		return err
-	}
-	if _, err := normalizeTunRoutes(opts.TunRoutes); err != nil {
-		return err
-	}
-	return nil
-}
-
 // BuildTun creates and configures a regular TUN.
 func (s *System) BuildTun(opts sysnet.TunOpts) (gtun.Tun, error) {
-	if err := s.VerifyTunOpts(opts); err != nil {
+	if err := s.CheckTunOpts(opts).Err(); err != nil {
 		return nil, err
 	}
 	mtu := linuxtun.NormalizeMTU(opts.MTU)
@@ -586,25 +590,35 @@ func (s *System) BuildTun(opts sysnet.TunOpts) (gtun.Tun, error) {
 		_ = t.Close()
 		return nil, err
 	}
+	if opts.Name != "" {
+		if err := s.tunConfig.SetTunName(t, opts.Name); err != nil {
+			_ = t.Close()
+			return nil, err
+		}
+	}
+	state := &tunState{tun: t, revision: 1}
+	wrapper := &regularTun{state: state, system: s}
+	state.public = wrapper
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		_ = t.Close()
 		return nil, net.ErrClosed
 	}
-	s.tuns[t] = &tunState{tun: t}
+	s.tuns[wrapper] = state
 	s.mu.Unlock()
 	if s.callbacks.TunCreated != nil {
-		s.callbacks.TunCreated(t)
+		s.callbacks.TunCreated(wrapper)
 	}
 	if s.callbacks.TunConfigured != nil {
-		s.callbacks.TunConfigured(t, copyTunOpts(opts))
+		s.callbacks.TunConfigured(wrapper, copyTunOpts(opts))
 	}
-	return t, nil
+	return wrapper, nil
 }
 
 func copyTunOpts(opts sysnet.TunOpts) sysnet.TunOpts {
 	return sysnet.TunOpts{
+		Name:      opts.Name,
 		TunAddrs:  append([]string(nil), opts.TunAddrs...),
 		TunRoutes: append([]string(nil), opts.TunRoutes...),
 		MTU:       opts.MTU,
@@ -676,12 +690,20 @@ func (s *System) resolveTunLocked(
 		s.mu.Unlock()
 		return resolvedTun{}, nil, sysnet.ErrUnknownTun
 	}
-	if _, ok := s.tuns[t]; !ok {
+	state, ok := s.tuns[t]
+	if !ok {
 		s.mu.Unlock()
 		return resolvedTun{}, nil, sysnet.ErrUnknownTun
 	}
+	state.mu.Lock()
+	if state.tun == nil {
+		state.mu.Unlock()
+		s.mu.Unlock()
+		return resolvedTun{}, nil, sysnet.ErrUnknownTun
+	}
+	native := state.tun
 	s.mu.Unlock()
-	return resolvedTun{tun: t}, func() {}, nil
+	return resolvedTun{tun: native}, state.mu.Unlock, nil
 }
 
 // TunWarnings returns read-only runtime warnings for a regular TUN created by
@@ -701,6 +723,13 @@ func (s *System) SetTunMTU(t gtun.Tun, mtu int) error {
 		return err
 	}
 	defer release()
+	if err := s.tunOperationError(
+		resolved,
+		sysnet.OpSetMTU,
+		sysnet.FamilyNone,
+	); err != nil {
+		return err
+	}
 	if !resolved.isDefault {
 		return s.tunConfig.SetTunMTU(resolved.tun, mtu)
 	}
@@ -722,12 +751,23 @@ func (s *System) SetTunAddrs(t gtun.Tun, addrs []string) error {
 		return err
 	}
 	defer release()
-	if resolved.isDefault {
-		return s.setDefaultTunAddrsLocked(resolved, addrs)
-	}
 	normalized, _, err := normalizeTunAddrs(addrs, "", "")
 	if err != nil {
 		return err
+	}
+	family := optionFamily(normalized, nil)
+	if family == sysnet.FamilyNone {
+		family = sysnet.FamilyDual
+	}
+	if err := s.tunOperationError(
+		resolved,
+		sysnet.OpSetAddresses,
+		family,
+	); err != nil {
+		return err
+	}
+	if resolved.isDefault {
+		return s.setDefaultTunAddrsLocked(resolved, addrs)
 	}
 	return s.tunConfig.SetTunAddrs(resolved.tun, normalized)
 }
@@ -740,6 +780,17 @@ func (s *System) AddTunAddr(t gtun.Tun, addr string) error {
 		return err
 	}
 	defer release()
+	prefix, err := netip.ParsePrefix(addr)
+	if err != nil {
+		return err
+	}
+	if err := s.tunOperationError(
+		resolved,
+		sysnet.OpAddAddress,
+		prefixFamily(prefix),
+	); err != nil {
+		return err
+	}
 	normalized, _, err := normalizeTunAddrs([]string{addr}, "", "")
 	if err != nil {
 		return err
@@ -761,6 +812,13 @@ func (s *System) GetTunAddrs(t gtun.Tun) ([]string, error) {
 		return nil, err
 	}
 	defer release()
+	if err := s.tunOperationError(
+		resolved,
+		sysnet.OpGetAddresses,
+		sysnet.FamilyIPv4,
+	); err != nil {
+		return nil, err
+	}
 	return s.tunConfig.GetTunAddrs(resolved.tun)
 }
 
@@ -774,6 +832,17 @@ func (s *System) SetTunRoutes(t gtun.Tun, routes []string) error {
 	defer release()
 	normalized, err := normalizeTunRoutes(routes)
 	if err != nil {
+		return err
+	}
+	family := optionFamily(nil, normalized)
+	if family == sysnet.FamilyNone {
+		family = sysnet.FamilyDual
+	}
+	if err := s.tunOperationError(
+		resolved,
+		sysnet.OpSetRoutes,
+		family,
+	); err != nil {
 		return err
 	}
 	if resolved.isDefault {
@@ -790,6 +859,17 @@ func (s *System) AddTunRoute(t gtun.Tun, route string) error {
 		return err
 	}
 	defer release()
+	prefix, err := netip.ParsePrefix(route)
+	if err != nil {
+		return err
+	}
+	if err := s.tunOperationError(
+		resolved,
+		sysnet.OpAddRoute,
+		prefixFamily(prefix),
+	); err != nil {
+		return err
+	}
 	normalized, err := normalizeTunRoutes([]string{route})
 	if err != nil {
 		return err
@@ -809,7 +889,14 @@ func (s *System) AddTunRoute(t gtun.Tun, route string) error {
 	return s.tunConfig.AddTunRoute(resolved.tun, normalized[0])
 }
 
-func (s *System) GetTunRotue(t gtun.Tun) ([]string, error) {
+func prefixFamily(prefix netip.Prefix) sysnet.AddressFamily {
+	if prefix.Addr().Is4() {
+		return sysnet.FamilyIPv4
+	}
+	return sysnet.FamilyIPv6
+}
+
+func (s *System) GetTunRoutes(t gtun.Tun) ([]string, error) {
 	s.defaultTunMu.Lock()
 	defer s.defaultTunMu.Unlock()
 	resolved, release, err := s.resolveTunLocked(t)
@@ -817,10 +904,17 @@ func (s *System) GetTunRotue(t gtun.Tun) ([]string, error) {
 		return nil, err
 	}
 	defer release()
+	if err := s.tunOperationError(
+		resolved,
+		sysnet.OpGetRoutes,
+		sysnet.FamilyIPv4,
+	); err != nil {
+		return nil, err
+	}
 	if resolved.isDefault {
 		return append([]string(nil), resolved.state.routes...), nil
 	}
-	return s.tunConfig.GetTunRotue(resolved.tun)
+	return s.tunConfig.GetTunRoutes(resolved.tun)
 }
 
 func (s *System) setDefaultTunAddrsLocked(
@@ -890,7 +984,7 @@ func (s *System) updateDefaultTunAddrsLocked(
 	if err != nil {
 		return err
 	}
-	oldMainRoutes, err := s.tunConfig.GetTunRotue(resolved.tun)
+	oldMainRoutes, err := s.tunConfig.GetTunRoutes(resolved.tun)
 	if err != nil {
 		return err
 	}
@@ -948,7 +1042,7 @@ func (s *System) setDefaultTunRoutesLocked(
 	if state.routingConfig == nil {
 		return sysnet.ErrUnknownTun
 	}
-	oldMainRoutes, err := s.tunConfig.GetTunRotue(resolved.tun)
+	oldMainRoutes, err := s.tunConfig.GetTunRoutes(resolved.tun)
 	if err != nil {
 		return err
 	}
@@ -1028,12 +1122,167 @@ func cloneDefaultTunRoutingConfig(config routing.Config) routing.Config {
 	return cloned
 }
 
-func (s *System) SetTunName(t gtun.Tun, name string) ([]string, error) {
-	if !s.ownedRegularTun(t) {
-		return nil, sysnet.ErrUnknownTun
+func (s *System) SetTunName(t gtun.Tun, name string) error {
+	s.defaultTunMu.Lock()
+	defer s.defaultTunMu.Unlock()
+	resolved, release, err := s.resolveTunLocked(t)
+	if err != nil {
+		return err
 	}
-	return s.tunConfig.SetTunName(t, name)
+	defer release()
+	if err := s.tunOperationError(
+		resolved,
+		sysnet.OpRename,
+		sysnet.FamilyNone,
+	); err != nil {
+		return err
+	}
+	valid, free := s.TunNameVerify(name)
+	if valid && !free {
+		current, _ := resolved.tun.Name()
+		free = current == name
+	}
+	if !valid || !free {
+		return fmt.Errorf(
+			"TUN name %q is invalid or already in use: %w",
+			name,
+			sysnet.ErrInvalidOptions,
+		)
+	}
+	return s.tunConfig.SetTunName(resolved.tun, name)
 }
+
+// tunOperationError checks one live-object operation. Feature configuration
+// and injected dependencies are immutable after construction. defaultTunMu,
+// held by every caller, prevents System.Close from changing the closed state
+// during this check and the following mutation.
+func (s *System) tunOperationError(
+	resolved resolvedTun,
+	operation sysnet.Operation,
+	family sysnet.AddressFamily,
+) error {
+	target := sysnet.TargetTun
+	if resolved.isDefault {
+		target = sysnet.TargetDefaultTun
+	}
+	capability := s.capabilityReport.Operation(sysnet.OperationKey{
+		Target:    target,
+		Operation: operation,
+		Family:    family,
+	})
+	return capabilityError(capability)
+}
+
+func (t *regularTun) nativeTun() gtun.Tun {
+	if t == nil || t.system == nil || t.state == nil {
+		return nil
+	}
+	t.system.mu.Lock()
+	defer t.system.mu.Unlock()
+	if t.system.closed || t.system.tuns[t] != t.state {
+		return nil
+	}
+	t.state.mu.Lock()
+	defer t.state.mu.Unlock()
+	return t.state.tun
+}
+
+func (t *regularTun) File() *os.File {
+	if native := t.nativeTun(); native != nil {
+		return native.File()
+	}
+	return nil
+}
+
+func (t *regularTun) IsNative() bool {
+	if native := t.nativeTun(); native != nil {
+		return native.IsNative()
+	}
+	return false
+}
+
+func (t *regularTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+	if native := t.nativeTun(); native != nil {
+		return native.Read(bufs, sizes, offset)
+	}
+	return 0, os.ErrClosed
+}
+
+func (t *regularTun) Write(bufs [][]byte, offset int) (int, error) {
+	if native := t.nativeTun(); native != nil {
+		return native.Write(bufs, offset)
+	}
+	return 0, os.ErrClosed
+}
+
+func (t *regularTun) MWO() int {
+	if native := t.nativeTun(); native != nil {
+		return native.MWO()
+	}
+	return 0
+}
+
+func (t *regularTun) MRO() int {
+	if native := t.nativeTun(); native != nil {
+		return native.MRO()
+	}
+	return 0
+}
+
+func (t *regularTun) MTU() (int, error) {
+	if native := t.nativeTun(); native != nil {
+		return native.MTU()
+	}
+	return 0, os.ErrClosed
+}
+
+func (t *regularTun) Name() (string, error) {
+	if native := t.nativeTun(); native != nil {
+		return native.Name()
+	}
+	return "", os.ErrClosed
+}
+
+func (t *regularTun) Events() <-chan gtun.Event {
+	if native := t.nativeTun(); native != nil {
+		return native.Events()
+	}
+	return closedRegularTunEvents
+}
+
+func (t *regularTun) BatchSize() int {
+	if native := t.nativeTun(); native != nil {
+		return max(1, native.BatchSize())
+	}
+	return 1
+}
+
+func (t *regularTun) Close() error {
+	if t == nil || t.system == nil || t.state == nil {
+		return nil
+	}
+	t.system.mu.Lock()
+	if t.system.tuns[t] != t.state {
+		t.system.mu.Unlock()
+		return nil
+	}
+	delete(t.system.tuns, t)
+	t.state.mu.Lock()
+	native := t.state.tun
+	t.state.tun = nil
+	t.state.mu.Unlock()
+	t.system.mu.Unlock()
+	if native == nil {
+		return nil
+	}
+	return native.Close()
+}
+
+var closedRegularTunEvents = func() <-chan gtun.Event {
+	events := make(chan gtun.Event)
+	close(events)
+	return events
+}()
 
 func nativeTunIndex(t gtun.Tun) (int, error) {
 	if t == nil || t.File() == nil {

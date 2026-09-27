@@ -170,11 +170,11 @@ func AddTunRoute(tun gtun.Tun, route string) error {
 	return nil
 }
 
-// GetTunRotue returns list off routes of provided Tun.
+// GetTunRoutes returns the routes of the provided TUN.
 //
-// The misspelling is kept to match the gonnect sysnet.System interface. The Tun
-// must expose a non-nil File; otherwise sysnet.ErrUnknownTun is returned.
-func GetTunRotue(tun gtun.Tun) ([]string, error) {
+// The TUN must expose a non-nil File; otherwise sysnet.ErrUnknownTun is
+// returned.
+func GetTunRoutes(tun gtun.Tun) ([]string, error) {
 	info, err := tunFileInfo(tun)
 	if err != nil {
 		return nil, err
@@ -206,22 +206,22 @@ func GetTunRotue(tun gtun.Tun) ([]string, error) {
 //
 // The Tun must expose a non-nil File; otherwise sysnet.ErrUnknownTun is
 // returned.
-func SetTunName(tun gtun.Tun, name string) ([]string, error) {
+func SetTunName(tun gtun.Tun, name string) error {
 	info, err := tunFileInfo(tun)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	wasUp := info.link.Attrs().Flags&net.FlagUp != 0
 	if wasUp {
 		if err := netlink.LinkSetDown(info.link); err != nil {
-			return nil, fmt.Errorf("set interface %s down: %w", info.name, err)
+			return fmt.Errorf("set interface %s down: %w", info.name, err)
 		}
 	}
 	if err := netlink.LinkSetName(info.link, name); err != nil {
 		if wasUp {
 			_ = netlink.LinkSetUp(info.link)
 		}
-		return nil, fmt.Errorf(
+		return fmt.Errorf(
 			"rename interface %s to %s: %w",
 			info.name,
 			name,
@@ -230,14 +230,14 @@ func SetTunName(tun gtun.Tun, name string) ([]string, error) {
 	}
 	renamed, err := tunFileInfo(tun)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if wasUp {
 		if err := netlink.LinkSetUp(renamed.link); err != nil {
-			return nil, fmt.Errorf("set interface %s up: %w", renamed.name, err)
+			return fmt.Errorf("set interface %s up: %w", renamed.name, err)
 		}
 	}
-	return []string{renamed.name}, nil
+	return nil
 }
 
 type tunInfo struct {

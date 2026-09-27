@@ -127,8 +127,8 @@ func TestDefaultTunFallbackHostCollision(t *testing.T) {
 	}
 
 	opts := sysnet.DefaultTunOpts{TunAddrs: []string{"10.250.0.1/32"}}
-	if err := s.VerifyDefaultTunOpts(opts); err != nil {
-		t.Fatalf("VerifyDefaultTunOpts error = %v", err)
+	if err := s.CheckDefaultTunOpts(opts).Err(); err != nil {
+		t.Fatalf("CheckDefaultTunOpts error = %v", err)
 	}
 	dt, err := s.BuildDefaultTun(opts)
 	if err != nil {

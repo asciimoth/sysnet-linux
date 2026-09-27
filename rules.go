@@ -24,35 +24,85 @@ const (
 	execCompletionReadSize = 32
 )
 
-var supportedRules = []sysnet.RuleTypeInfo{
-	{Type: "comm", Description: "Process command regexp matcher."},
-	{Type: "exec", Description: "Process executable path matcher."},
-	{Type: "cmd", Description: "Process command line regexp matcher."},
-	{Type: "pid", Description: "Process PID."},
-	{Type: "user", Description: "Name of user owning process."},
-	{Type: "uid", Description: "UID owning process."},
-	{Type: "group", Description: "Name of group owning process."},
-	{Type: "gid", Description: "GID owning process."},
+type ruleDefinition struct {
+	Type        string
+	Description string
+	ValueKind   sysnet.RuleValueKind
+	SemanticsID string
+	Completion  bool
+}
+
+var supportedRules = []ruleDefinition{
+	{
+		Type:        "comm",
+		Description: "Process command regular expression.",
+		ValueKind:   sysnet.RuleValueRegex,
+		SemanticsID: "linux.process-comm-regexp.v1",
+	},
+	{
+		Type:        "exec",
+		Description: "Process executable path or basename pattern.",
+		ValueKind:   sysnet.RuleValuePath,
+		SemanticsID: "linux.process-executable-pattern.v1",
+		Completion:  true,
+	},
+	{
+		Type:        "cmd",
+		Description: "Process command line regular expression.",
+		ValueKind:   sysnet.RuleValueRegex,
+		SemanticsID: "linux.process-command-line-regexp.v1",
+	},
+	{
+		Type:        "pid",
+		Description: "Space-separated process IDs.",
+		ValueKind:   sysnet.RuleValuePID,
+		SemanticsID: "linux.process-id-list.v1",
+	},
+	{
+		Type:        "user",
+		Description: "Process user name.",
+		ValueKind:   sysnet.RuleValueName,
+		SemanticsID: "linux.process-user-name.v1",
+		Completion:  true,
+	},
+	{
+		Type:        "uid",
+		Description: "Space-separated process user IDs.",
+		ValueKind:   sysnet.RuleValueOpaque,
+		SemanticsID: "linux.process-user-id-list.v1",
+		Completion:  true,
+	},
+	{
+		Type:        "group",
+		Description: "Process group name.",
+		ValueKind:   sysnet.RuleValueName,
+		SemanticsID: "linux.process-group-name.v1",
+		Completion:  true,
+	},
+	{
+		Type:        "gid",
+		Description: "Space-separated process group IDs.",
+		ValueKind:   sysnet.RuleValueOpaque,
+		SemanticsID: "linux.process-group-id-list.v1",
+		Completion:  true,
+	},
 }
 
 type compiledRule struct {
-	process func(pmark.ProcessInfo) bool
-	owner   func(*sockowner.SocketOwner) bool
+	process       func(pmark.ProcessInfo) bool
+	owner         func(*sockowner.SocketOwner) bool
+	matcherFields matcherProcessFields
 }
 
-// ListRules reports rule types supported by enabled integrations.
-func (s *System) ListRules() sysnet.RulesInfo {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var info sysnet.RulesInfo
-	if s.tunRulesSupportedLocked() {
-		info.TunRules = append(info.TunRules, supportedRules...)
-	}
-	if s.features.MatcherRules && s.ruleTracker != nil && s.ownerLookup != nil {
-		info.MatcherRules = append(info.MatcherRules, supportedRules...)
-	}
-	return info
-}
+// matcherProcessFields identifies the bounded procfs data needed when socket
+// owner metadata alone cannot evaluate a matcher rule.
+type matcherProcessFields uint8
+
+const (
+	matcherProcessComm matcherProcessFields = 1 << iota
+	matcherProcessCmdline
+	matcherProcessExecutable
+)
 
 func (s *System) tunRulesSupportedLocked() bool {
 	return s.features.TunRules &&
@@ -61,50 +111,24 @@ func (s *System) tunRulesSupportedLocked() bool {
 		s.ruleTracker != nil
 }
 
-// RuleVerify checks whether a rule value is syntactically valid.
-func (s *System) RuleVerify(rule sysnet.Rule) bool {
-	_, err := compileRule(rule)
-	return err == nil
-}
-
-// RuleCompl returns quick best-effort completions for rules whose value space is
-// enumerable without process traversal. Account completions are read from the
-// local passwd and group databases, and executable path completion inspects only
-// one directory with a small scan cap so large filesystems cannot make
-// completion expensive.
-func (s *System) RuleCompl(rule sysnet.Rule) (out []string) {
-	defer func() {
-		if r := recover(); r != nil {
-			s.logCompletionErrorf("panic completing %s rule: %v", rule.Type, r)
-			out = nil
-		}
-	}()
-
-	var err error
+// completeRuleValue returns bounded suggestions for one validated rule type.
+// Account completion reads fixed local databases. Executable completion scans
+// only one directory and uses strict result and scan limits.
+func completeRuleValue(rule sysnet.Rule) ([]string, error) {
 	switch rule.Type {
 	case "user":
-		out, err = completePasswdRule(rule.Rule, false, "/etc/passwd")
+		return completePasswdRule(rule.Rule, false, "/etc/passwd")
 	case "uid":
-		out, err = completePasswdRule(rule.Rule, true, "/etc/passwd")
+		return completePasswdRule(rule.Rule, true, "/etc/passwd")
 	case "group":
-		out, err = completeGroupRule(rule.Rule, false, "/etc/group")
+		return completeGroupRule(rule.Rule, false, "/etc/group")
 	case "gid":
-		out, err = completeGroupRule(rule.Rule, true, "/etc/group")
-	case "exec", "exe":
-		out, err = completeExecRule(rule.Rule)
+		return completeGroupRule(rule.Rule, true, "/etc/group")
+	case "exec":
+		return completeExecRule(rule.Rule)
 	default:
-		return nil
+		return nil, sysnet.ErrNotSupported
 	}
-	if err != nil {
-		s.logCompletionErrorf(
-			"complete %s rule %q: %v",
-			rule.Type,
-			rule.Rule,
-			err,
-		)
-		return nil
-	}
-	return out
 }
 
 func (s *System) logCompletionErrorf(format string, args ...any) {
@@ -230,8 +254,9 @@ func compileRule(rule sysnet.Rule) (compiledRule, error) {
 			return compiledRule{}, err
 		}
 		return compiledRule{
-			process: func(info pmark.ProcessInfo) bool { return re.MatchString(info.Comm) },
-			owner:   func(owner *sockowner.SocketOwner) bool { return re.MatchString(owner.Comm) },
+			process:       func(info pmark.ProcessInfo) bool { return re.MatchString(info.Comm) },
+			owner:         func(owner *sockowner.SocketOwner) bool { return re.MatchString(owner.Comm) },
+			matcherFields: matcherProcessComm,
 		}, nil
 	case "cmd":
 		re, err := regexp.Compile(rule.Rule)
@@ -239,8 +264,9 @@ func compileRule(rule sysnet.Rule) (compiledRule, error) {
 			return compiledRule{}, err
 		}
 		return compiledRule{
-			process: func(info pmark.ProcessInfo) bool { return re.MatchString(info.Cmdline) },
-			owner:   func(*sockowner.SocketOwner) bool { return false },
+			process:       func(info pmark.ProcessInfo) bool { return re.MatchString(info.Cmdline) },
+			owner:         func(*sockowner.SocketOwner) bool { return false },
+			matcherFields: matcherProcessCmdline,
 		}, nil
 	case "exec":
 		match, err := compileExec(rule.Rule)
@@ -248,8 +274,9 @@ func compileRule(rule sysnet.Rule) (compiledRule, error) {
 			return compiledRule{}, err
 		}
 		return compiledRule{
-			process: func(info pmark.ProcessInfo) bool { return match(info.Exe) },
-			owner:   func(owner *sockowner.SocketOwner) bool { return owner.ProcName != "" && match(owner.ProcName) },
+			process:       func(info pmark.ProcessInfo) bool { return match(info.Exe) },
+			owner:         func(owner *sockowner.SocketOwner) bool { return owner.ProcName != "" && match(owner.ProcName) },
+			matcherFields: matcherProcessExecutable,
 		}, nil
 	case "pid":
 		values, err := parseUint32List(rule.Rule)

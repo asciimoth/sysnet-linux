@@ -211,10 +211,10 @@ func TestTunConfigFunctionsReturnUnknownTunForNilFile(t *testing.T) {
 	if _, err := GetTunAddrs(tun); !errors.Is(err, sysnet.ErrUnknownTun) {
 		t.Fatalf("GetTunAddrs error = %v, want ErrUnknownTun", err)
 	}
-	if _, err := GetTunRotue(tun); !errors.Is(err, sysnet.ErrUnknownTun) {
-		t.Fatalf("GetTunRotue error = %v, want ErrUnknownTun", err)
+	if _, err := GetTunRoutes(tun); !errors.Is(err, sysnet.ErrUnknownTun) {
+		t.Fatalf("GetTunRoutes error = %v, want ErrUnknownTun", err)
 	}
-	if _, err := SetTunName(
+	if err := SetTunName(
 		tun,
 		"renamed0",
 	); !errors.Is(

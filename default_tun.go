@@ -70,59 +70,11 @@ type dnsInterfaceIndexer interface {
 	SetInterfaceIndex(int) error
 }
 
-// VerifyDefaultTunOpts validates DefaultTun options without mutating host state.
-func (s *System) VerifyDefaultTunOpts(opts sysnet.DefaultTunOpts) error {
-	features := s.Features()
-	if !features.DefaultTun {
-		return sysnet.ErrNotSupported
-	}
-	if len(opts.SourceRoutes) > 0 && !features.DefaultTunSourceRoutes {
-		return sysnet.ErrNotSupported
-	}
-	if len(opts.Exclude) > 0 && len(opts.Include) > 0 {
-		return errors.New(
-			"default tun exclude and include rules are mutually exclusive",
-		)
-	}
-	if opts.Strict && !s.Features().StrictMode {
-		return sysnet.ErrNotSupported
-	}
-	if len(opts.Exclude) > 0 || len(opts.Include) > 0 {
-		s.mu.Lock()
-		tunRulesSupported := s.tunRulesSupportedLocked()
-		s.mu.Unlock()
-		if !tunRulesSupported {
-			return sysnet.ErrNotSupported
-		}
-	}
-	for _, rule := range append(append([]sysnet.Rule{}, opts.Exclude...), opts.Include...) {
-		if _, err := compileRule(rule); err != nil {
-			return err
-		}
-	}
-	addrs, _, err := normalizeTunAddrs(
-		opts.TunAddrs,
-		s.defaultTunCIDR,
-		opts.DnsIP,
-	)
-	if err != nil {
-		return err
-	}
-	if _, err := normalizeTunSourceRoutes(
-		addrs,
-		opts.SourceRoutes,
-	); err != nil {
-		return err
-	}
-	_, err = normalizeTunRoutes(opts.TunRoutes)
-	return err
-}
-
 // BuildDefaultTun creates or rebuilds the single active DefaultTun.
 func (s *System) BuildDefaultTun(
 	opts sysnet.DefaultTunOpts,
 ) (sysnet.DefaultTun, error) {
-	if err := s.VerifyDefaultTunOpts(opts); err != nil {
+	if err := s.CheckDefaultTunOpts(opts).Err(); err != nil {
 		return nil, err
 	}
 	addrs, dnsIP, err := normalizeTunAddrs(
@@ -357,7 +309,6 @@ func (s *System) BuildDefaultTun(
 	if err := s.updateKillswitch(state, rc.Mode); err != nil {
 		return nil, fail(err)
 	}
-
 	var sourceGeneration uint64
 	if tunRecreated {
 		s.mu.Lock()
@@ -673,25 +624,28 @@ func (s *System) DefaultTunWarnings(t sysnet.DefaultTun) []sysnet.Warning {
 	return append([]sysnet.Warning(nil), warnings...)
 }
 
-func (d *defaultTun) SetDns(resolver gdns.Interface) {
+// SetDNS replaces the resolver served by the active default TUN. A nil
+// resolver detaches the current resolver and stops managed DNS requests.
+func (d *defaultTun) SetDNS(resolver gdns.Interface) error {
 	d.system.defaultTunMu.Lock()
 	defer d.system.defaultTunMu.Unlock()
 	d.system.mu.Lock()
 	active := !d.system.closed && d.system.defaultTun == d.defaultTunState
 	d.system.mu.Unlock()
 	if !active {
-		return
+		return sysnet.ErrUnknownTun
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.server == nil {
-		return
+		return sysnet.ErrUnknownTun
 	}
 	if resolver == nil {
 		d.server.Detach()
-		return
+		return nil
 	}
 	d.server.Attach(resolver)
+	return nil
 }
 
 func (d *defaultTun) Close() error {

@@ -83,7 +83,7 @@ func TestDefaultTunDynamicMethodsResolvePublicWrapper(t *testing.T) {
 	if err := s.AddTunRoute(dt, "198.51.100.0/24"); err != nil {
 		t.Fatal(err)
 	}
-	gotRoutes, err := s.GetTunRotue(dt)
+	gotRoutes, err := s.GetTunRoutes(dt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,11 +166,11 @@ func TestDefaultTunDynamicMethodsRejectForeignAndInactive(t *testing.T) {
 	) {
 		t.Fatalf("foreign GetTunAddrs = %v, want ErrUnknownTun", err)
 	}
-	if _, err := first.GetTunRotue(foreign); !errors.Is(
+	if _, err := first.GetTunRoutes(foreign); !errors.Is(
 		err,
 		sysnet.ErrUnknownTun,
 	) {
-		t.Fatalf("foreign GetTunRotue = %v, want ErrUnknownTun", err)
+		t.Fatalf("foreign GetTunRoutes = %v, want ErrUnknownTun", err)
 	}
 
 	oldSource := defaultTunSourceForTest(t, dt).SourceGeneration()
@@ -213,8 +213,8 @@ func TestDefaultTunDynamicMethodsRejectForeignAndInactive(t *testing.T) {
 	if _, err := first.GetTunAddrs(dt); !errors.Is(err, sysnet.ErrUnknownTun) {
 		t.Fatalf("inactive GetTunAddrs = %v, want ErrUnknownTun", err)
 	}
-	if _, err := first.GetTunRotue(dt); !errors.Is(err, sysnet.ErrUnknownTun) {
-		t.Fatalf("inactive GetTunRotue = %v, want ErrUnknownTun", err)
+	if _, err := first.GetTunRoutes(dt); !errors.Is(err, sysnet.ErrUnknownTun) {
+		t.Fatalf("inactive GetTunRoutes = %v, want ErrUnknownTun", err)
 	}
 	if _, err := dt.Read(nil, nil, 0); !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("inactive Read = %v, want closed error", err)
@@ -330,7 +330,7 @@ func TestDefaultTunDynamicUpdateMatchesFullRebuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	dynamicAddrs := append([]string(nil), tunConfig.addrs[native]...)
-	dynamicRoutes, err := s.GetTunRotue(dt)
+	dynamicRoutes, err := s.GetTunRoutes(dt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +366,7 @@ func TestDefaultTunDynamicUpdateMatchesFullRebuild(t *testing.T) {
 	if got := tunConfig.mtu[native]; got != 9000 {
 		t.Fatalf("rebuilt MTU = %d, want 9000", got)
 	}
-	if got, err := s.GetTunRotue(dt); err != nil {
+	if got, err := s.GetTunRoutes(dt); err != nil {
 		t.Fatal(err)
 	} else if !slices.Equal(got, dynamicRoutes) {
 		t.Fatalf("rebuilt route intent = %v, want %v", got, dynamicRoutes)
@@ -517,7 +517,7 @@ func TestDefaultTunRouteUpdateRollsBackRoutingFailure(t *testing.T) {
 	if !errors.Is(err, errInjectedRouting) {
 		t.Fatalf("SetTunRoutes error = %v, want injected failure", err)
 	}
-	if got, err := s.GetTunRotue(dt); err != nil {
+	if got, err := s.GetTunRoutes(dt); err != nil {
 		t.Fatal(err)
 	} else if !slices.Equal(got, []string{"0.0.0.0/0"}) {
 		t.Fatalf("route intent after rollback = %v", got)
