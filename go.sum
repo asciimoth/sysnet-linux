@@ -2,8 +2,8 @@ github.com/asciimoth/bufpool v0.3.0 h1:tQMop/kZ3eOLSorM9i0cqtOIpxWQUroGZ6oNk5DTn
 github.com/asciimoth/bufpool v0.3.0/go.mod h1:JV6H4hpj2bCS5Svr0wNqR+XOZFOOkdXfNZxCjm/3QHw=
 github.com/asciimoth/gonnect v0.55.0 h1:9pgqRF/zikzDLgxFBEXIV390QGgnnrDlIMqb3KXTL/c=
 github.com/asciimoth/gonnect v0.55.0/go.mod h1:W5OAXiqFw48MTm54+dPua9calyVjez/uqjcbrQwcvPU=
-github.com/asciimoth/gonnect-netstack v0.8.1 h1:d0mYClTutWKOk0gfssxKgwS5zz7yyz24TLjEHiohiWA=
-github.com/asciimoth/gonnect-netstack v0.8.1/go.mod h1:4KzYndt6XD+WdQ5j/j1yyBRBufXDRRN7AezilYoJkOM=
+github.com/asciimoth/gonnect-netstack v0.9.0 h1:ch/3IkLWdiotQJbKavf3vLBOOWmm3/fDO6eFZ6eXRDM=
+github.com/asciimoth/gonnect-netstack v0.9.0/go.mod h1:4KzYndt6XD+WdQ5j/j1yyBRBufXDRRN7AezilYoJkOM=
 github.com/asciimoth/p-mark v0.4.0 h1:rOjE/Ye30XeRXEUIG6K6btiz8Z9ySgogBLa0orQJBKI=
 github.com/asciimoth/p-mark v0.4.0/go.mod h1:uBcCKIk6x5hjb7rDnH4trBCAfHr/4xOWM8q+tydLJAw=
 github.com/asciimoth/tuntap v0.4.3 h1:MCpPk/KdvcE6bsXD8bwHMvH2LbzVeG4K+Efps1ASTZs=
