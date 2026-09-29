@@ -39,8 +39,6 @@ The primary application for this package is [Almagest](https://github.com/asciim
 - A mounted BPF filesystem and a configured pin path for process-based TUN rules
 - A compatible killswitch daemon for killswitch integration
 
-You do not need all optional integrations. The high-level constructor probes the current environment and disables unavailable features. Always use `Features()` and `ListRules()` to determine what the created system supports.
-
 ## Installation
 
 ```sh
@@ -79,8 +77,8 @@ func main() {
 	system = linuxSystem
 	defer system.Close()
 
-	features := system.Features()
-	log.Printf("TUN: %t, default TUN: %t", features.Tun, features.DefaultTun)
+	capabilities := system.Capabilities()
+	log.Printf("system capabilities: %+v", capabilities)
 }
 ```
 
@@ -116,7 +114,7 @@ the source generation changes.
 The dynamic MTU, address, and route methods accept this public object. Address
 updates keep the main routing table free of routes through the default TUN.
 Route updates change the routing manager's dedicated VPN-table policy; they do
-not add routes to the main table. `GetTunRotue` returns this route intent for a
+not add routes to the main table. `GetTunRoutes` returns this route intent for a
 default TUN. An address update that would change the active DNS address is not
 supported and returns an error that matches `sysnet.ErrNotSupported`; use
 `BuildDefaultTun` for that change.

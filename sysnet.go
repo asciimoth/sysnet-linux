@@ -431,28 +431,44 @@ func (s *System) reserveDefaultTunIP() {
 }
 
 func (s *System) buildMarkedNetwork() gonnect.Network {
-	setRoutingMark := func(network, address string, c syscall.RawConn) {
-		if err := sockopt.SetRoutingMark(c, s.appBypassMark); err != nil {
-			s.logf("set SO_MARK on %s %s: %v", network, address, err)
+	return buildMarkedPolicyNetwork(
+		s.appBypassMark,
+		s.features.DefaultTun,
+		s.logf,
+		sockopt.SetRoutingMark,
+	)
+}
+
+func buildMarkedPolicyNetwork(
+	mark uint32,
+	required bool,
+	logf func(string, ...any),
+	setMark func(any, uint32) error,
+) gonnect.Network {
+	setRoutingMark := func(network, address string, c syscall.RawConn) error {
+		if err := setMark(c, mark); err != nil {
+			logf("set SO_MARK on %s %s: %v", network, address, err)
+			if required {
+				return err
+			}
 		}
+		return nil
 	}
 	native := gonnect.NativeConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
-			setRoutingMark(network, address, c)
-			return nil
+			return setRoutingMark(network, address, c)
 		},
 		ControlContext: func(_ context.Context, network, address string, c syscall.RawConn) error {
-			setRoutingMark(network, address, c)
-			return nil
+			return setRoutingMark(network, address, c)
 		},
 		ListenCfg: &net.ListenConfig{
 			Control: func(network, address string, c syscall.RawConn) error {
-				setRoutingMark(network, address, c)
-				return nil
+				return setRoutingMark(network, address, c)
 			},
 		},
 	}.Build()
-	return policyNetwork{Network: native}
+	detached := gonnect.DetachNetwork(native, nil, nil)
+	return policyNetwork{Network: detached, closer: detached}
 }
 
 // policyNetwork prevents consumers from bypassing the socket-control hooks
@@ -460,9 +476,12 @@ func (s *System) buildMarkedNetwork() gonnect.Network {
 // is not safe to use as an unrestricted native network.
 type policyNetwork struct {
 	gonnect.Network
+	closer io.Closer
 }
 
 func (policyNetwork) IsNative() bool { return false }
+
+func (n policyNetwork) Close() error { return n.closer.Close() }
 
 // Close releases every object owned by System.
 func (s *System) Close() error {
@@ -489,6 +508,12 @@ func (s *System) Close() error {
 	s.mu.Unlock()
 
 	var err error
+	if closer, ok := s.outNet.(io.Closer); ok {
+		err = errors.Join(err, closer.Close())
+	}
+	if closer, ok := s.localNet.(io.Closer); ok {
+		err = errors.Join(err, closer.Close())
+	}
 	if defaultTun != nil {
 		err = errors.Join(err, defaultTun.closeActive())
 	}
@@ -990,7 +1015,7 @@ func (s *System) updateDefaultTunAddrsLocked(
 	}
 	oldRC := cloneDefaultTunRoutingConfig(*state.routingConfig)
 	newRC := cloneDefaultTunRoutingConfig(oldRC)
-	newRC.Families = routeFamilies(addrs, state.routes)
+	setDefaultTunRoutingFamilies(&newRC, addrs, state.routes)
 
 	if addedAddr == "" {
 		err = s.tunConfig.SetTunAddrs(resolved.tun, addrs)
@@ -1048,7 +1073,7 @@ func (s *System) setDefaultTunRoutesLocked(
 	}
 	oldRC := cloneDefaultTunRoutingConfig(*state.routingConfig)
 	newRC := cloneDefaultTunRoutingConfig(oldRC)
-	newRC.Families = routeFamilies(state.addrs, routes)
+	setDefaultTunRoutingFamilies(&newRC, state.addrs, routes)
 
 	if err := s.tunConfig.SetTunRoutes(resolved.tun, nil); err != nil {
 		return errors.Join(
@@ -1348,7 +1373,7 @@ func normalizeTunAddrs(
 			seen[cidr] = true
 			out = append(out, cidr)
 		}
-		if dnsAddr.IsValid() && prefix.Contains(dnsAddr) {
+		if dnsAddr.IsValid() && prefix.Addr() == dnsAddr {
 			containsDNS = true
 		}
 		if fallbackPrefix.IsValid() && prefix.Addr() == fallbackPrefix.Addr() {
@@ -1360,7 +1385,7 @@ func normalizeTunAddrs(
 		if !seen[cidr] {
 			out = append(out, cidr)
 		}
-		if dnsAddr.IsValid() && fallbackPrefix.Contains(dnsAddr) {
+		if dnsAddr.IsValid() && fallbackPrefix.Addr() == dnsAddr {
 			containsDNS = true
 		}
 	}
@@ -1487,6 +1512,17 @@ func routeFamilies(addrs, routes []string) routing.FamilySet {
 		return routing.BothFamilies
 	}
 	return f
+}
+
+func setDefaultTunRoutingFamilies(
+	config *routing.Config,
+	addrs, routes []string,
+) {
+	config.TunnelFamilies = routeFamilies(addrs, routes)
+	config.Families = config.TunnelFamilies
+	if config.Strictness == routing.Strict {
+		config.Families = routing.BothFamilies
+	}
 }
 
 func hexMark(mark uint32) string {

@@ -23,10 +23,9 @@ func TestCompileDesiredStateModeRules(t *testing.T) {
 			want: []Rule{
 				appLookupRule(100),
 				appUnreachableRule(101),
-				userLookupRule(103, unix.RT_TABLE_MAIN),
-				userUnreachableRule(104),
-				plainLookupRule(105, 300),
-				plainUnreachableRule(106),
+				userUnreachableRule(103),
+				plainLookupRule(104, 300),
+				plainUnreachableRule(105),
 			},
 		},
 		{
@@ -143,6 +142,40 @@ func TestCompileDesiredStateRoutes(t *testing.T) {
 			got.SafeRoutes,
 			[]Route{safeMainRoute},
 		)
+	}
+}
+
+func TestCompileDesiredStateBlocksPolicyFamilyWithoutTunnelRoute(t *testing.T) {
+	cfg := compilerTestConfig()
+	cfg.Families = BothFamilies
+	cfg.TunnelFamilies = FamilySet{IPv4: true}
+	cfg.Strictness = Strict
+
+	got, err := CompileDesiredState(cfg, Snapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, route := range got.VPNRoutes {
+		if route.Family == unix.AF_INET6 {
+			t.Fatalf("unsupported IPv6 route installed: %+v", route)
+		}
+	}
+	var ipv6 []Rule
+	for _, rule := range got.Rules {
+		if rule.Family == unix.AF_INET6 {
+			ipv6 = append(ipv6, rule)
+		}
+	}
+	want := []Rule{
+		appLookupRule(100),
+		appUnreachableRule(101),
+		plainUnreachableRule(103),
+	}
+	for i := range want {
+		want[i].Family = unix.AF_INET6
+	}
+	if !reflect.DeepEqual(ipv6, want) {
+		t.Fatalf("IPv6 rules = %#v, want %#v", ipv6, want)
 	}
 }
 

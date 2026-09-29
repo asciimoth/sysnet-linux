@@ -2535,10 +2535,10 @@ func checkDefaultTunRebuildDNSMutation(system *linux.System) error {
 			dnsIP,
 		)
 	}
-	if err := expectDNSRCodeAt(
-		"DNS mutation rebuilt starts detached",
+	if err := expectDNSAAt(
+		"DNS mutation rebuild preserves attached DNS",
 		rebuiltDNSIP,
-		gdns.RCodeServerFailure,
+		answerA,
 	); err != nil {
 		return err
 	}
@@ -2698,9 +2698,9 @@ func checkDefaultTunUnderlyingLinkRecreate(system *linux.System) error {
 	); err != nil {
 		return err
 	}
-	if err := expectDNSRCode(
-		"deleted-link rebuilt starts detached",
-		gdns.RCodeServerFailure,
+	if err := expectDNSA(
+		"deleted-link rebuild preserves attached DNS",
+		answerA,
 	); err != nil {
 		return err
 	}
@@ -3171,10 +3171,10 @@ func checkResolvedDefaultTunRebuildDNSMutation(system *linux.System) error {
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
-	if err := expectDNSRCodeAt(
-		"resolved DNS mutation rebuilt starts detached",
+	if err := expectDNSAAt(
+		"resolved DNS mutation rebuild preserves attached DNS",
 		"127.0.0.53",
-		gdns.RCodeServerFailure,
+		answerA,
 	); err != nil {
 		return err
 	}
@@ -3371,10 +3371,10 @@ func checkResolvedDefaultTunUnderlyingLinkRecreate(system *linux.System) error {
 	if err := flushResolvedCaches(); err != nil {
 		return err
 	}
-	if err := expectDNSRCodeAt(
-		"resolved deleted-link rebuilt starts detached",
+	if err := expectDNSAAt(
+		"resolved deleted-link rebuild preserves attached DNS",
 		"127.0.0.53",
-		gdns.RCodeServerFailure,
+		answerA,
 	); err != nil {
 		return err
 	}

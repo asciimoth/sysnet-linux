@@ -63,6 +63,23 @@ func TestValidateConfigRejectsInvalidValues(t *testing.T) {
 			},
 		},
 		{
+			name: "tunnel family outside policy",
+			update: func(cfg *Config) {
+				cfg.TunnelFamilies = FamilySet{IPv6: true}
+			},
+		},
+		{
+			name: "source route outside tunnel families",
+			update: func(cfg *Config) {
+				cfg.Families = BothFamilies
+				cfg.TunnelFamilies = FamilySet{IPv4: true}
+				cfg.SourceRoutes = []SourceRoute{{
+					Destination: netip.MustParsePrefix("2001:db8::/32"),
+					Source:      netip.MustParseAddr("2001:db8::2"),
+				}}
+			},
+		},
+		{
 			name: "invalid preferred source",
 			update: func(cfg *Config) {
 				cfg.SourceRoutes = []SourceRoute{{

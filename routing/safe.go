@@ -41,17 +41,35 @@ func ClassifySafeRoute(route Route, tunIndex int) SafeClassification {
 		}
 		return RouteSafe
 	}
-	if route.Gateway.IsValid() && route.Dst.Addr().IsGlobalUnicast() &&
-		!privateOrLocalPrefix(route.Dst) {
+	if route.Gateway.IsValid() && !privateOrLocalPrefix(route.Dst) {
 		return RouteUnsafe
 	}
 	return RouteSafe
 }
 
 func privateOrLocalPrefix(prefix netip.Prefix) bool {
-	addr := prefix.Addr()
-	if !addr.IsValid() {
+	if !prefix.IsValid() {
 		return false
 	}
-	return addr.IsPrivate() || addr.IsLinkLocalUnicast()
+	for _, allowed := range safeDestinationPrefixes(prefix.Addr()) {
+		if prefix.Bits() >= allowed.Bits() && allowed.Contains(prefix.Addr()) {
+			return true
+		}
+	}
+	return false
+}
+
+func safeDestinationPrefixes(addr netip.Addr) []netip.Prefix {
+	if addr.Is4() {
+		return []netip.Prefix{
+			netip.MustParsePrefix("10.0.0.0/8"),
+			netip.MustParsePrefix("172.16.0.0/12"),
+			netip.MustParsePrefix("192.168.0.0/16"),
+			netip.MustParsePrefix("169.254.0.0/16"),
+		}
+	}
+	return []netip.Prefix{
+		netip.MustParsePrefix("fc00::/7"),
+		netip.MustParsePrefix("fe80::/10"),
+	}
 }

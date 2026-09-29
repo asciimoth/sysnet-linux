@@ -181,8 +181,6 @@ func (r *DebianResolvconf) UnsetDNS() error {
 	}
 	active := r.setDNSActive
 	server := r.setDNS
-	r.setDNS = netip.Addr{}
-	r.setDNSActive = false
 	r.mu.Unlock()
 
 	if !active {
@@ -195,6 +193,14 @@ func (r *DebianResolvconf) UnsetDNS() error {
 	); refreshErr != nil {
 		err = errors.Join(err, refreshErr)
 	}
+	if err == nil {
+		r.mu.Lock()
+		if r.setDNSActive && r.setDNS == server {
+			r.setDNS = netip.Addr{}
+			r.setDNSActive = false
+		}
+		r.mu.Unlock()
+	}
 	return err
 }
 
@@ -202,20 +208,29 @@ func (r *DebianResolvconf) UnsetDNS() error {
 // forwarding resources. Close is idempotent.
 func (r *DebianResolvconf) Close() error {
 	r.mu.Lock()
-	if r.closed {
+	if r.closed && !r.setDNSActive {
 		r.mu.Unlock()
 		return nil
 	}
 	r.closed = true
 	active := r.setDNSActive
-	r.setDNSActive = false
+	server := r.setDNS
 	client := r.client
 	r.client = nil
 	r.mu.Unlock()
 
 	var err error
 	if active {
-		err = errors.Join(err, r.runResolvconf([]string{"-d", r.iface}, nil))
+		cleanupErr := r.runResolvconf([]string{"-d", r.iface}, nil)
+		err = errors.Join(err, cleanupErr)
+		if cleanupErr == nil {
+			r.mu.Lock()
+			if r.setDNS == server {
+				r.setDNS = netip.Addr{}
+				r.setDNSActive = false
+			}
+			r.mu.Unlock()
+		}
 	}
 	if r.base != nil {
 		err = errors.Join(err, r.base.Close())

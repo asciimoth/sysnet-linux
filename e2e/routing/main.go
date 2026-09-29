@@ -263,11 +263,10 @@ func checkExcludeStrict(manager *routing.Manager, cfg routing.Config) error {
 	); err != nil {
 		return err
 	}
-	if err := expectRoute(
+	if err := expectUnreachable(
 		"exclude strict user-marked default",
 		"8.8.8.8",
 		userMark,
-		"dev "+physLinkName,
 	); err != nil {
 		return err
 	}
@@ -287,11 +286,10 @@ func checkExcludeStrict(manager *routing.Manager, cfg routing.Config) error {
 	); err != nil {
 		return err
 	}
-	if err := expectRoute6(
+	if err := expectUnreachable6(
 		"exclude strict IPv6 user-marked default",
 		"2001:db8:ffff::8888",
 		userMark,
-		"dev "+physLinkName,
 	); err != nil {
 		return err
 	}
@@ -311,11 +309,10 @@ func checkExcludeStrict(manager *routing.Manager, cfg routing.Config) error {
 	); err != nil {
 		return err
 	}
-	if err := expectRoute(
+	if err := expectUnreachable(
 		"exclude strict marked safe route",
 		"172.28.9.9",
 		userMark,
-		"dev "+safeLinkName,
 	); err != nil {
 		return err
 	}
@@ -338,11 +335,10 @@ func checkExcludeStrict(manager *routing.Manager, cfg routing.Config) error {
 			log.Printf("restore primary default route failed: %v", err)
 		}
 	}()
-	if err := expectRoute(
-		"exclude strict marked traffic uses lower-priority direct default",
+	if err := expectUnreachable(
+		"exclude strict marked traffic ignores lower-priority direct default",
 		"8.8.8.8",
 		userMark,
-		"dev "+safeLinkName,
 	); err != nil {
 		return err
 	}

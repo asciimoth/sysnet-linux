@@ -342,7 +342,7 @@ func TestManagerApplyKeepsDesiredRuleThatMatchesOldGuard(t *testing.T) {
 	}
 	want := Rule{
 		Family:   unix.AF_INET,
-		Priority: config.PriorityBase + 6,
+		Priority: config.PriorityBase + 5,
 		Action:   RuleUnreachable,
 	}
 	if !slices.Contains(adapter.rules, want) {

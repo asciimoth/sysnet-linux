@@ -7,11 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"github.com/asciimoth/gonnect"
@@ -198,7 +196,7 @@ func New(config SystemConfig) (*System, error) {
 	if appMark == 0 {
 		appMark = routing.DefaultAppBypassMark
 	}
-	dnsNet := buildMarkedNetwork(appMark, logf)
+	dnsNet := buildMarkedNetwork(appMark, features.DefaultTun, logf)
 	var dnsProvider dns.DNSProvider
 	if features.DNSControl {
 		provider, err := autoSystemEnv.newDNSProvider(config, dnsNet, dnsNet)
@@ -216,6 +214,9 @@ func New(config SystemConfig) (*System, error) {
 	}
 
 	var extraClosers []io.Closer
+	if closer, ok := dnsNet.(io.Closer); ok {
+		extraClosers = append(extraClosers, closer)
+	}
 	var pmarkController PmarkController
 	if features.Pmark {
 		controller, closers, err := autoSystemEnv.newPmark(config, logf)
@@ -336,30 +337,15 @@ func pmarkPriority(config SystemConfig) int {
 
 func buildMarkedNetwork(
 	mark uint32,
+	required bool,
 	logf func(format string, args ...any),
 ) gonnect.Network {
-	setRoutingMark := func(network, address string, c syscall.RawConn) {
-		if err := sockopt.SetRoutingMark(c, mark); err != nil {
-			logf("set SO_MARK on %s %s: %v", network, address, err)
-		}
-	}
-	native := gonnect.NativeConfig{
-		Control: func(network, address string, c syscall.RawConn) error {
-			setRoutingMark(network, address, c)
-			return nil
-		},
-		ControlContext: func(_ context.Context, network, address string, c syscall.RawConn) error {
-			setRoutingMark(network, address, c)
-			return nil
-		},
-		ListenCfg: &net.ListenConfig{
-			Control: func(network, address string, c syscall.RawConn) error {
-				setRoutingMark(network, address, c)
-				return nil
-			},
-		},
-	}.Build()
-	return policyNetwork{Network: native}
+	return buildMarkedPolicyNetwork(
+		mark,
+		required,
+		logf,
+		sockopt.SetRoutingMark,
+	)
 }
 
 func newNativeRoutingManager() (RoutingManager, error) {

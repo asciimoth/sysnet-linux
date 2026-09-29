@@ -170,8 +170,6 @@ func (d *Direct) UnsetDNS() error {
 	}
 	active := d.setDNSActive
 	server := d.setDNS
-	d.setDNS = netip.Addr{}
-	d.setDNSActive = false
 	d.mu.Unlock()
 
 	if !active {
@@ -184,6 +182,14 @@ func (d *Direct) UnsetDNS() error {
 	); refreshErr != nil {
 		err = errors.Join(err, refreshErr)
 	}
+	if err == nil {
+		d.mu.Lock()
+		if d.setDNSActive && d.setDNS == server {
+			d.setDNS = netip.Addr{}
+			d.setDNSActive = false
+		}
+		d.mu.Unlock()
+	}
 	return err
 }
 
@@ -191,20 +197,29 @@ func (d *Direct) UnsetDNS() error {
 // resources. Close is idempotent.
 func (d *Direct) Close() error {
 	d.mu.Lock()
-	if d.closed {
+	if d.closed && !d.setDNSActive {
 		d.mu.Unlock()
 		return nil
 	}
 	d.closed = true
 	active := d.setDNSActive
-	d.setDNSActive = false
+	server := d.setDNS
 	client := d.client
 	d.client = nil
 	d.mu.Unlock()
 
 	var err error
 	if active {
-		err = errors.Join(err, d.restoreResolvConfIfOwned())
+		restoreErr := d.restoreResolvConfIfOwned()
+		err = errors.Join(err, restoreErr)
+		if restoreErr == nil {
+			d.mu.Lock()
+			if d.setDNS == server {
+				d.setDNS = netip.Addr{}
+				d.setDNSActive = false
+			}
+			d.mu.Unlock()
+		}
 	}
 	if d.base != nil {
 		err = errors.Join(err, d.base.Close())

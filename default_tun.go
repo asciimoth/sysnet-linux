@@ -31,6 +31,7 @@ type defaultTunState struct {
 	public           *defaultTun
 	tun              gtun.Tun
 	server           *gdns.Server
+	resolver         gdns.Interface
 	dnsIP            netip.Addr
 	generation       uint64
 	sourceGeneration uint64
@@ -149,6 +150,7 @@ func (s *System) BuildDefaultTun(
 
 	state.mu.Lock()
 	oldServer := state.server
+	oldResolver := state.resolver
 	oldDNSIP := state.dnsIP
 	oldRuleIDs := append([]uint64(nil), state.ruleIDs...)
 	oldPmarkChecker := state.pmarkChecker
@@ -233,9 +235,10 @@ func (s *System) BuildDefaultTun(
 			return nil, fail(err)
 		}
 		server = gdns.NewServer(conn, nil, nil)
+		if oldResolver != nil {
+			server.Attach(oldResolver)
+		}
 		serverReplaced = true
-	} else if server != nil {
-		server.Detach()
 	}
 
 	var pmarkConfig defaultTunPmarkConfig
@@ -279,7 +282,8 @@ func (s *System) BuildDefaultTun(
 	rc.AppBypassMask = s.appBypassMask
 	rc.UserMark = s.userMark
 	rc.UserMarkMask = s.userMarkMask
-	rc.Families = routeFamilies(addrs, routes)
+	rc.TunnelFamilies = routeFamilies(addrs, routes)
+	rc.Families = rc.TunnelFamilies
 	rc.SourceRoutes = sourceRoutes
 	if len(opts.Include) > 0 {
 		rc.Mode = routing.ModeInclude
@@ -288,6 +292,7 @@ func (s *System) BuildDefaultTun(
 	}
 	if opts.Strict {
 		rc.Strictness = routing.Strict
+		rc.Families = routing.BothFamilies
 	} else {
 		rc.Strictness = routing.NonStrict
 	}
@@ -642,9 +647,11 @@ func (d *defaultTun) SetDNS(resolver gdns.Interface) error {
 	}
 	if resolver == nil {
 		d.server.Detach()
+		d.resolver = nil
 		return nil
 	}
 	d.server.Attach(resolver)
+	d.resolver = resolver
 	return nil
 }
 
@@ -672,6 +679,7 @@ func (d *defaultTunState) closeActive() error {
 	d.mu.Lock()
 	server := d.server
 	d.server = nil
+	d.resolver = nil
 	rc := d.routingConfig
 	d.routingConfig = nil
 	ksID := d.killswitchID

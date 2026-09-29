@@ -107,6 +107,50 @@ func TestClassifySafeRoute(t *testing.T) {
 	}
 }
 
+func TestClassifySafeRouteChecksWholeGatewayPrefix(t *testing.T) {
+	tests := []struct {
+		prefix string
+		want   SafeClassification
+	}{
+		{"10.0.0.0/8", RouteSafe},
+		{"10.0.0.0/7", RouteUnsafe},
+		{"172.16.0.0/12", RouteSafe},
+		{"172.16.0.0/11", RouteUnsafe},
+		{"192.168.0.0/16", RouteSafe},
+		{"192.168.0.0/15", RouteUnsafe},
+		{"169.254.0.0/16", RouteSafe},
+		{"169.254.0.0/15", RouteUnsafe},
+		{"0.0.0.0/1", RouteUnsafe},
+		{"fc00::/7", RouteSafe},
+		{"fc00::/6", RouteUnsafe},
+		{"fe80::/10", RouteSafe},
+		{"fe80::/9", RouteUnsafe},
+		{"::/1", RouteUnsafe},
+	}
+	for _, test := range tests {
+		t.Run(test.prefix, func(t *testing.T) {
+			prefix := netip.MustParsePrefix(test.prefix)
+			gateway := "192.168.1.1"
+			family := unix.AF_INET
+			if prefix.Addr().Is6() {
+				gateway = "fe80::1"
+				family = unix.AF_INET6
+			}
+			route := routeWithGateway(family, test.prefix, gateway)
+			if got := ClassifySafeRoute(route, 9); got != test.want {
+				t.Fatalf("ClassifySafeRoute() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestClassifySafeRouteKeepsConnectedPublicPrefix(t *testing.T) {
+	route := routeWithDst(unix.AF_INET, "203.0.113.0/24")
+	if got := ClassifySafeRoute(route, 9); got != RouteSafe {
+		t.Fatalf("connected route = %v, want safe", got)
+	}
+}
+
 func routeWithDst(family int, dst string) Route {
 	return Route{
 		Family:    family,

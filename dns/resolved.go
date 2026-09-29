@@ -1095,23 +1095,25 @@ func (b *resolvedRouteBuilder) config() ([]resolvedUpstreamRoute, []string) {
 
 func resolvedRouteFunc(routes []resolvedUpstreamRoute) gdns.RouteFunc {
 	routes = append([]resolvedUpstreamRoute(nil), routes...)
-	sort.SliceStable(routes, func(i, j int) bool {
-		return longestDomain(
-			routes[i].domains,
-		) > longestDomain(
-			routes[j].domains,
-		)
-	})
 	return func(msg *gdns.Message) string {
 		name := resolvedQuestionName(msg)
+		bestName := ""
+		bestLength := -1
 		for _, route := range routes {
 			for _, domain := range route.domains {
 				if domain == "." || dnsNameMatchesDomain(name, domain) {
-					return route.name
+					length := len(domain)
+					if domain == "." {
+						length = 0
+					}
+					if length > bestLength {
+						bestName = route.name
+						bestLength = length
+					}
 				}
 			}
 		}
-		return ""
+		return bestName
 	}
 }
 
@@ -1129,10 +1131,7 @@ func dnsNameMatchesDomain(name, domain string) bool {
 func longestDomain(domains []string) int {
 	var maxLen int
 	for _, domain := range domains {
-		if domain == "." {
-			continue
-		}
-		if len(domain) > maxLen {
+		if domain != "." && len(domain) > maxLen {
 			maxLen = len(domain)
 		}
 	}

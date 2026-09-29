@@ -21,8 +21,12 @@ func CompileDesiredState(
 	config = cloneConfig(config)
 
 	state := DesiredState{Config: config}
+	tunnelFamilies := effectiveTunnelFamilies(config)
 	for _, family := range familyConstants(config.Families) {
 		state.Rules = append(state.Rules, compileRules(config, family)...)
+		if !familyEnabled(tunnelFamilies, family) {
+			continue
+		}
 		defaultRoute := Route{
 			Family:    family,
 			Table:     config.VPNTable,
@@ -187,10 +191,13 @@ func compileRules(config Config, family int) []Rule {
 			Mask:   config.UserMarkMask,
 		}
 	}
+	if !familyEnabled(effectiveTunnelFamilies(config), family) {
+		add(all(RuleUnreachable, 0))
+		return rules
+	}
 
 	switch {
 	case config.Mode == ModeExclude && config.Strictness == Strict:
-		add(user(RuleLookup, unix.RT_TABLE_MAIN))
 		add(user(RuleUnreachable, 0))
 		add(all(RuleLookup, config.VPNTable))
 		add(all(RuleUnreachable, 0))
@@ -211,6 +218,13 @@ func compileRules(config Config, family int) []Rule {
 		add(all(RuleLookup, unix.RT_TABLE_MAIN))
 	}
 	return rules
+}
+
+func effectiveTunnelFamilies(config Config) FamilySet {
+	if !config.TunnelFamilies.IPv4 && !config.TunnelFamilies.IPv6 {
+		return config.Families
+	}
+	return config.TunnelFamilies
 }
 
 func markRule(

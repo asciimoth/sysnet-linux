@@ -108,7 +108,12 @@ type Config struct {
 
 	Mode       Mode
 	Strictness Strictness
-	Families   FamilySet
+	// Families selects the families covered by policy rules.
+	Families FamilySet
+	// TunnelFamilies selects the families that the TUN can carry. An empty
+	// value means all policy families for compatibility with direct users of
+	// this package.
+	TunnelFamilies FamilySet
 }
 
 // DefaultConfig returns a conservative starting point. Callers must still set
@@ -219,6 +224,14 @@ func (c Config) validate() error {
 			ErrInvalidConfig,
 		)
 	}
+	if (c.TunnelFamilies.IPv4 && !c.Families.IPv4) ||
+		(c.TunnelFamilies.IPv6 && !c.Families.IPv6) {
+		return fmt.Errorf(
+			"%w: tunnel families must be covered by policy families",
+			ErrInvalidConfig,
+		)
+	}
+	tunnelFamilies := effectiveTunnelFamilies(c)
 	seenSourceRoutes := make(map[netip.Prefix]netip.Addr, len(c.SourceRoutes))
 	for i, route := range c.SourceRoutes {
 		if !route.Destination.IsValid() ||
@@ -254,9 +267,9 @@ func (c Config) validate() error {
 		if route.Source.Is4() {
 			family = unix.AF_INET
 		}
-		if !familyEnabled(c.Families, family) {
+		if !familyEnabled(tunnelFamilies, family) {
 			return fmt.Errorf(
-				"%w: source route %d uses a disabled address family",
+				"%w: source route %d uses a family not carried by the TUN",
 				ErrInvalidConfig,
 				i,
 			)

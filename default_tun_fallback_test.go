@@ -41,7 +41,7 @@ func TestNormalizeTunAddrsFallbackHostCollision(t *testing.T) {
 			wantDNS: netip.MustParseAddr("10.250.0.1"),
 		},
 		{
-			name: "caller DNS",
+			name: "unassigned caller DNS",
 			addrs: []string{
 				"10.250.0.1/32",
 				"192.0.2.1/24",
@@ -50,6 +50,19 @@ func TestNormalizeTunAddrsFallbackHostCollision(t *testing.T) {
 			want: []string{
 				"10.250.0.1/32",
 				"192.0.2.1/24",
+			},
+			wantDNS: netip.MustParseAddr("10.250.0.1"),
+		},
+		{
+			name: "assigned caller DNS",
+			addrs: []string{
+				"10.250.0.1/32",
+				"192.0.2.53/24",
+			},
+			dnsIP: "192.0.2.53",
+			want: []string{
+				"10.250.0.1/32",
+				"192.0.2.53/24",
 			},
 			wantDNS: netip.MustParseAddr("192.0.2.53"),
 		},
