@@ -1,7 +1,7 @@
 typos:
   typos
 
-check: tidy typos fmt lint vet test-total
+check: tidy typos fmt lint vet test e2e
 
 vet:
 	go vet ./...
@@ -44,4 +44,6 @@ e2e-routing:
 e2e-system:
 	./e2e/system/run.sh
 
-test-total: test e2e-dns e2e-routing e2e-system
+e2e: e2e-dns e2e-routing e2e-system
+
+test-total: test e2e
