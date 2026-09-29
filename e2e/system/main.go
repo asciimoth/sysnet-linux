@@ -46,6 +46,8 @@ const (
 	physLinkName = "snrt-phys0"
 	peerLinkName = "snrt-peer0"
 	safeLinkName = "snrt-safe0"
+	wifiLinkName = "snrt-wifi0"
+	wifiPeerName = "snrt-wifi1"
 	rpfLinkName  = "snrt-rpf0"
 	rpfPeerName  = "snrt-rpf1"
 	rpfNetNSName = "snrt-rpf-ns"
@@ -60,6 +62,8 @@ const (
 	userMark                     = 0x4d000001
 	sourceRouteRebuildIterations = 32
 	pmarkVTunCurlIterations      = 64
+	laptopSwitchIterations       = 3
+	laptopStateHold              = 200 * time.Millisecond
 
 	socketProbeMode  = "socket-probe"
 	rpfHTTPServeMode = "rpfilter-http-server"
@@ -354,6 +358,12 @@ func runResolved() error {
 		return err
 	}
 	if err := checkDefaultTunRuleContexts(system, pmarkCtl); err != nil {
+		return err
+	}
+	if err := checkResolvedLaptopSwitching(system, true); err != nil {
+		return err
+	}
+	if err := checkResolvedLaptopSwitching(system, false); err != nil {
 		return err
 	}
 	return nil
@@ -2859,6 +2869,358 @@ func checkResolvedDefaultTunLifecycle(
 		return err
 	}
 	return nil
+}
+
+type laptopNetworkState struct {
+	name      string
+	link      string
+	lanPrefix string
+	lanTarget string
+	dnsServer *recordingDNSServer
+	dnsAnswer netip.Addr
+	otherLAN  string
+	connected bool
+}
+
+func checkResolvedLaptopSwitching(
+	system *linux.System,
+	strict bool,
+) error {
+	mode := "non-strict"
+	if strict {
+		mode = "strict"
+	}
+	ethernet, wifi, disconnected, cleanup, err := setupLaptopNetworks()
+	if err != nil {
+		return fmt.Errorf("%s laptop setup: %w", mode, err)
+	}
+	defer cleanup()
+
+	dt, err := system.BuildDefaultTun(sysnet.DefaultTunOpts{
+		TunAddrs: []string{dnsIP + "/32"},
+		DnsIP:    dnsIP,
+		MTU:      1400,
+		Strict:   strict,
+	})
+	if err != nil {
+		return fmt.Errorf("build %s laptop DefaultTun: %w", mode, err)
+	}
+	defer func() { _ = dt.Close() }()
+	tunName, err := dt.Name()
+	if err != nil {
+		return fmt.Errorf("%s laptop DefaultTun name: %w", mode, err)
+	}
+
+	states := []laptopNetworkState{
+		ethernet,
+		disconnected,
+		wifi,
+		disconnected,
+	}
+	for iteration := range laptopSwitchIterations {
+		for _, state := range states {
+			label := fmt.Sprintf(
+				"%s laptop iteration %d %s",
+				mode,
+				iteration+1,
+				state.name,
+			)
+			if err := applyLaptopNetworkState(
+				ethernet,
+				wifi,
+				state,
+			); err != nil {
+				return fmt.Errorf("%s transition: %w", label, err)
+			}
+			if err := checkLaptopNetworkState(
+				system,
+				tunName,
+				strict,
+				state,
+				label,
+			); err != nil {
+				return err
+			}
+			time.Sleep(laptopStateHold)
+		}
+	}
+	return nil
+}
+
+func setupLaptopNetworks() (
+	laptopNetworkState,
+	laptopNetworkState,
+	laptopNetworkState,
+	func(),
+	error,
+) {
+	cleanup := func() {
+		_ = revertResolvedLinkByName(physLinkName)
+		_ = revertResolvedLinkByName(wifiLinkName)
+		_ = ip("route", "del", "10.210.1.0/24")
+		_ = ip("route", "del", "10.210.2.0/24")
+		_ = ip("link", "del", wifiLinkName)
+		_ = ip("link", "set", physLinkName, "up")
+		for ip("route", "del", "default") == nil {
+		}
+		_ = ip(
+			"route", "add", "default",
+			"dev", physLinkName,
+		)
+	}
+	_ = ip("link", "del", wifiLinkName)
+	if err := ip(
+		"link", "add", wifiLinkName,
+		"type", "veth", "peer", "name", wifiPeerName,
+	); err != nil {
+		return laptopNetworkState{}, laptopNetworkState{},
+			laptopNetworkState{}, cleanup, err
+	}
+	commands := [][]string{
+		{"link", "set", wifiLinkName, "up"},
+		{"link", "set", wifiPeerName, "up"},
+		{"addr", "add", "203.0.113.2/24", "dev", wifiLinkName},
+		{"addr", "add", "203.0.113.1/24", "dev", wifiPeerName},
+	}
+	for _, args := range commands {
+		if err := ip(args...); err != nil {
+			cleanup()
+			return laptopNetworkState{}, laptopNetworkState{},
+				laptopNetworkState{}, cleanup, err
+		}
+	}
+
+	ethernetDNS, err := newRecordingDNSServer(
+		netip.MustParseAddr("198.51.100.2"),
+		netip.MustParseAddr("203.0.113.201"),
+	)
+	if err != nil {
+		cleanup()
+		return laptopNetworkState{}, laptopNetworkState{},
+			laptopNetworkState{}, cleanup, err
+	}
+	wifiDNS, err := newRecordingDNSServer(
+		netip.MustParseAddr("203.0.113.2"),
+		netip.MustParseAddr("203.0.113.202"),
+	)
+	if err != nil {
+		_ = ethernetDNS.Close()
+		cleanup()
+		return laptopNetworkState{}, laptopNetworkState{},
+			laptopNetworkState{}, cleanup, err
+	}
+	baseCleanup := cleanup
+	cleanup = func() {
+		_ = ethernetDNS.Close()
+		_ = wifiDNS.Close()
+		baseCleanup()
+	}
+
+	ethernet := laptopNetworkState{
+		name:      "ethernet",
+		link:      physLinkName,
+		lanPrefix: "10.210.1.0/24",
+		lanTarget: "10.210.1.1",
+		dnsServer: ethernetDNS,
+		dnsAnswer: ethernetDNS.answer,
+		otherLAN:  "10.210.2.1",
+		connected: true,
+	}
+	wifi := laptopNetworkState{
+		name:      "wifi",
+		link:      wifiLinkName,
+		lanPrefix: "10.210.2.0/24",
+		lanTarget: "10.210.2.1",
+		dnsServer: wifiDNS,
+		dnsAnswer: wifiDNS.answer,
+		otherLAN:  "10.210.1.1",
+		connected: true,
+	}
+	disconnected := laptopNetworkState{name: "no-network"}
+	return ethernet, wifi, disconnected, cleanup, nil
+}
+
+func applyLaptopNetworkState(
+	ethernet laptopNetworkState,
+	wifi laptopNetworkState,
+	state laptopNetworkState,
+) error {
+	for ip("route", "del", "default") == nil {
+	}
+	for _, network := range []laptopNetworkState{ethernet, wifi} {
+		_ = ip("route", "del", network.lanPrefix)
+		if err := revertResolvedLinkByName(network.link); err != nil {
+			return err
+		}
+		if err := ip("link", "set", network.link, "down"); err != nil {
+			return err
+		}
+	}
+	if !state.connected {
+		return flushResolvedCaches()
+	}
+	if err := ip("link", "set", state.link, "up"); err != nil {
+		return err
+	}
+	if err := ip(
+		"route", "add", "default",
+		"dev", state.link,
+	); err != nil {
+		return err
+	}
+	if err := ip(
+		"route", "add", state.lanPrefix,
+		"dev", state.link,
+	); err != nil {
+		return err
+	}
+	ifidx, err := linkIndex(state.link)
+	if err != nil {
+		return err
+	}
+	if err := configureResolvedLinkDNS(
+		ifidx,
+		state.dnsServer.addr,
+		nil,
+		true,
+	); err != nil {
+		return err
+	}
+	return flushResolvedCaches()
+}
+
+func checkLaptopNetworkState(
+	system *linux.System,
+	tunName string,
+	strict bool,
+	state laptopNetworkState,
+	label string,
+) error {
+	if !state.connected {
+		if err := waitFor(func() error {
+			output, err := routeGet(
+				"-4",
+				"8.8.8.8",
+				routing.DefaultAppBypassMark,
+			)
+			if err == nil {
+				return fmt.Errorf(
+					"marked route unexpectedly succeeded: %q",
+					output,
+				)
+			}
+			return nil
+		}); err != nil {
+			return fmt.Errorf("%s transient unreachable route: %w", label, err)
+		}
+		for _, target := range []string{"10.210.1.1", "10.210.2.1"} {
+			if err := waitForExpectedRoute(
+				label+" stale LAN "+target,
+				target,
+				0,
+				"dev "+tunName,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if err := waitForExpectedRoute(
+		label+" marked outnet",
+		"8.8.8.8",
+		routing.DefaultAppBypassMark,
+		"dev "+state.link,
+	); err != nil {
+		return err
+	}
+	wantLANLink := state.link
+	if strict {
+		wantLANLink = tunName
+	}
+	if err := waitForExpectedRoute(
+		label+" active LAN",
+		state.lanTarget,
+		0,
+		"dev "+wantLANLink,
+	); err != nil {
+		return err
+	}
+	if err := waitForExpectedRoute(
+		label+" old LAN",
+		state.otherLAN,
+		0,
+		"dev "+tunName,
+	); err != nil {
+		return err
+	}
+	queryName := uniqueDNSName("laptop-" + state.name)
+	if err := waitFor(func() error {
+		return expectDNSAFromInterface(
+			system.OutDNS(),
+			queryName,
+			state.dnsAnswer,
+		)
+	}); err != nil {
+		return fmt.Errorf("%s dynamic resolved upstream: %w", label, err)
+	}
+	return state.dnsServer.waitForQuery(queryName, label+" DNS")
+}
+
+func waitForExpectedRoute(
+	name string,
+	destination string,
+	mark uint32,
+	want string,
+) error {
+	return waitFor(func() error {
+		return expectRoute(name, destination, mark, want)
+	})
+}
+
+func expectDNSAFromInterface(
+	resolver gdns.Interface,
+	name string,
+	want netip.Addr,
+) error {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		500*time.Millisecond,
+	)
+	defer cancel()
+	resp, err := gdns.Query(ctx, resolver, &gdns.Message{
+		ID:               gdns.NextID(),
+		Opcode:           gdns.OpcodeQuery,
+		RecursionDesired: true,
+		Questions: []gdns.Question{{
+			Name:  name,
+			Type:  gdns.TypeA,
+			Class: gdns.ClassIN,
+		}},
+	})
+	if err != nil {
+		return err
+	}
+	if resp.RCode != gdns.RCodeSuccess {
+		return fmt.Errorf("RCode = %d, want success", resp.RCode)
+	}
+	for _, answer := range resp.Answers {
+		if answer.Type != gdns.TypeA || len(answer.Data) != net.IPv4len {
+			continue
+		}
+		if got := netip.AddrFrom4([4]byte(answer.Data)); got == want {
+			return nil
+		}
+	}
+	return fmt.Errorf("answers = %+v, want A %s", resp.Answers, want)
+}
+
+func revertResolvedLinkByName(name string) error {
+	ifidx, err := linkIndex(name)
+	if err != nil {
+		return nil
+	}
+	return revertResolvedLink(ifidx)
 }
 
 func checkResolvedDefaultTunDNSWarnings(system *linux.System) error {

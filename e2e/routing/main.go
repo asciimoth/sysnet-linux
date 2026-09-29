@@ -10,6 +10,7 @@ import (
 	"log"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/asciimoth/sysnet-linux/routing"
 	"github.com/vishvananda/netlink"
@@ -1143,47 +1144,61 @@ func expectRoute(name, dst string, mark uint32, contains string) error {
 }
 
 func expectRouteAny(name, dst string, mark uint32, containsAny []string) error {
-	output, err := routeGet("-4", dst, mark)
-	if err != nil {
-		return fmt.Errorf(
-			"%s: route get failed with output %q: %w",
-			name,
-			output,
-			err,
-		)
-	}
-	for _, contains := range containsAny {
-		if strings.Contains(output, contains) {
-			return nil
+	var lastErr error
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		output, err := routeGet("-4", dst, mark)
+		if err == nil {
+			for _, contains := range containsAny {
+				if strings.Contains(output, contains) {
+					return nil
+				}
+			}
+			lastErr = fmt.Errorf(
+				"%s: route %q does not contain any of %q",
+				name,
+				output,
+				containsAny,
+			)
+		} else {
+			lastErr = fmt.Errorf(
+				"%s: route get failed with output %q: %w",
+				name,
+				output,
+				err,
+			)
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	return fmt.Errorf(
-		"%s: route %q does not contain any of %q",
-		name,
-		output,
-		containsAny,
-	)
+	return lastErr
 }
 
 func expectRoute6(name, dst string, mark uint32, contains string) error {
-	output, err := routeGet("-6", dst, mark)
-	if err != nil {
-		return fmt.Errorf(
-			"%s: route get failed with output %q: %w",
-			name,
-			output,
-			err,
-		)
+	var lastErr error
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		output, err := routeGet("-6", dst, mark)
+		if err == nil && strings.Contains(output, contains) {
+			return nil
+		}
+		if err != nil {
+			lastErr = fmt.Errorf(
+				"%s: route get failed with output %q: %w",
+				name,
+				output,
+				err,
+			)
+		} else {
+			lastErr = fmt.Errorf(
+				"%s: route %q does not contain %q",
+				name,
+				output,
+				contains,
+			)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if !strings.Contains(output, contains) {
-		return fmt.Errorf(
-			"%s: route %q does not contain %q",
-			name,
-			output,
-			contains,
-		)
-	}
-	return nil
+	return lastErr
 }
 
 func expectUnreachable(name, dst string, mark uint32) error {
@@ -1239,20 +1254,32 @@ func expectTableRouteFamily(
 	family, table int,
 	prefix string,
 ) error {
-	routes, err := netlink.RouteListFiltered(
-		family,
-		&netlink.Route{Table: table},
-		netlink.RT_FILTER_TABLE,
-	)
-	if err != nil {
-		return fmt.Errorf("%s: list table %d: %w", name, table, err)
-	}
-	for _, route := range routes {
-		if tableRoutePrefix(route, family) == prefix {
-			return nil
+	var lastErr error
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		routes, err := netlink.RouteListFiltered(
+			family,
+			&netlink.Route{Table: table},
+			netlink.RT_FILTER_TABLE,
+		)
+		if err != nil {
+			lastErr = fmt.Errorf("%s: list table %d: %w", name, table, err)
+		} else {
+			for _, route := range routes {
+				if tableRoutePrefix(route, family) == prefix {
+					return nil
+				}
+			}
+			lastErr = fmt.Errorf(
+				"%s: table %d does not contain %s",
+				name,
+				table,
+				prefix,
+			)
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	return fmt.Errorf("%s: table %d does not contain %s", name, table, prefix)
+	return lastErr
 }
 
 func expectNoTableRouteFamily(

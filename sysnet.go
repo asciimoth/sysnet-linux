@@ -78,7 +78,10 @@ type Callbacks struct {
 	KillswitchUpdated    func(rules killswitch.AllowRules)
 }
 
-// RoutingManager is the routing.Manager surface used by System.
+// RoutingManager is the routing.Manager surface used by System. An injected
+// implementation must monitor host route changes itself if it supports
+// non-strict routing. The native manager returned by routing.NewManager does
+// this automatically.
 type RoutingManager interface {
 	Apply(routing.Config) error
 	Refresh() error
@@ -190,6 +193,9 @@ type Config struct {
 	// reads it for each lookup. An empty value uses /etc/hosts.
 	HostsFile string
 
+	// RoutingManager applies default-TUN policy routing. Custom managers must
+	// keep non-strict safe routes synchronized with host route changes. Use
+	// routing.NewManager for the native netlink-monitored implementation.
 	RoutingManager RoutingManager
 	Connmark       ConnmarkManager
 	Pmark          PmarkController
@@ -550,7 +556,18 @@ func (s *System) AllocSubnet() subnet.SubnetAllocator { return s.allocator }
 // OutDNS returns the DNS interface used by OutNet resolution.
 func (s *System) OutDNS() gdns.Interface { return s.outDNS }
 
-// OutNet returns app-marked outbound network.
+// OutNet returns an app-marked outbound network.
+//
+// Each new socket uses the current Linux main routing table, so new operations
+// follow changes between physical networks without rebuilding System. A socket
+// operation can fail while the host has no usable route. Existing connections
+// are not migrated or reconnected; they can stop when their interface or source
+// address disappears. Callers that need continuity must reconnect them.
+//
+// Hostname resolution follows dynamic network DNS changes only when the
+// selected DNSProvider supports them. The systemd-resolved provider does. The
+// direct, openresolv, and Debian resolvconf providers keep the upstream servers
+// that they read during initialization.
 func (s *System) OutNet() gonnect.Network {
 	if s.outNet == nil {
 		return &gonnect.RejectNetwork{}

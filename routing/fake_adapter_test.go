@@ -20,8 +20,13 @@ type fakeAdapter struct {
 	ops    []string
 
 	replaceRouteErr error
+	listRoutesErr   error
 	deleteRouteErr  func(Route) error
 	addRuleErr      func(Rule) error
+	closeStarted    chan struct{}
+	closeRelease    chan struct{}
+	closeErr        error
+	closeCalls      int
 }
 
 func newFakeAdapter() *fakeAdapter {
@@ -52,6 +57,9 @@ func (f *fakeAdapter) LinkByIndex(index int) error {
 }
 
 func (f *fakeAdapter) ListRoutes(family, table int) ([]Route, error) {
+	if f.listRoutesErr != nil {
+		return nil, f.listRoutesErr
+	}
 	var out []Route
 	for _, route := range f.routes {
 		if route.Family == family && route.Table == table {
@@ -117,7 +125,16 @@ func (f *fakeAdapter) DeleteRule(rule Rule) error {
 	return nil
 }
 
-func (f *fakeAdapter) Close() error { return nil }
+func (f *fakeAdapter) Close() error {
+	if f.closeStarted != nil {
+		close(f.closeStarted)
+	}
+	if f.closeRelease != nil {
+		<-f.closeRelease
+	}
+	f.closeCalls++
+	return f.closeErr
+}
 
 func appendWithoutRoute(routes []Route, remove Route) []Route {
 	return slices.DeleteFunc(routes, func(route Route) bool {

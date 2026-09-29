@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
+	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
 )
 
@@ -19,23 +22,58 @@ var (
 
 // Manager reconciles package-owned Linux routes and rules.
 type Manager struct {
-	mu      sync.Mutex
-	adapter netlinkAdapter
-	closed  bool
-	applied *DesiredState
+	mu        sync.Mutex
+	adapter   netlinkAdapter
+	closed    bool
+	applied   *DesiredState
+	closeDone chan struct{}
+	closeErr  error
+
+	monitorDone      chan struct{}
+	monitorWait      sync.WaitGroup
+	monitorSubscribe routeSubscribeFunc
+	monitorOptions   netlink.RouteSubscribeOptions
+	monitorNamespace *netns.NsHandle
+	monitorDebounce  time.Duration
+	monitorRetry     time.Duration
 }
 
 // NewManager creates a Manager backed by a real netlink handle.
+//
+// The manager monitors main-table route changes. While a non-strict policy is
+// active, it rebuilds the safe table after changes settle. The update is
+// asynchronous, so route changes can cause a short fail-closed interval before
+// the safe table matches the main table. Strict policies do not use the safe
+// table and do not require a refresh.
 func NewManager() (*Manager, error) {
 	adapter, err := newRealAdapter()
 	if err != nil {
 		return nil, err
 	}
-	return newManagerWithAdapter(adapter), nil
+	namespace, err := netns.Get()
+	if err != nil {
+		_ = adapter.Close()
+		return nil, fmt.Errorf("open route monitor namespace: %w", err)
+	}
+	manager := newManagerWithAdapter(adapter)
+	manager.monitorNamespace = &namespace
+	manager.monitorOptions.Namespace = &namespace
+	if err := manager.startRouteMonitor(
+		netlink.RouteSubscribeWithOptions,
+	); err != nil {
+		_ = adapter.Close()
+		_ = namespace.Close()
+		return nil, fmt.Errorf("monitor main routes: %w", err)
+	}
+	return manager, nil
 }
 
 func newManagerWithAdapter(adapter netlinkAdapter) *Manager {
-	return &Manager{adapter: adapter}
+	return &Manager{
+		adapter:         adapter,
+		monitorDebounce: defaultRouteMonitorDebounce,
+		monitorRetry:    defaultRouteMonitorRetry,
+	}
 }
 
 // Apply validates config, snapshots main, compiles desired routing state, and
@@ -71,8 +109,9 @@ func (m *Manager) Apply(config Config) error {
 	return nil
 }
 
-// Refresh rebuilds the safe table from the current main table while preserving
-// currently applied rules and VPN routes.
+// Refresh immediately rebuilds the safe table from the current main table
+// while preserving currently applied rules and VPN routes. NewManager also
+// calls this operation automatically after main-table route changes settle.
 func (m *Manager) Refresh() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -82,15 +121,11 @@ func (m *Manager) Refresh() error {
 	if m.applied == nil {
 		return errors.New("routing: refresh called before apply")
 	}
+	return m.refreshLocked()
+}
+
+func (m *Manager) refreshLocked() error {
 	config := m.applied.Config
-	snapshot, err := m.snapshotMain(config)
-	if err != nil {
-		return err
-	}
-	desired, err := CompileDesiredState(config, snapshot)
-	if err != nil {
-		return err
-	}
 	guardInstalled := false
 	fail := func(err error) error {
 		if guardInstalled {
@@ -105,6 +140,14 @@ func (m *Manager) Refresh() error {
 			return fail(fmt.Errorf("install transition guard: %w", err))
 		}
 		guardInstalled = true
+	}
+	snapshot, err := m.snapshotMain(config)
+	if err != nil {
+		return fail(err)
+	}
+	desired, err := CompileDesiredState(config, snapshot)
+	if err != nil {
+		return fail(err)
 	}
 	if err := m.flushTable(config, config.SafeTable); err != nil {
 		return fail(err)
@@ -178,15 +221,40 @@ func (m *Manager) Rollback(config Config) error {
 	return nil
 }
 
-// Close closes the underlying netlink handle. It does not rollback state.
+// Close stops route monitoring and closes the underlying netlink handle. It
+// does not rollback state.
 func (m *Manager) Close() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed {
-		return nil
+		done := m.closeDone
+		m.mu.Unlock()
+		if done != nil {
+			<-done
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.closeErr
 	}
 	m.closed = true
-	return m.adapter.Close()
+	closeDone := make(chan struct{})
+	m.closeDone = closeDone
+	done := m.monitorDone
+	if done != nil {
+		close(done)
+		m.monitorDone = nil
+	}
+	m.mu.Unlock()
+
+	m.monitorWait.Wait()
+	err := m.adapter.Close()
+	if m.monitorNamespace != nil {
+		err = errors.Join(err, m.monitorNamespace.Close())
+	}
+	m.mu.Lock()
+	m.closeErr = err
+	close(closeDone)
+	m.mu.Unlock()
+	return err
 }
 
 func (m *Manager) ensureOpen() error {
