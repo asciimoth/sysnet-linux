@@ -1,6 +1,7 @@
 # sysnet-linux
 
-`sysnet-linux` implements the [`sysnet.System`](https://pkg.go.dev/github.com/asciimoth/gonnect/sysnet#System) interface from the [`gonnect`](https://github.com/asciimoth/gonnect) library for Linux.
+`sysnet-linux` implements the [`sysnet.System`](https://pkg.go.dev/github.com/asciimoth/gonnect/sysnet#System) interface from the [`gonnect`](https://github.com/asciimoth/gonnect) library for Linux.  
+[sysnet-windows](https://github.com/asciimoth/sysnet-windows) provides a windows backend for same interface.
 
 The primary application for this package is [Almagest](https://github.com/asciimoth/almagest). You can also use it as the Linux backend of another VPN application that needs one cross-platform system-networking abstraction.
 
