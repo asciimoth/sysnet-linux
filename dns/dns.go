@@ -207,12 +207,7 @@ func DnsMode(ctx context.Context, env Env) (ret string, err error) {
 // NOTE: Borrowed from github.com/tailscale/tailscale
 func ResolvOwner(bs []byte) string {
 	likely := ""
-	b := bytes.NewBuffer(bs)
-	for {
-		line, err := b.ReadString('\n')
-		if err != nil {
-			return likely
-		}
+	for line := range strings.SplitSeq(string(bs), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -231,6 +226,7 @@ func ResolvOwner(bs []byte) string {
 			likely = "resolvconf"
 		}
 	}
+	return likely
 }
 
 // ResolvedIsActuallyResolver reports whether the system is using

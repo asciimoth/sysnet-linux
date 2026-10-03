@@ -166,6 +166,27 @@ func lookupLocalHost(
 
 	// #nosec G304 -- HostsFile is an explicit configuration value.
 	data, _ := os.ReadFile(hostsFile)
+	return lookupLocalHostData(data, network, host, addresses, seen)
+}
+
+func lookupLocalHostData(
+	data []byte,
+	network, host string,
+	addresses []netip.Addr,
+	seen map[netip.Addr]struct{},
+) ([]netip.Addr, bool, error) {
+	name := normalizeHostName(host)
+	appendAddress := func(address netip.Addr) {
+		address = address.Unmap()
+		if !addressMatchesNetwork(address, network) {
+			return
+		}
+		if _, found := seen[address]; found {
+			return
+		}
+		seen[address] = struct{}{}
+		addresses = append(addresses, address)
+	}
 	for line := range strings.SplitSeq(string(data), "\n") {
 		if comment := strings.IndexByte(line, '#'); comment >= 0 {
 			line = line[:comment]

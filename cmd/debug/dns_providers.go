@@ -15,6 +15,10 @@ import (
 
 func debugDNSFallbackAddrs() ([]netip.AddrPort, error) {
 	raw := os.Getenv("SYSNET_DEBUG_DNS_FALLBACKS")
+	return parseDebugDNSFallbackAddrs(raw)
+}
+
+func parseDebugDNSFallbackAddrs(raw string) ([]netip.AddrPort, error) {
 	if raw == "" {
 		return nil, nil
 	}

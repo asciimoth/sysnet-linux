@@ -75,7 +75,7 @@ func (f FQDN) WithTrailingDot() string {
 // WithoutTrailingDot returns f as a string, with the trailing dot
 // removed.
 func (f FQDN) WithoutTrailingDot() string {
-	return string(f[:len(f)-1])
+	return strings.TrimSuffix(string(f), ".")
 }
 
 func (f FQDN) NumLabels() int {

@@ -1,7 +1,13 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+set dotenv-load := true
+
 typos:
   typos
 
-check: tidy typos fmt lint vet test e2e
+check: tidy typos fmt lint vet test fuzz e2e
+
+fuzz:
+  ./scripts/fuzz.sh
 
 vet:
 	go vet ./...

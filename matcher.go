@@ -134,14 +134,7 @@ func readMatcherProcessInfo(
 				err,
 			)
 		}
-		parts := bytes.Split(bytes.Trim(cmdline, "\x00"), []byte{0})
-		args := make([]string, 0, len(parts))
-		for _, part := range parts {
-			if len(part) != 0 {
-				args = append(args, string(part))
-			}
-		}
-		info.Cmdline = strings.Join(args, " ")
+		info.Cmdline = parseProcessCmdline(cmdline)
 	}
 	if fields&matcherProcessExecutable != 0 {
 		executable, err := os.Readlink(filepath.Join(procDir, "exe"))
@@ -155,6 +148,17 @@ func readMatcherProcessInfo(
 		info.Exe = executable
 	}
 	return info, nil
+}
+
+func parseProcessCmdline(cmdline []byte) string {
+	parts := bytes.Split(bytes.Trim(cmdline, "\x00"), []byte{0})
+	args := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if len(part) != 0 {
+			args = append(args, string(part))
+		}
+	}
+	return strings.Join(args, " ")
 }
 
 func (m *socketMatcher) Close() error {

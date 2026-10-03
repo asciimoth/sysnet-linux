@@ -162,6 +162,16 @@ func completeColonFileRule(
 	if err != nil {
 		return nil, err
 	}
+	return completeColonFileData(data, prefix, ids, nameField, idField), nil
+}
+
+func completeColonFileData(
+	data []byte,
+	prefix string,
+	ids bool,
+	nameField int,
+	idField int,
+) []string {
 	values := make([]string, 0)
 	seen := make(map[string]bool)
 	for _, line := range strings.Split(string(data), "\n") {
@@ -183,10 +193,10 @@ func completeColonFileRule(
 		values = append(values, value)
 	}
 	if len(values) == 0 {
-		return nil, nil
+		return nil
 	}
 	sort.Strings(values)
-	return values, nil
+	return values
 }
 
 func completeExecRule(prefix string) (values []string, err error) {
@@ -399,6 +409,10 @@ func processStatusIDs(pid uint32) (uid uint32, gid uint32, ok bool) {
 	if err != nil {
 		return 0, 0, false
 	}
+	return parseProcessStatusIDs(data)
+}
+
+func parseProcessStatusIDs(data []byte) (uid uint32, gid uint32, ok bool) {
 	var gotUID, gotGID bool
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)

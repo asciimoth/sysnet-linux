@@ -56,8 +56,12 @@ func (c *Config) Write(w io.Writer, owner string) error {
 	if len(c.SearchDomains) > 0 {
 		io.WriteString(buf, "search") //nolint
 		for _, domain := range c.SearchDomains {
-			io.WriteString(buf, " ")                         //nolint
-			io.WriteString(buf, domain.WithoutTrailingDot()) //nolint
+			value := domain.WithoutTrailingDot()
+			if domain == "." {
+				value = "."
+			}
+			io.WriteString(buf, " ")   //nolint
+			io.WriteString(buf, value) //nolint
 		}
 		io.WriteString(buf, "\n") //nolint
 	}
@@ -99,15 +103,7 @@ func Parse(r io.Reader) (*Config, error) {
 					line,
 				)
 			}
-			for len(domains) > 0 {
-				domain := domains
-				i := strings.IndexAny(domain, " \t")
-				if i != -1 {
-					domain = domain[:i]
-					domains = strings.TrimSpace(domains[i+1:])
-				} else {
-					domains = ""
-				}
+			for _, domain := range strings.Fields(domains) {
 				fqdn, err := dnsname.ToFQDN(domain)
 				if err != nil {
 					return nil, fmt.Errorf(
@@ -120,6 +116,9 @@ func Parse(r io.Reader) (*Config, error) {
 				config.SearchDomains = append(config.SearchDomains, fqdn)
 			}
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan resolv.conf: %w", err)
 	}
 	return config, nil
 }
