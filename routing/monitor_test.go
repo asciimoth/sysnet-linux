@@ -176,14 +176,34 @@ func TestManagerRouteMonitorGuardsBeforeSnapshotAndKeepsGuardOnFailure(
 	)
 }
 
-func TestManagerRouteMonitorResubscribesAndRefreshesAfterClosure(t *testing.T) {
+func TestManagerPinnedRouteMonitorResubscribesAndRefreshesAfterClosure(
+	t *testing.T,
+) {
+	testManagerRouteMonitorResubscribesAndRefreshesAfterClosure(t, true)
+}
+
+func TestManagerCurrentRouteMonitorResubscribesAndRefreshesAfterClosure(
+	t *testing.T,
+) {
+	testManagerRouteMonitorResubscribesAndRefreshesAfterClosure(t, false)
+}
+
+func testManagerRouteMonitorResubscribesAndRefreshesAfterClosure(
+	t *testing.T,
+	pinned bool,
+) {
+	t.Helper()
 	adapter := newFakeAdapter()
 	adapter.routes = append(adapter.routes, route("192.168.10.0/24"))
 	manager := newManagerWithAdapter(adapter)
 	manager.monitorDebounce = 5 * time.Millisecond
 	manager.monitorRetry = 10 * time.Millisecond
 	namespace := netns.NsHandle(123)
-	manager.monitorOptions.Namespace = &namespace
+	var wantNamespace *netns.NsHandle
+	if pinned {
+		wantNamespace = &namespace
+		manager.monitorOptions.Namespace = wantNamespace
+	}
 	type testSubscription struct {
 		fail      chan struct{}
 		namespace *netns.NsHandle
@@ -218,16 +238,24 @@ func TestManagerRouteMonitorResubscribesAndRefreshesAfterClosure(t *testing.T) {
 		t.Fatalf("Apply error = %v", err)
 	}
 	first := awaitRouteSubscription(t, subscriptions)
-	if first.namespace != &namespace {
-		t.Fatal("initial subscription did not use captured namespace")
+	if first.namespace != wantNamespace {
+		t.Fatalf(
+			"initial subscription namespace = %v, want %v",
+			first.namespace,
+			wantNamespace,
+		)
 	}
 	manager.mu.Lock()
 	adapter.routes = append(adapter.routes, route("10.44.0.0/24"))
 	manager.mu.Unlock()
 	close(first.fail)
 	second := awaitRouteSubscription(t, subscriptions)
-	if second.namespace != &namespace {
-		t.Fatal("recovered subscription changed namespace")
+	if second.namespace != wantNamespace {
+		t.Fatalf(
+			"recovered subscription namespace = %v, want %v",
+			second.namespace,
+			wantNamespace,
+		)
 	}
 	awaitManagerSafeRoutes(
 		t,

@@ -50,6 +50,9 @@ e2e-routing:
 e2e-system:
 	./e2e/system/run.sh
 
-e2e: e2e-dns e2e-routing e2e-system
+e2e-current-namespace:
+	./e2e/currentnamespace/run.sh
+
+e2e: e2e-dns e2e-routing e2e-system e2e-current-namespace
 
 test-total: test e2e

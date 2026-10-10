@@ -80,8 +80,8 @@ type Callbacks struct {
 
 // RoutingManager is the routing.Manager surface used by System. An injected
 // implementation must monitor host route changes itself if it supports
-// non-strict routing. The native manager returned by routing.NewManager does
-// this automatically.
+// non-strict routing. The native managers returned by routing.NewManager and
+// routing.NewManagerCurrentNamespace do this automatically.
 type RoutingManager interface {
 	Apply(routing.Config) error
 	Refresh() error

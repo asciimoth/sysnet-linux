@@ -20,6 +20,7 @@ import (
 	pmark "github.com/asciimoth/p-mark"
 	"github.com/asciimoth/sysnet-linux/dns"
 	"github.com/asciimoth/sysnet-linux/killswitch"
+	"github.com/asciimoth/sysnet-linux/routing"
 )
 
 func FuzzUntrustedInput(f *testing.F) {
@@ -281,7 +282,7 @@ func fuzzAutoConstructor(data []byte) {
 			return nil
 		},
 		waitTUNProbeRetry: func(time.Duration) {},
-		newRoutingManager: func() (RoutingManager, error) {
+		newRoutingManager: func(routing.ManagerOptions) (RoutingManager, error) {
 			if flag(2) {
 				return nil, injected
 			}

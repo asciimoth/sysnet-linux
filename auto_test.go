@@ -17,6 +17,7 @@ import (
 	gtun "github.com/asciimoth/gonnect/tun"
 	"github.com/asciimoth/sysnet-linux/dns"
 	"github.com/asciimoth/sysnet-linux/killswitch"
+	"github.com/asciimoth/sysnet-linux/routing"
 )
 
 func TestProbeTUNCreation(t *testing.T) {
@@ -165,7 +166,7 @@ func TestNewRetriesOnlyTUNProbe(t *testing.T) {
 		waitTUNProbeRetry: func(delay time.Duration) {
 			waits = append(waits, delay)
 		},
-		newRoutingManager: func() (RoutingManager, error) {
+		newRoutingManager: func(routing.ManagerOptions) (RoutingManager, error) {
 			routingCalls++
 			return &fakeRouting{}, nil
 		},
@@ -301,6 +302,64 @@ func TestNewDisablesTUNAfterAllProbeAttemptsFail(t *testing.T) {
 	)
 	if !slices.Equal(logs, []string{wantLog}) {
 		t.Fatalf("logs = %v, want [%q]", logs, wantLog)
+	}
+}
+
+func TestNewSelectsCurrentNamespaceRoutingManager(t *testing.T) {
+	oldEnv := autoSystemEnv
+	defer func() { autoSystemEnv = oldEnv }()
+
+	var gotOptions routing.ManagerOptions
+	autoSystemEnv.hasCapability = func(int) bool { return true }
+	autoSystemEnv.newRoutingManager = func(
+		options routing.ManagerOptions,
+	) (RoutingManager, error) {
+		gotOptions = options
+		return &fakeRouting{}, nil
+	}
+
+	system, err := New(SystemConfig{
+		Features:                FeatureConfig{Routing: true},
+		RoutingMonitorNamespace: routing.CurrentNamespace,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = system.Close() }()
+	if gotOptions.MonitorNamespace != routing.CurrentNamespace {
+		t.Fatalf(
+			"routing monitor namespace = %d, want %d",
+			gotOptions.MonitorNamespace,
+			routing.CurrentNamespace,
+		)
+	}
+}
+
+func TestNewDoesNotDowngradeCurrentNamespaceRoutingFailure(t *testing.T) {
+	oldEnv := autoSystemEnv
+	defer func() { autoSystemEnv = oldEnv }()
+	managerErr := errors.New("routing manager failed")
+
+	autoSystemEnv.hasCapability = func(int) bool { return true }
+	autoSystemEnv.newRoutingManager = func(
+		options routing.ManagerOptions,
+	) (RoutingManager, error) {
+		if options.MonitorNamespace != routing.CurrentNamespace {
+			t.Fatalf(
+				"routing monitor namespace = %d, want %d",
+				options.MonitorNamespace,
+				routing.CurrentNamespace,
+			)
+		}
+		return nil, managerErr
+	}
+
+	_, err := New(SystemConfig{
+		Features:                FeatureConfig{Routing: true},
+		RoutingMonitorNamespace: routing.CurrentNamespace,
+	})
+	if !errors.Is(err, managerErr) {
+		t.Fatalf("New error = %v, want %v", err, managerErr)
 	}
 }
 

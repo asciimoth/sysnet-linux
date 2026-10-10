@@ -93,6 +93,11 @@ type PmarkConfig struct {
 // need a DNS provider tied to a TUN created elsewhere, use NewSystem.
 type SystemConfig struct {
 	Features FeatureConfig
+	// RoutingMonitorNamespace selects how the native routing manager monitors
+	// route changes. The zero value pins the namespace through procfs.
+	// CurrentNamespace requires the process to stay in its final network
+	// namespace for its full lifetime.
+	RoutingMonitorNamespace routing.MonitorNamespace
 
 	Allocator      linuxsubnet.DefaultAllocatorConfig
 	DNS            DNSConfig
@@ -115,7 +120,7 @@ type systemAutoEnvironment struct {
 	hasCapability     func(int) bool
 	probeTUN          func(TUNFactory, func(time.Duration), func(string, ...any)) error
 	waitTUNProbeRetry func(time.Duration)
-	newRoutingManager func() (RoutingManager, error)
+	newRoutingManager func(routing.ManagerOptions) (RoutingManager, error)
 	newDNSProvider    func(SystemConfig, gonnect.Network, gonnect.Network) (dns.DNSProvider, error)
 	newPmark          func(SystemConfig, func(format string, args ...any)) (PmarkController, []io.Closer, error)
 	newKillswitch     func(string, killswitch.Logf) KillswitchClient
@@ -143,9 +148,17 @@ var autoSystemEnv = systemAutoEnvironment{
 // when p-mark starts successfully. A missing optional integration is logged and
 // degrades the capability report, rather than making construction fail.
 //
-// Errors are reserved for invalid static configuration or failures in the
-// underlying System constructor after feature degradation.
+// Errors are reserved for invalid static configuration, failures in the
+// underlying System constructor after feature degradation, or failure to
+// create an explicitly requested current-namespace routing manager.
 func New(config SystemConfig) (*System, error) {
+	if config.RoutingMonitorNamespace != routing.PinnedNamespace &&
+		config.RoutingMonitorNamespace != routing.CurrentNamespace {
+		return nil, fmt.Errorf(
+			"invalid routing monitor namespace mode %d",
+			config.RoutingMonitorNamespace,
+		)
+	}
 	logf := config.Logf
 	if logf == nil {
 		logf = func(string, ...any) {}
@@ -185,11 +198,16 @@ func New(config SystemConfig) (*System, error) {
 
 	var routingManager RoutingManager
 	if features.Routing {
-		routingManager = setupRoutingManager(
+		var err error
+		routingManager, err = setupRoutingManager(
+			config.RoutingMonitorNamespace,
 			&features,
 			&capabilityFailures,
 			logf,
 		)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	appMark := config.AppBypassMark
@@ -348,33 +366,45 @@ func buildMarkedNetwork(
 	)
 }
 
-func newNativeRoutingManager() (RoutingManager, error) {
-	return routing.NewManager()
+func newNativeRoutingManager(
+	options routing.ManagerOptions,
+) (RoutingManager, error) {
+	return routing.NewManagerWithOptions(options)
 }
 
+//nolint:nilnil // A nil manager is the supported best-effort pinned result.
 func setupRoutingManager(
+	monitorNamespace routing.MonitorNamespace,
 	features *FeatureConfig,
 	failures *capabilityFailures,
 	logf func(format string, args ...any),
-) RoutingManager {
+) (RoutingManager, error) {
 	if !autoSystemEnv.hasCapability(unix.CAP_NET_ADMIN) {
 		logf("system auto-detect: disabling routing: missing CAP_NET_ADMIN")
 		failures.routing = []sysnet.CapabilityReason{
 			sysnet.ReasonPermissionDenied,
 		}
 		disableRoutingFeatures(features)
-		return nil
+		return nil, nil
 	}
-	manager, err := autoSystemEnv.newRoutingManager()
+	manager, err := autoSystemEnv.newRoutingManager(routing.ManagerOptions{
+		MonitorNamespace: monitorNamespace,
+	})
 	if err != nil {
+		if monitorNamespace == routing.CurrentNamespace {
+			return nil, fmt.Errorf(
+				"create current-namespace routing manager: %w",
+				err,
+			)
+		}
 		logf("system auto-detect: disabling routing: %v", err)
 		failures.routing = []sysnet.CapabilityReason{
 			sysnet.ReasonProbeFailed,
 		}
 		disableRoutingFeatures(features)
-		return nil
+		return nil, nil
 	}
-	return manager
+	return manager, nil
 }
 
 func probeTUNCreation(

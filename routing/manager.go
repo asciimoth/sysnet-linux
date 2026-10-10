@@ -20,6 +20,23 @@ var (
 	ErrRollbackIncomplete = errors.New("routing: rollback incomplete")
 )
 
+// MonitorNamespace selects the network namespace used by the route monitor.
+type MonitorNamespace uint8
+
+const (
+	// PinnedNamespace pins the process network namespace with a handle. This is
+	// the default and preserves the behavior of NewManager.
+	PinnedNamespace MonitorNamespace = iota
+	// CurrentNamespace starts the monitor in the caller's current network
+	// namespace without opening procfs or entering a namespace.
+	CurrentNamespace
+)
+
+// ManagerOptions configures Manager construction.
+type ManagerOptions struct {
+	MonitorNamespace MonitorNamespace
+}
+
 // Manager reconciles package-owned Linux routes and rules.
 type Manager struct {
 	mu        sync.Mutex
@@ -34,6 +51,7 @@ type Manager struct {
 	monitorSubscribe routeSubscribeFunc
 	monitorOptions   netlink.RouteSubscribeOptions
 	monitorNamespace *netns.NsHandle
+	monitorNSClose   func() error
 	monitorDebounce  time.Duration
 	monitorRetry     time.Duration
 }
@@ -46,23 +64,73 @@ type Manager struct {
 // the safe table matches the main table. Strict policies do not use the safe
 // table and do not require a refresh.
 func NewManager() (*Manager, error) {
-	adapter, err := newRealAdapter()
+	return NewManagerWithOptions(ManagerOptions{})
+}
+
+// NewManagerCurrentNamespace creates a Manager that monitors the caller's
+// current network namespace.
+//
+// The process must already be in its final network namespace. No thread in the
+// process can change network namespaces after construction. This mode does not
+// open a namespace handle and does not call setns.
+func NewManagerCurrentNamespace() (*Manager, error) {
+	return NewManagerWithOptions(ManagerOptions{
+		MonitorNamespace: CurrentNamespace,
+	})
+}
+
+// NewManagerWithOptions creates a Manager with explicit monitor options.
+func NewManagerWithOptions(options ManagerOptions) (*Manager, error) {
+	return newManager(options, managerDependencies{
+		newAdapter:   func() (netlinkAdapter, error) { return newRealAdapter() },
+		getNamespace: netns.Get,
+		closeNamespace: func(namespace netns.NsHandle) error {
+			return namespace.Close()
+		},
+		subscribe: netlink.RouteSubscribeWithOptions,
+	})
+}
+
+type managerDependencies struct {
+	newAdapter     func() (netlinkAdapter, error)
+	getNamespace   func() (netns.NsHandle, error)
+	closeNamespace func(netns.NsHandle) error
+	subscribe      routeSubscribeFunc
+}
+
+func newManager(
+	options ManagerOptions,
+	dependencies managerDependencies,
+) (*Manager, error) {
+	if options.MonitorNamespace != PinnedNamespace &&
+		options.MonitorNamespace != CurrentNamespace {
+		return nil, fmt.Errorf(
+			"routing: invalid monitor namespace mode %d",
+			options.MonitorNamespace,
+		)
+	}
+	adapter, err := dependencies.newAdapter()
 	if err != nil {
 		return nil, err
 	}
-	namespace, err := netns.Get()
-	if err != nil {
-		_ = adapter.Close()
-		return nil, fmt.Errorf("open route monitor namespace: %w", err)
-	}
 	manager := newManagerWithAdapter(adapter)
-	manager.monitorNamespace = &namespace
-	manager.monitorOptions.Namespace = &namespace
-	if err := manager.startRouteMonitor(
-		netlink.RouteSubscribeWithOptions,
-	); err != nil {
+	if options.MonitorNamespace == PinnedNamespace {
+		namespace, err := dependencies.getNamespace()
+		if err != nil {
+			_ = adapter.Close()
+			return nil, fmt.Errorf("open route monitor namespace: %w", err)
+		}
+		manager.monitorNamespace = &namespace
+		manager.monitorNSClose = func() error {
+			return dependencies.closeNamespace(namespace)
+		}
+		manager.monitorOptions.Namespace = &namespace
+	}
+	if err := manager.startRouteMonitor(dependencies.subscribe); err != nil {
 		_ = adapter.Close()
-		_ = namespace.Close()
+		if manager.monitorNSClose != nil {
+			_ = manager.monitorNSClose()
+		}
 		return nil, fmt.Errorf("monitor main routes: %w", err)
 	}
 	return manager, nil
@@ -247,8 +315,8 @@ func (m *Manager) Close() error {
 
 	m.monitorWait.Wait()
 	err := m.adapter.Close()
-	if m.monitorNamespace != nil {
-		err = errors.Join(err, m.monitorNamespace.Close())
+	if m.monitorNSClose != nil {
+		err = errors.Join(err, m.monitorNSClose())
 	}
 	m.mu.Lock()
 	m.closeErr = err

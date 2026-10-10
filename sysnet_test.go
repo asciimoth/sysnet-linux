@@ -47,7 +47,7 @@ func TestNewAutoBuildsAvailableComponents(t *testing.T) {
 			return nil
 		},
 		waitTUNProbeRetry: func(time.Duration) {},
-		newRoutingManager: func() (RoutingManager, error) {
+		newRoutingManager: func(routing.ManagerOptions) (RoutingManager, error) {
 			return &fakeRouting{}, nil
 		},
 		newDNSProvider: func(
@@ -195,7 +195,7 @@ func TestNewAutoDegradesUnavailableComponents(t *testing.T) {
 		waitTUNProbeRetry: func(time.Duration) {
 			t.Fatal("TUN probe retry wait should not run")
 		},
-		newRoutingManager: func() (RoutingManager, error) {
+		newRoutingManager: func(routing.ManagerOptions) (RoutingManager, error) {
 			t.Fatal(
 				"routing manager should not be created without CAP_NET_ADMIN",
 			)
